@@ -1,0 +1,54 @@
+# Build artifacts
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+*.pyo
+
+# Releases (packaged binaries)
+releases/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+$RECYCLE.BIN/
+System Volume Information/
+
+# Data (user data, not source code)
+数据/
+数据版本/
+
+# Photos (too large for repo)
+照片/
+
+# Reference / misc files
+其他参考文件/
+中间文件/
+其他/
+.codex/
+Seagate/
+Autorun.inf
+
+# Screenshots and debug images
+问题*.png
+111.png
+222.png
+333.png
+
+# Large non-code files
+chat内容.docx
+界面示例.pdf
+界面示例.ppt
+
+# Logs and temp
+*.log
+.Rhistory
+
+# Note: keep 字段模版/ as it contains templates
