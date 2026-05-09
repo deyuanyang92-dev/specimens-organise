@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import uuid
@@ -39,6 +40,7 @@ from .models import (
     CLASSIFICATION_FILE,
     CLASSIFICATION_HEADERS,
     CLASSIFICATION_REQUIRED,
+    CLASSIFICATION_SUMMARY_FIELDS,
     CURRENT_DATA_SCHEMA_VERSION,
     DATA_VERSION_DIR,
     DATA_VERSION_LOG_FILE,
@@ -59,7 +61,7 @@ from .models import (
     Row,
     StatusFlags,
 )
-from .parsing import extract_collection_date, extract_location_code, format_voucher, parse_voucher_serial
+from .parsing import derive_specimen_fields_from_tube_number, format_voucher, parse_voucher_serial
 
 
 DEFAULT_CONFIG = {
@@ -94,6 +96,7 @@ class ExcelStore:
             import atexit
             atexit.register(self.release_lock)
         self.ensure_files()
+        self._upgrade_workspace_schema()
         self._assert_supported_data_schema()
         self.ensure_index()
         self._sync_next_serial()
@@ -235,6 +238,21 @@ class ExcelStore:
     def get_photos(self, voucher: str) -> list[Row]:
         return [row for row in self.read_rows("photo") if self._value(row, "入库编号*") == voucher]
 
+    def get_all_photo_voucher_map(self) -> dict[str, list[str]]:
+        """Return mapping from resolved photo path to list of voucher numbers.
+
+        Used by the image search dialog to show which voucher(s) an
+        already-linked photo belongs to.
+        """
+        result: dict[str, list[str]] = {}
+        for row in self.read_rows("photo"):
+            voucher = self._value(row, "入库编号*")
+            if not voucher:
+                continue
+            resolved = str(self.resolve_photo_path(row))
+            result.setdefault(resolved, []).append(voucher)
+        return result
+
     def create_specimen(self) -> str:
         voucher = self.next_voucher()
         now = self._now()
@@ -259,9 +277,12 @@ class ExcelStore:
             "photos": self.get_photos(voucher),
             "index": self._find_index(voucher),
         }
+        remaining_photos = [row for row in self.read_rows("photo") if self._value(row, "入库编号*") != voucher]
         self._delete_rows("specimen", voucher)
         self._delete_rows("classification", voucher)
-        self._delete_rows("photo", voucher)
+        self._write_rows("photo", remaining_photos)
+        for photo in old["photos"]:
+            self._delete_unreferenced_photo_file(photo, remaining_photos)
         self._delete_index(voucher)
         self._record_action("delete_specimen", voucher, "specimen", "", old, {})
 
@@ -270,11 +291,20 @@ class ExcelStore:
         if not photos:
             return 0
         self._record_action("clear_photos", voucher, "photo", "", {"photos": photos}, {})
-        self._delete_rows("photo", voucher)
-        self._invalidate_cache(PHOTO_FILE)
+        remaining_photos = [row for row in self.read_rows("photo") if self._value(row, "入库编号*") != voucher]
+        self._write_rows("photo", remaining_photos)
+        for photo in photos:
+            self._delete_unreferenced_photo_file(photo, remaining_photos)
         return len(photos)
 
-    def set_fields(self, category: str, voucher: str, updates: dict[str, Any], action_type: str = "update_fields") -> bool:
+    def set_fields(
+        self,
+        category: str,
+        voucher: str,
+        updates: dict[str, Any],
+        action_type: str = "update_fields",
+        auto_derive_specimen_fields: bool = True,
+    ) -> bool:
         if category not in ("specimen", "classification"):
             raise ValueError(f"Unsupported category: {category}")
         headers = CATEGORY_HEADERS[category]
@@ -295,12 +325,11 @@ class ExcelStore:
             return False
 
         rows[index].update(changed)
-        if category == "specimen" and "管内编号*" in changed:
+        if auto_derive_specimen_fields and category == "specimen" and "管内编号*" in changed:
             tube = rows[index].get("管内编号*", "")
-            auto_updates = {
-                "采集日期": extract_collection_date(tube),
-                "采集地点缩写*": extract_location_code(tube),
-            }
+            # 原代码只自动派生“采集日期”和“采集地点缩写*”；旧版本还支持保存方式。
+            # 现在统一走管内编号派生函数，恢复保存方式，同时保留原字段兼容。
+            auto_updates = derive_specimen_fields_from_tube_number(tube)
             for field, value in auto_updates.items():
                 if value and rows[index].get(field) != value:
                     rows[index][field] = value
@@ -335,16 +364,49 @@ class ExcelStore:
         resolved_inputs = {Path(p).resolve() for p in photo_paths}
         if not resolved_inputs:
             return {}
+        input_hashes: dict[str, str] = {}
+        for path in resolved_inputs:
+            try:
+                input_hashes[str(path)] = self._file_sha256(path)
+            except OSError:
+                continue
         conflicts: dict[str, str] = {}
         for row in self.read_rows("photo"):
             voucher = self._value(row, "入库编号*")
             if voucher == target_voucher:
+                continue
+            row_hash = self._value(row, "文件SHA256")
+            if row_hash:
+                for input_path, input_hash in input_hashes.items():
+                    if input_hash == row_hash:
+                        conflicts[input_path] = voucher
                 continue
             row_path = self.resolve_photo_path(row)
             if row_path:
                 resolved = Path(row_path).resolve()
                 if resolved in resolved_inputs:
                     conflicts[str(resolved)] = voucher
+        return conflicts
+
+    def find_archive_name_conflicts(self, photo_paths: list[Path | str]) -> dict[str, str]:
+        """Return input photos whose original filename collides with a different archived file."""
+        archive_dir = self._photo_archive_dir()
+        conflicts: dict[str, str] = {}
+        for raw_path in photo_paths:
+            path = Path(raw_path).resolve()
+            if not path.is_file():
+                continue
+            target = archive_dir / self._safe_photo_filename(path.name)
+            if not target.exists():
+                continue
+            try:
+                if target.resolve() == path:
+                    continue
+                if self._file_sha256(target) == self._file_sha256(path):
+                    continue
+            except OSError:
+                continue
+            conflicts[str(path)] = str(target.resolve())
         return conflicts
 
     def export_all_data(self, target: Path) -> int:
@@ -368,6 +430,13 @@ class ExcelStore:
         source_rows = self._read_external_rows(source, SPECIMEN_HEADERS)
         if not source_rows:
             return ImportResult(imported=0, skipped=0, photos_imported=0)
+        source_ids = [self._value(row, "入库编号*") for row in source_rows if self._value(row, "入库编号*")]
+        duplicate_source = [voucher for voucher, count in Counter(source_ids).items() if count > 1]
+        if duplicate_source:
+            report = self._write_conflict_report(
+                [{"入库编号": voucher, "冲突类型": "导入文件内部重复", "源记录摘要": "", "目标记录摘要": ""} for voucher in duplicate_source]
+            )
+            raise ImportConflictError("导入文件存在重复入库编号，导入已阻止。", report)
         existing = set(self.list_vouchers())
         imported_ids: list[str] = []
         skipped = 0
@@ -399,7 +468,9 @@ class ExcelStore:
                         "创建时间": now,
                         "来源工作区": str(source),
                         "来源记录ID": "",
-                        "记录指纹": self._fingerprint_from_rows(row),
+                        # 原代码：self._fingerprint_from_rows(row)
+                        # _fingerprint_from_rows 需要同时接收标本和分类两部分；单文件导入没有分类表时传 None。
+                        "记录指纹": self._fingerprint_from_rows(row, None),
                     }
                 )
                 self._ensure_summary_row(voucher, created_at=now)
@@ -412,15 +483,27 @@ class ExcelStore:
         self._record_data_version("导入数据文件", f"来源：{source}；导入 {len(imported_ids)} 个标本")
         return ImportResult(imported=len(imported_ids), skipped=skipped, photos_imported=0)
 
-    def _photo_row(self, voucher: str, photo_path: Path | str, allow_outside: bool = False) -> Row:
-        path = Path(photo_path).resolve()
-        relative = self.relative_photo_path(path, allow_outside=allow_outside)
+    def _photo_row(
+        self,
+        voucher: str,
+        photo_path: Path | str,
+        allow_outside: bool = False,
+        source_row: Row | None = None,
+    ) -> Row:
+        original_name = self._value(source_row, "原始文件名") or self._value(source_row, "文件名") or Path(photo_path).name
+        archived = self._archive_photo_file(Path(photo_path), original_name=original_name)
         return {
             "入库编号*": voucher,
-            "文件名": path.name,
-            "相对路径": relative,
-            "描述": "",
+            "文件名": archived["file_name"],
+            "相对路径": archived["relative_path"],
+            "描述": self._value(source_row, "描述"),
             "来源工作区根路径": "",
+            "原始文件名": archived["original_name"],
+            "原始路径": archived["source_path"],
+            "文件SHA256": archived["sha256"],
+            "文件大小": archived["size"],
+            "归档时间": archived["archived_at"],
+            "归档状态": "已归档",
         }
 
     def delete_photo(self, voucher: str, photo_index: int) -> bool:
@@ -431,25 +514,119 @@ class ExcelStore:
         position = matching_positions[photo_index]
         old_row = rows.pop(position)
         self._write_rows("photo", rows)
+        self._delete_unreferenced_photo_file(old_row, rows)
         self._update_summary_modified(voucher)
         self._record_action("delete_photo", voucher, "photo", "", old_row, {})
         return True
 
+    def set_photo_filename(self, voucher: str, photo_index: int, filename: str) -> bool:
+        return self._rename_photo_file(voucher, photo_index, filename)
+
     def set_photo_description(self, voucher: str, photo_index: int, description: str) -> bool:
+        return self._set_photo_text_field(voucher, photo_index, "描述", description)
+
+    def _set_photo_text_field(self, voucher: str, photo_index: int, field: str, value: str) -> bool:
+        if field not in {"文件名", "描述"}:
+            raise ValueError(f"不支持修改照片字段：{field}")
         rows = self.read_rows("photo")
         matching_positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == voucher]
         if photo_index < 0 or photo_index >= len(matching_positions):
             return False
         position = matching_positions[photo_index]
         old_row = rows[position].copy()
-        rows[position]["描述"] = self._string(description)
+        rows[position][field] = self._string(value)
         if old_row == rows[position]:
             return False
         self._write_rows("photo", rows)
-        self._append_field_changes(voucher, "photo", old_row, rows[position], "update_photo")
-        self._update_summary_modified(voucher)
-        self._record_action("update_photo", voucher, "photo", "描述", old_row, rows[position].copy())
+        # 原代码只有“描述”可保存；现在“文件名”和“描述”统一走修改明细 + 汇总写入。
+        self._write_changes_and_summary(voucher, "photo", old_row, rows[position], "update_photo")
+        self._record_action("update_photo", voucher, "photo", field, old_row, rows[position].copy())
         return True
+
+    def _rename_photo_file(self, voucher: str, photo_index: int, filename: str) -> bool:
+        rows = self.read_rows("photo")
+        matching_positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == voucher]
+        if photo_index < 0 or photo_index >= len(matching_positions):
+            return False
+        position = matching_positions[photo_index]
+        old_row = rows[position].copy()
+        old_path = self.resolve_photo_path(old_row)
+        if not old_path.exists():
+            raise FileNotFoundError(f"照片文件不存在：{old_path}")
+        target = self._move_archive_file_to_name(old_path, filename)
+        new_row = old_row.copy()
+        new_row["文件名"] = target.name
+        new_row["相对路径"] = self._archive_relative_path(target)
+        new_row["来源工作区根路径"] = ""
+        if old_row == new_row:
+            return False
+        rows[position] = self._fit_headers(new_row, PHOTO_HEADERS)
+        self._write_rows("photo", rows)
+        self._delete_unreferenced_photo_file(old_row, rows)
+        self._write_changes_and_summary(voucher, "photo", old_row, rows[position], "update_photo")
+        self._record_action("update_photo", voucher, "photo", "文件名", old_row, rows[position].copy())
+        return True
+
+    def replace_photo(self, voucher: str, photo_index: int, photo_path: Path | str, allow_outside: bool = False) -> Row | None:
+        rows = self.read_rows("photo")
+        matching_positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == voucher]
+        if photo_index < 0 or photo_index >= len(matching_positions):
+            return None
+        position = matching_positions[photo_index]
+        new_row = self._photo_row(voucher, photo_path, allow_outside=allow_outside)
+        old_row = rows[position].copy()
+        if old_row == new_row:
+            return new_row
+        rows[position] = new_row
+        self._write_rows("photo", rows)
+        self._delete_unreferenced_photo_file(old_row, rows)
+        self._write_changes_and_summary(voucher, "photo", old_row, new_row, "update_photo")
+        # 原代码：self._update_summary_modified(voucher)
+        # _write_changes_and_summary 已更新修改汇总，避免重复计数。
+        self._record_action("update_photo", voucher, "photo", "", old_row, new_row.copy())
+        return new_row
+
+    def move_photos(self, source_voucher: str, target_voucher: str, photo_indices: list[int] | set[int] | tuple[int, ...]) -> int:
+        if not source_voucher or not target_voucher or source_voucher == target_voucher:
+            return 0
+        requested_set: set[int] = set()
+        for index in photo_indices:
+            try:
+                parsed = int(index)
+            except (TypeError, ValueError):
+                continue
+            if parsed >= 0:
+                requested_set.add(parsed)
+        requested = sorted(requested_set)
+        if not requested:
+            return 0
+        rows = self.read_rows("photo")
+        source_positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == source_voucher]
+        selected_positions = [source_positions[index] for index in requested if index < len(source_positions)]
+        if not selected_positions:
+            return 0
+        old_rows = [rows[position].copy() for position in selected_positions]
+        moved_rows: list[Row] = []
+        for row in old_rows:
+            moved = row.copy()
+            moved["入库编号*"] = target_voucher
+            moved_rows.append(self._fit_headers(moved, PHOTO_HEADERS))
+        selected_set = set(selected_positions)
+        new_rows = [row for index, row in enumerate(rows) if index not in selected_set]
+        new_rows.extend(moved_rows)
+        self._write_rows("photo", new_rows)
+        self._update_summary_modified(source_voucher)
+        self._update_summary_modified(target_voucher)
+        # 原代码在 UI 中逐张 add_photo/delete_photo；任何一步失败都会留下半完成状态。
+        self._record_action(
+            "move_photos",
+            "",
+            "photo",
+            "",
+            {"source": source_voucher, "photos": old_rows},
+            {"target": target_voucher, "photos": moved_rows},
+        )
+        return len(moved_rows)
 
     def next_voucher(self) -> str:
         self.assert_unique_vouchers()
@@ -551,12 +728,23 @@ class ExcelStore:
                 self._ensure_summary_row(voucher, created_at=now)
 
         photos_imported = 0
+        missing_photos: list[dict[str, str]] = []
         for photo in source_photos:
             voucher = self._value(photo, "入库编号*")
             if voucher in import_id_set:
-                fitted = self._fit_headers(photo, PHOTO_HEADERS)
-                if not fitted.get("来源工作区根路径"):
-                    fitted["来源工作区根路径"] = str(source)
+                source_path = self._resolve_import_photo_path(photo, source)
+                if not source_path.exists():
+                    missing_photos.append(
+                        {
+                            "入库编号": voucher,
+                            "文件名": self._value(photo, "文件名"),
+                            "相对路径": self._value(photo, "相对路径"),
+                            "来源工作区根路径": self._value(photo, "来源工作区根路径"),
+                            "解析路径": str(source_path),
+                        }
+                    )
+                    continue
+                fitted = self._photo_row(voucher, source_path, allow_outside=True, source_row=photo)
                 target_photos.append(fitted)
                 photos_imported += 1
 
@@ -565,9 +753,13 @@ class ExcelStore:
         self._write_rows("photo", target_photos)
         self._write_plain_rows(self.data_dir / INDEX_FILE, INDEX_HEADERS, target_index)
         self._sync_next_serial()
+        report_path = self._write_photo_missing_report(missing_photos) if missing_photos else None
         self._record_action("import_workspace", "", "workspace", "", {}, {"source": str(source), "imported": import_ids})
-        self._record_data_version("导入工作区", f"来源：{source}；导入 {len(import_ids)} 个标本，照片 {photos_imported} 张")
-        return ImportResult(imported=len(import_ids), skipped=skipped, photos_imported=photos_imported)
+        summary = f"来源：{source}；导入 {len(import_ids)} 个标本，照片 {photos_imported} 张"
+        if report_path:
+            summary += f"；缺失照片 {len(missing_photos)} 张，报告：{report_path}"
+        self._record_data_version("导入工作区", summary)
+        return ImportResult(imported=len(import_ids), skipped=skipped, photos_imported=photos_imported, report_path=report_path)
 
     def create_data_snapshot(self, operation_type: str = "手动快照", summary: str = "") -> Path:
         version_id = datetime.now().strftime("v%Y%m%d_%H%M%S")
@@ -603,7 +795,11 @@ class ExcelStore:
     def restore_data_snapshot(self, snapshot_path: Path | str) -> None:
         snapshot = Path(snapshot_path).resolve()
         expected_parent = (self.data_dir / DATA_VERSION_DIR).resolve()
-        if not str(snapshot).startswith(str(expected_parent)):
+        try:
+            snapshot.relative_to(expected_parent)
+        except ValueError:
+            # 原代码：if not str(snapshot).startswith(str(expected_parent))
+            # 避免 /path/data_versions_old 这类字符串前缀误判。
             raise ValueError(f"快照路径不在数据版本目录内：{snapshot}")
         if not snapshot.exists() or not snapshot.is_dir():
             raise FileNotFoundError(f"数据版本不存在：{snapshot}")
@@ -666,6 +862,22 @@ class ExcelStore:
                 return path
         return candidates[0]
 
+    def _resolve_import_photo_path(self, photo_row: Row, source_root: Path) -> Path:
+        relative = self._value(photo_row, "相对路径")
+        candidates = [self._resolve_relative(source_root, relative)]
+        source_photo_root = self._value(photo_row, "来源工作区根路径")
+        if source_photo_root:
+            src = Path(source_photo_root)
+            if src.is_dir():
+                candidates.append(self._resolve_relative(src, relative))
+        original_path = self._value(photo_row, "原始路径")
+        if original_path:
+            candidates.append(Path(original_path).resolve())
+        for path in candidates:
+            if path.exists():
+                return path
+        return candidates[0]
+
     def relative_photo_path(self, path: Path, allow_outside: bool = False) -> str:
         path = path.resolve()
         try:
@@ -675,6 +887,164 @@ class ExcelStore:
             if not allow_outside:
                 raise ValueError("照片不在当前工作区内，无法生成稳定的工作区相对路径")
             return Path(os.path.relpath(path, self.root)).as_posix()
+
+    def _photo_location(self, path: Path, allow_outside: bool = False) -> tuple[str, str]:
+        try:
+            relative = path.relative_to(self.root)
+            return "./" + relative.as_posix(), ""
+        except ValueError:
+            if not allow_outside:
+                raise ValueError("照片不在当前工作区内，无法生成稳定的工作区相对路径")
+            # 原代码会把外部照片保存成 ../xxx；现在用来源根路径 + 文件名避免路径穿越。
+            return "./" + path.name, str(path.parent)
+
+    def _archive_photo_file(self, source: Path, original_name: str | None = None) -> dict[str, str]:
+        source = source.resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"照片文件不存在：{source}")
+        digest = self._file_sha256(source)
+        archive_dir = self._photo_archive_dir()
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        clean_name = self._safe_photo_filename(original_name or source.name)
+        target = self._archive_target_path(archive_dir, digest, clean_name)
+        if not target.exists():
+            tmp = archive_dir / f".{uuid.uuid4().hex}.tmp{source.suffix.lower()}"
+            try:
+                shutil.copy2(source, tmp)
+                copied_digest = self._file_sha256(tmp)
+                if copied_digest != digest:
+                    raise OSError(f"照片复制校验失败：{source}")
+                tmp.replace(target)
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return {
+            "path": str(target),
+            "file_name": target.name,
+            "relative_path": self._archive_relative_path(target),
+            "original_name": Path(original_name or source.name).name,
+            "source_path": str(source),
+            "sha256": digest,
+            "size": str(source.stat().st_size),
+            "archived_at": self._now(),
+        }
+
+    def _archive_target_path(self, archive_dir: Path, digest: str, clean_name: str) -> Path:
+        return self._available_archive_target(archive_dir, clean_name, digest)
+
+    def _photo_archive_dir(self) -> Path:
+        return self.root / "照片"
+
+    def _archive_relative_path(self, path: Path) -> str:
+        return "./" + path.resolve().relative_to(self.root).as_posix()
+
+    def _available_archive_target(self, archive_dir: Path, clean_name: str, digest: str | None = None) -> Path:
+        target = archive_dir / clean_name
+        if self._target_available_for_digest(target, digest):
+            return target
+        path = Path(clean_name)
+        stem = path.stem or "photo"
+        suffix = path.suffix
+        counter = 2
+        while True:
+            candidate = archive_dir / f"{stem}_{counter}{suffix}"
+            if self._target_available_for_digest(candidate, digest):
+                return candidate
+            counter += 1
+
+    def _target_available_for_digest(self, target: Path, digest: str | None) -> bool:
+        if not target.exists():
+            return True
+        if digest:
+            try:
+                return self._file_sha256(target) == digest
+            except OSError:
+                return False
+        return False
+
+    def _move_archive_file_to_name(self, source: Path, filename: str) -> Path:
+        source = source.resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"照片文件不存在：{source}")
+        digest = self._file_sha256(source)
+        archive_dir = self._photo_archive_dir()
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        default_suffix = source.suffix if source.suffix else ""
+        clean_name = self._safe_photo_filename(filename, default_suffix=default_suffix)
+        target = self._available_archive_target(archive_dir, clean_name, digest)
+        if source == target.resolve():
+            return target
+        if target.exists():
+            # 同内容同名文件已存在时复用目标，避免留下重复副本。
+            return target
+        if self._is_workspace_archive_path(source):
+            source.replace(target)
+        else:
+            tmp = archive_dir / f".{uuid.uuid4().hex}.tmp{source.suffix.lower()}"
+            try:
+                shutil.copy2(source, tmp)
+                if self._file_sha256(tmp) != digest:
+                    raise OSError(f"照片复制校验失败：{source}")
+                tmp.replace(target)
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return target
+
+    def _delete_unreferenced_photo_file(self, photo_row: Row, remaining_rows: list[Row] | None = None) -> bool:
+        try:
+            path = self.resolve_photo_path(photo_row).resolve()
+        except Exception:
+            return False
+        if not self._is_workspace_archive_path(path) or not path.exists():
+            return False
+        rows = remaining_rows if remaining_rows is not None else self.read_rows("photo")
+        for row in rows:
+            try:
+                other = self.resolve_photo_path(row).resolve()
+            except Exception:
+                continue
+            if other == path:
+                return False
+        return self._delete_archive_file_if_safe(path)
+
+    def _delete_archive_file_if_safe(self, path: Path) -> bool:
+        path = path.resolve()
+        if not self._is_workspace_archive_path(path) or not path.exists():
+            return False
+        try:
+            path.unlink()
+            return True
+        except OSError:
+            return False
+
+    def _is_workspace_archive_path(self, path: Path) -> bool:
+        try:
+            path.resolve().relative_to(self._photo_archive_dir().resolve())
+            return True
+        except ValueError:
+            return False
+
+    def _safe_photo_filename(self, filename: str, default_suffix: str = "") -> str:
+        name = Path(filename or "photo").name.strip() or "photo"
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+        path = Path(name)
+        suffix = path.suffix or default_suffix
+        stem = path.stem or "photo"
+        if len(stem) > 140:
+            stem = stem[:140].rstrip(" ._") or "photo"
+        return f"{stem}{suffix}"
+
+    def _file_sha256(self, path: Path) -> str:
+        h = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
 
     def _cached_rows(self, file_key: str, loader: Callable[[], list[Row]]) -> list[Row]:
         file_path = self.data_dir / file_key
@@ -757,6 +1127,55 @@ class ExcelStore:
             raise ImportConflictError(
                 f"该工作区数据版本为 {current}，高于当前软件支持的 {CURRENT_DATA_SCHEMA_VERSION}，已禁止写入。"
             )
+
+    def _upgrade_workspace_schema(self) -> None:
+        current = str(self.config.get("data_schema_version", "1.0.0"))
+        if _version_tuple(current) < _version_tuple("1.1.1"):
+            self._migrate_hash_prefixed_photos()
+        if _version_tuple(current) < _version_tuple(CURRENT_DATA_SCHEMA_VERSION):
+            self.config["data_schema_version"] = CURRENT_DATA_SCHEMA_VERSION
+            self._save_config()
+
+    def _migrate_hash_prefixed_photos(self) -> None:
+        rows = self.read_rows("photo")
+        if not rows:
+            return
+        changed = False
+        moved_paths: dict[Path, Path] = {}
+        old_paths: set[Path] = set()
+        pattern = re.compile(r"^[0-9a-fA-F]{12}(?:_[0-9a-fA-F]{8})?__(.+)$")
+        archive_dir = self._photo_archive_dir().resolve()
+        for idx, row in enumerate(rows):
+            relative = self._value(row, "相对路径")
+            old_path = self._resolve_relative(self.root, relative).resolve()
+            if old_path in moved_paths:
+                target = moved_paths[old_path]
+            else:
+                try:
+                    old_path.relative_to(archive_dir)
+                except ValueError:
+                    continue
+                match = pattern.match(old_path.name)
+                if not match:
+                    continue
+                if not old_path.exists():
+                    continue
+                desired = self._value(row, "原始文件名") or self._value(row, "文件名") or match.group(1)
+                target = self._move_archive_file_to_name(old_path, desired)
+                moved_paths[old_path] = target
+                old_paths.add(old_path)
+            new_row = row.copy()
+            new_row["文件名"] = target.name
+            new_row["相对路径"] = self._archive_relative_path(target)
+            new_row["来源工作区根路径"] = ""
+            fitted = self._fit_headers(new_row, PHOTO_HEADERS)
+            if self._fit_headers(row, PHOTO_HEADERS) != fitted:
+                rows[idx] = fitted
+                changed = True
+        if changed:
+            self._write_rows("photo", rows)
+        for old_path in old_paths:
+            self._delete_archive_file_if_safe(old_path)
 
     def _save_config(self) -> None:
         path = self.data_dir / WORKSPACE_CONFIG_FILE
@@ -951,6 +1370,7 @@ class ExcelStore:
         action_type = self._value(action, "操作类型")
         voucher = self._value(action, "入库编号")
         category = self._value(action, "信息类别")
+        field = self._value(action, "字段名")
         old_value = self._json(action.get("旧值JSON"))
         new_value = self._json(action.get("新值JSON"))
         value = old_value if undo else new_value
@@ -970,6 +1390,14 @@ class ExcelStore:
             opposite = new_value if undo else old_value
             idx = self._find_photo_row_index(rows, opposite)
             if idx is not None:
+                if field == "文件名":
+                    source_path = self.resolve_photo_path(opposite)
+                    if source_path.exists():
+                        target_path = self._move_archive_file_to_name(source_path, self._value(target, "文件名"))
+                        target = dict(target)
+                        target["文件名"] = target_path.name
+                        target["相对路径"] = self._archive_relative_path(target_path)
+                        target["来源工作区根路径"] = ""
                 rows[idx] = self._fit_headers(target, PHOTO_HEADERS)
                 self._write_rows("photo", rows)
         elif action_type == "add_photo":
@@ -1025,13 +1453,34 @@ class ExcelStore:
             else:
                 self._delete_rows("photo", voucher)
                 self._invalidate_cache(PHOTO_FILE)
+        elif action_type == "move_photos":
+            old_photos = old_value.get("photos") or []
+            new_photos = new_value.get("photos") or []
+            rows = self.read_rows("photo")
+            if undo:
+                for photo in new_photos:
+                    self._remove_photo_from_rows(rows, photo)
+                rows.extend(self._fit_headers(photo, PHOTO_HEADERS) for photo in old_photos)
+            else:
+                for photo in old_photos:
+                    self._remove_photo_from_rows(rows, photo)
+                rows.extend(self._fit_headers(photo, PHOTO_HEADERS) for photo in new_photos)
+            self._write_rows("photo", rows)
 
     def _remove_photo_row(self, old_value: Row) -> None:
         rows = self.read_rows("photo")
         idx = self._find_photo_row_index(rows, old_value)
         if idx is not None:
-            rows.pop(idx)
+            removed = rows.pop(idx)
             self._write_rows("photo", rows)
+            self._delete_unreferenced_photo_file(removed, rows)
+
+    def _remove_photo_from_rows(self, rows: list[Row], target: Row) -> bool:
+        idx = self._find_photo_row_index(rows, target)
+        if idx is None:
+            return False
+        rows.pop(idx)
+        return True
 
     def _find_photo_row_index(self, rows: list[Row], target: Row) -> int | None:
         fitted = self._fit_headers(target, PHOTO_HEADERS)
@@ -1134,6 +1583,13 @@ class ExcelStore:
         self._write_plain_rows(path, headers, conflicts)
         return path
 
+    def _write_photo_missing_report(self, rows: list[dict[str, str]]) -> Path:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = self.data_dir / f"照片导入缺失报告_{timestamp}.xlsx"
+        headers = ["入库编号", "文件名", "相对路径", "来源工作区根路径", "解析路径"]
+        self._write_plain_rows(path, headers, rows)
+        return path
+
     def _record_summary(self, specimen: Row | None, classification: Row | None) -> str:
         if not specimen and not classification:
             return ""
@@ -1143,9 +1599,11 @@ class ExcelStore:
             f"管内编号={self._value(specimen, '管内编号*')}",
             f"地点={self._value(specimen, '采集地点缩写*')}",
             f"日期={self._value(specimen, '采集日期')}",
-            f"种名={self._value(classification, '种名*')}",
-            f"科={self._value(classification, '科*')}",
         ]
+        parts.extend(
+            f"{label}={self._value(classification, field)}"
+            for label, field in CLASSIFICATION_SUMMARY_FIELDS
+        )
         return "; ".join(parts)
 
     def _fingerprint_from_rows(self, specimen: Row | None, classification: Row | None) -> str:
@@ -1266,9 +1724,15 @@ class ExcelStore:
         text = str(relative or "").strip()
         if text.startswith("./"):
             text = text[2:]
-        resolved = (root / text).resolve()
-        if not str(resolved).startswith(str(root.resolve())):
-            return root / text
+        base = root.resolve()
+        raw = Path(text)
+        resolved = raw.resolve() if raw.is_absolute() else (base / raw).resolve()
+        try:
+            resolved.relative_to(base)
+        except ValueError:
+            # 原代码：if not str(resolved).startswith(str(root.resolve())): return root / text
+            # 使用 Path.relative_to 做严格边界检查；越界路径返回一个确定不存在的占位路径。
+            return base / "__invalid_photo_path__" / raw.name
         return resolved
 
     def _now(self) -> str:

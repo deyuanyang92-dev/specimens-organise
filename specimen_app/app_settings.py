@@ -22,6 +22,8 @@ PREVIEW_QUALITY_SIZES = {
     "original": None,
 }
 
+DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT = "Ctrl+Alt+F"
+
 
 @dataclass
 class AppSettings:
@@ -30,6 +32,7 @@ class AppSettings:
     preview_quality: str = "standard"
     search_paths: list[str] = field(default_factory=list)
     show_grid_filenames: bool = True
+    photo_filename_fill_shortcut: str = DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT
     window_geometry: str = ""
     splitter_sizes: list = field(default_factory=list)
 
@@ -57,6 +60,9 @@ def load_settings() -> AppSettings:
     show_grid_filenames = data.get("show_grid_filenames", True)
     if not isinstance(show_grid_filenames, bool):
         show_grid_filenames = True
+    photo_filename_fill_shortcut = data.get("photo_filename_fill_shortcut", DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT)
+    if not isinstance(photo_filename_fill_shortcut, str) or not photo_filename_fill_shortcut.strip():
+        photo_filename_fill_shortcut = DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT
     raw_sizes = data.get("splitter_sizes", [])
     if raw_sizes and isinstance(raw_sizes[0], list):
         splitter_sizes = raw_sizes
@@ -68,6 +74,7 @@ def load_settings() -> AppSettings:
         preview_quality=str(data.get("preview_quality", "standard")),
         search_paths=[str(item) for item in data.get("search_paths", []) if item],
         show_grid_filenames=show_grid_filenames,
+        photo_filename_fill_shortcut=photo_filename_fill_shortcut.strip(),
         window_geometry=str(data.get("window_geometry", "")),
         splitter_sizes=splitter_sizes,
     )
@@ -82,6 +89,7 @@ def save_settings(settings: AppSettings) -> None:
         "preview_quality": settings.preview_quality,
         "search_paths": settings.search_paths[:20],
         "show_grid_filenames": settings.show_grid_filenames,
+        "photo_filename_fill_shortcut": settings.photo_filename_fill_shortcut or DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT,
         "window_geometry": settings.window_geometry,
         "splitter_sizes": settings.splitter_sizes,
     }

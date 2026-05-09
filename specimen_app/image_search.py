@@ -13,14 +13,29 @@ from typing import Callable, Iterable
 from .models import Row
 
 
-SUPPORTED_IMAGE_SUFFIXES = {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp"}
+SUPPORTED_IMAGE_SUFFIX_ORDER = (
+    ".tif",
+    ".tiff",
+    ".jpg",
+    ".jpeg",
+    ".jpe",
+    ".jfif",
+    ".png",
+    ".bmp",
+    ".webp",
+    ".gif",
+    ".jp2",
+    ".j2k",
+)
+SUPPORTED_IMAGE_SUFFIXES = set(SUPPORTED_IMAGE_SUFFIX_ORDER)
 TIF_IMAGE_SUFFIXES = {".tif", ".tiff"}
-JPG_IMAGE_SUFFIXES = {".jpg", ".jpeg"}
+JPG_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".jpe", ".jfif"}
 TIF_JPG_IMAGE_SUFFIXES = TIF_IMAGE_SUFFIXES | JPG_IMAGE_SUFFIXES
 IMAGE_TYPE_SUFFIXES = {
     "tif": TIF_IMAGE_SUFFIXES,
     "jpg": JPG_IMAGE_SUFFIXES,
     "tif_jpg": TIF_JPG_IMAGE_SUFFIXES,
+    "all": SUPPORTED_IMAGE_SUFFIXES,
 }
 EXCLUDED_DIR_NAMES = {"build", "dist", "releases", "__pycache__", ".git", ".agents"}
 EXCLUDED_SYSTEM_DIRS = {"proc", "sys", "dev", "run", "snap", "boot", "lib", "lib64", "sbin", "bin", "usr"}
@@ -28,7 +43,8 @@ EXCLUDED_PATH_PARTS = {("数据", "数据版本"), ("数据", "缩略图缓存")
 IDENTIFIER_SEPARATOR_RE = re.compile(r"[-_]+")
 NATURAL_SORT_RE = re.compile(r"(\d+)")
 IMAGE_INDEX_CACHE_LIMIT = 3
-IMAGE_INDEX_DISK_VERSION = 3
+# 新增格式和通用兜底检索后，旧磁盘索引需要失效重建。
+IMAGE_INDEX_DISK_VERSION = 4
 IMAGE_INDEX_CACHE_DIR_NAME = "图片搜索索引缓存"
 _IMAGE_INDEX_CACHE: OrderedDict[tuple[tuple[str, ...], int], list["ImageIndexEntry"]] = OrderedDict()
 _IMAGE_INDEX_LOCK = threading.RLock()
@@ -45,6 +61,7 @@ class ImageSearchResult:
     score: int
     matched_keywords: tuple[str, ...]
     is_linked: bool = False
+    linked_vouchers: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -66,13 +83,23 @@ class ImageSearchIndex:
     def __init__(self) -> None:
         self._entries: list[ImageIndexEntry] = []
         self._token_index: dict[str, set[int]] = {}
+        self._source_key: tuple[tuple[str, ...], int] | None = None
 
     @property
     def entries(self) -> list[ImageIndexEntry]:
         return list(self._entries)
 
-    def build(self, entries: list[ImageIndexEntry]) -> None:
+    @property
+    def source_key(self) -> tuple[tuple[str, ...], int] | None:
+        return self._source_key
+
+    def build(
+        self,
+        entries: list[ImageIndexEntry],
+        source_key: tuple[tuple[str, ...], int] | None = None,
+    ) -> None:
         self._entries = list(entries)
+        self._source_key = source_key
         self._token_index.clear()
         for idx, entry in enumerate(self._entries):
             tokens = self._tokenize(entry.stem)
@@ -104,6 +131,17 @@ class ImageSearchIndex:
         result = [idx for idx in candidates if self._verify_positions(idx, query_tokens)]
         return sorted(result, key=lambda i: natural_sort_key(self._entries[i].file_name))[:limit]
 
+    def contains_search(self, query: str, limit: int = 100) -> list[int]:
+        needles = self._contains_needles(query)
+        if not needles:
+            return []
+        result = []
+        for idx, entry in enumerate(self._entries):
+            haystacks = self._contains_haystacks(entry)
+            if any(needle in haystack for needle in needles for haystack in haystacks):
+                result.append(idx)
+        return sorted(result, key=lambda i: natural_sort_key(self._entries[i].file_name))[:limit]
+
     def _verify_positions(self, entry_idx: int, query_tokens: list[str]) -> bool:
         stem_tokens = self._tokenize(self._entries[entry_idx].stem)
         for start in range(len(stem_tokens) - len(query_tokens) + 1):
@@ -128,6 +166,22 @@ class ImageSearchIndex:
         return [t.lower() for t in IDENTIFIER_SEPARATOR_RE.split(text) if t]
 
     @staticmethod
+    def _contains_needles(text: str) -> tuple[str, ...]:
+        raw = str(text or "").strip().lower()
+        if not raw:
+            return ()
+        normalized = IDENTIFIER_SEPARATOR_RE.sub("-", raw)
+        return tuple(dict.fromkeys([raw, normalized]))
+
+    @staticmethod
+    def _contains_haystacks(entry: ImageIndexEntry) -> tuple[str, ...]:
+        raw_name = entry.file_name.lower()
+        raw_stem = entry.stem.lower()
+        normalized_name = IDENTIFIER_SEPARATOR_RE.sub("-", raw_name)
+        normalized_stem = IDENTIFIER_SEPARATOR_RE.sub("-", raw_stem)
+        return tuple(dict.fromkeys([raw_name, raw_stem, normalized_name, normalized_stem]))
+
+    @staticmethod
     def _prefixes(token: str) -> list[str]:
         return [token[: i + 1] for i in range(len(token))]
 
@@ -136,10 +190,14 @@ class ImageSearchIndex:
 
     @classmethod
     def from_dict(
-        cls, entries: list[ImageIndexEntry], data: dict[str, list[int]]
+        cls,
+        entries: list[ImageIndexEntry],
+        data: dict[str, list[int]],
+        source_key: tuple[tuple[str, ...], int] | None = None,
     ) -> "ImageSearchIndex":
         index = cls()
         index._entries = list(entries)
+        index._source_key = source_key
         index._token_index = {k: set(v) for k, v in data.items()}
         return index
 
@@ -402,10 +460,7 @@ def _image_index_disk_version_matches(path: Path) -> bool:
             prefix = handle.read(128)
     except OSError:
         return False
-    for ver in (IMAGE_INDEX_DISK_VERSION, IMAGE_INDEX_DISK_VERSION - 1):
-        if f'"version":{ver}' in prefix.replace(" ", ""):
-            return True
-    return False
+    return f'"version":{IMAGE_INDEX_DISK_VERSION}' in prefix.replace(" ", "")
 
 
 def _load_image_index_from_disk(cache_root: Path | str, key: tuple[tuple[str, ...], int]) -> list[ImageIndexEntry] | None:
@@ -490,6 +545,11 @@ def suffixes_for_image_type(image_type: str) -> set[str]:
     return set(IMAGE_TYPE_SUFFIXES.get(image_type, TIF_IMAGE_SUFFIXES))
 
 
+def image_file_filter() -> str:
+    suffix_patterns = " ".join(f"*{suffix}" for suffix in SUPPORTED_IMAGE_SUFFIX_ORDER)
+    return f"图片文件 ({suffix_patterns});;所有文件 (*.*)"
+
+
 def is_excluded_path(path: Path | str, root: Path | str) -> bool:
     workspace = Path(root).resolve()
     candidate = Path(path)
@@ -523,6 +583,7 @@ def image_search_results(
     should_stop: Callable[[], bool] | None = None,
     search_index: ImageSearchIndex | None = None,
     force_rebuild: bool = False,
+    path_to_vouchers: dict[str, list[str]] | None = None,
 ) -> list[ImageSearchResult]:
     workspace = Path(root).resolve()
     query = query.strip()
@@ -533,7 +594,11 @@ def image_search_results(
     effective_depth = effective_image_search_depth(all_roots, max_depth)
     allowed_suffixes = suffixes if suffixes is not None else TIF_IMAGE_SUFFIXES
 
+    key = _image_index_key(all_roots, effective_depth)
     index = search_index
+    # 原代码直接复用界面启动时的索引；切换到整个工作区或自定义目录时会拿错范围，导致 A- 等新目录图片搜不到。
+    if index is not None and index.source_key is not None and index.source_key != key:
+        index = None
     if index is None or force_rebuild:
         index = _get_or_build_search_index(
             all_roots,
@@ -547,6 +612,7 @@ def image_search_results(
 
     matched_indices = index.search(query, limit=limit * 3)
     matched_query = query
+    matched_score = 100
     if not matched_indices:
         # Progressive fallback: drop trailing tokens to find broader matches
         tokens = ImageSearchIndex._tokenize(query)
@@ -554,6 +620,11 @@ def image_search_results(
             tokens.pop()
             matched_query = "-".join(tokens)
             matched_indices = index.search(matched_query, limit=limit * 3)
+    if not matched_indices:
+        # 原代码只支持按分隔符 token 前缀检索；这里保留原逻辑，找不到时再按完整文件名做通用包含匹配。
+        matched_query = query
+        matched_score = 60
+        matched_indices = index.contains_search(query, limit=limit * 3)
     if not matched_indices:
         return []
 
@@ -569,14 +640,20 @@ def image_search_results(
         if not path.exists():
             continue
         relative = relative_display(path, workspace)
+        is_linked = path.resolve() in linked
+        # 原代码：linked_vouchers 仅在 is_linked 为 True 时才查询，导致关联到
+        # 其他标本的照片不显示入库编号。修复：无条件查询 path_to_vouchers，
+        # 让用户看到所有关联到的入库编号（不仅是当前标本的）。
+        linked_vouchers = (path_to_vouchers or {}).get(str(path.resolve()), []) or None
         results.append(
             ImageSearchResult(
                 path=path,
                 relative_path=relative,
                 file_name=entry.file_name,
-                score=100,
+                score=matched_score,
                 matched_keywords=(matched_query,),
-                is_linked=path.resolve() in linked,
+                is_linked=is_linked,
+                linked_vouchers=linked_vouchers,
             )
         )
         if len(results) >= limit:
@@ -619,7 +696,7 @@ def _get_or_build_search_index(
         return None
 
     index = ImageSearchIndex()
-    index.build(entries)
+    index.build(entries, source_key=key)
     with _SEARCH_INDEX_LOCK:
         _remember_search_index(key, index)
     if cache_root is not None:
@@ -698,7 +775,7 @@ def _load_search_index_from_disk(
                 suffix=str(item.get("suffix") or entry_path.suffix.lower()).lower(),
             )
         )
-    return ImageSearchIndex.from_dict(entries, token_data)
+    return ImageSearchIndex.from_dict(entries, token_data, source_key=key)
 
 
 def effective_image_search_depth(roots: list[Path | str], max_depth: int = 0) -> int:

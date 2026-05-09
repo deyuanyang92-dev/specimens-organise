@@ -9,14 +9,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PIL import Image
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPoint, QSize, QStringListModel, QByteArray
-from PyQt5.QtGui import QImage, QPixmap, QKeySequence, QFont, QPainter, QCursor, QFontMetrics
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPoint, QSize, QByteArray, QModelIndex
+from PyQt5.QtGui import QImage, QPixmap, QKeySequence, QFont, QPainter, QCursor, QFontMetrics, QStandardItem, QStandardItemModel
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -27,6 +28,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QShortcut,
     QListWidgetItem,
     QMainWindow,
     QMenu,
@@ -48,7 +50,22 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 
 from . import __version__
-from .app_settings import PREVIEW_QUALITY_OPTIONS, PREVIEW_QUALITY_SIZES, load_settings, remember_workspace, save_settings
+from .app_settings import (
+    DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT,
+    PREVIEW_QUALITY_OPTIONS,
+    PREVIEW_QUALITY_SIZES,
+    load_settings,
+    remember_workspace,
+    save_settings,
+)
+from .classification_fields import (
+    EDITABLE_CLASSIFICATION_COLUMNS,
+    FAMILY_LOOKUP_INPUT_COLUMNS,
+    SPECIES_LOOKUP_INPUT_COLUMNS,
+    TAXONOMY_LOOKUP_INPUT_COLUMNS,
+    classification_values_from_family_match,
+    classification_values_from_species_match,
+)
 from .icon import get_app_icon
 from .excel_store import ExcelStore
 from .image_cache import ThumbnailCache
@@ -59,21 +76,27 @@ from .image_search import (
     append_images_to_index,
     clear_image_index,
     default_image_query,
+    image_file_filter,
     image_index_exists,
     image_search_results,
+    is_supported_image,
     suffixes_for_image_type,
 )
+from .batch_export import BatchExportDialog  # 批量导出功能
 from .models import (
-    CLASSIFICATION_HEADERS,
     ImportConflictError,
     SAVE_METHOD_OPTIONS,
     SPECIMEN_HEADERS,
     WorkspaceLockedError,
     WorkspaceNotInitializedError,
 )
-from .parsing import extract_photo_date, extract_tube_from_filename, extract_location_code, parse_voucher_serial
+from .parsing import (
+    derive_specimen_fields_from_tube_number,
+    extract_specimen_tube_from_filename,
+    parse_voucher_serial,
+)
 from .release_manager import list_releases
-from .species import SpeciesMatch, SpeciesMatcher
+from .species import FamilyMatch, SpeciesMatch, SpeciesMatcher
 from .workspace import default_workspace, has_workspace_data, initialize_workspace, is_generated_workspace_path
 
 
@@ -82,6 +105,15 @@ from .workspace import default_workspace, has_workspace_data, initialize_workspa
 # ---------------------------------------------------------------------------
 
 def grid_shape(count: int) -> tuple[int, int]:
+    """根据照片数量计算最佳网格列数和行数。
+
+    布局规则：
+    - 1张: (1, 1)  单格填满
+    - 2张: (2, 1)  水平并列
+    - 3-4张: (2, 2) 2×2方阵
+    - 5-6张: (3, 2) 3列2行
+    - 7-8张: (4, 2) 4列2行
+    """
     if count <= 2:
         return max(1, count), 1
     if count <= 4:
@@ -89,6 +121,93 @@ def grid_shape(count: int) -> tuple[int, int]:
     if count <= 6:
         return 3, 2
     return 4, 2
+
+
+def _join_display(*parts: str) -> str:
+    return "  ".join(part for part in parts if part)
+
+
+TAXONOMY_INSERT_TEXT_ROLE = Qt.UserRole + 1
+TAXONOMY_CANDIDATE_ROW_ROLE = Qt.UserRole + 2
+
+
+class FieldValueCompleter(QCompleter):
+    """Show full taxonomy candidates, but insert only the active field value."""
+
+    def pathFromIndex(self, index: QModelIndex) -> str:
+        value = index.data(TAXONOMY_INSERT_TEXT_ROLE)
+        return str(value or "")
+
+
+def format_taxonomy_candidate_label(
+    field: str,
+    kind: str,
+    match: SpeciesMatch | FamilyMatch,
+) -> str:
+    if kind == "species" and isinstance(match, SpeciesMatch):
+        if field == "属名":
+            return _join_display(
+                match.genus_name,
+                match.chinese_name,
+                match.latin_name,
+                match.family_name,
+                match.family_latin,
+            )
+        if field == "种拉丁":
+            return _join_display(match.latin_name, match.chinese_name, match.family_name, match.family_latin)
+        return _join_display(match.chinese_name, match.latin_name, match.family_name, match.family_latin)
+    if kind == "family" and isinstance(match, FamilyMatch):
+        if field == "科拉丁":
+            return _join_display(match.family_latin, match.family_name)
+        return _join_display(match.family_name, match.family_latin)
+    return ""
+
+
+def classification_column_value_from_taxonomy_match(
+    field: str,
+    kind: str,
+    match: SpeciesMatch | FamilyMatch,
+) -> str:
+    if kind == "species" and isinstance(match, SpeciesMatch):
+        if field == "属名":
+            return match.genus_name
+        if field == "种拉丁":
+            return match.latin_name
+        return match.chinese_name
+    if kind == "family" and isinstance(match, FamilyMatch):
+        if field == "科拉丁":
+            return match.family_latin
+        return match.family_name
+    return ""
+
+
+PHOTO_FILENAME_FILL_FIELDS = ("管内编号*", "采集地点缩写*", "采集日期", "保存方式")
+
+
+def photo_filename_source_for_specimen_fill(photo_row: dict[str, Any]) -> str:
+    """Use the original name first; archived names may have suffixes like _2."""
+    original = str(photo_row.get("原始文件名", "") or "").strip()
+    if original:
+        return original
+    return str(photo_row.get("文件名", "") or "").strip()
+
+
+def specimen_updates_from_photo_filename(filename: str) -> dict[str, str]:
+    tube = extract_specimen_tube_from_filename(filename)
+    updates: dict[str, str] = {}
+    if tube:
+        updates["管内编号*"] = tube
+        # 原照片文件名逻辑分别解析日期、地点和保存方式；现在复用管内编号派生逻辑，避免两套规则不一致。
+        updates.update(derive_specimen_fields_from_tube_number(tube))
+    return {field: updates[field] for field in PHOTO_FILENAME_FILL_FIELDS if updates.get(field)}
+
+
+def default_photo_filename_fill_fields(updates: dict[str, str], current: dict[str, Any]) -> list[str]:
+    return [
+        field
+        for field in PHOTO_FILENAME_FILL_FIELDS
+        if updates.get(field) and not str(current.get(field, "") or "").strip()
+    ]
 
 
 VIEW_MODES = [
@@ -583,6 +702,8 @@ class SpecimenWindow(QMainWindow):
         self.specimen_widgets: dict[str, QLineEdit | QComboBox] = {}
         self.class_widgets: dict[str, QLineEdit] = {}
         self.photo_widgets: dict[str, QLineEdit] = {}
+        self._taxonomy_candidate_models: dict[str, QStandardItemModel] = {}
+        self._taxonomy_candidate_rows: dict[str, list[tuple[str, SpeciesMatch | FamilyMatch]]] = {}
 
         self._save_timers: dict[str, QTimer] = {}
         self._list_refresh_timer = QTimer(self)
@@ -592,6 +713,13 @@ class SpecimenWindow(QMainWindow):
         self._current_qpixmap: QPixmap | None = None
         self._grid_labels: list[GridPhotoCell] = []
         self._grid_requests: dict[int, int] = {}  # token -> slot index
+        self._photo_filename_fill_action: QAction | None = None
+
+        # 搜索数据容器：必须在 _build_ui() 之前初始化，因为 UI 构造期间
+        # QComboBox.currentIndexChanged 信号可能提前触发 _apply_voucher_filter。
+        self._all_vouchers: list[str] = []
+        self._all_tube_numbers: dict[str, str] = {}
+        self._all_photo_filenames: dict[str, list[str]] = {}
 
         self._build_ui()
 
@@ -687,9 +815,13 @@ class SpecimenWindow(QMainWindow):
 
     def eventFilter(self, obj, event) -> bool:
         if obj is self.photo_table and event.type() == event.KeyPress:
+            if event.matches(QKeySequence.Copy):
+                return self._copy_photo_table_selection()
             if event.modifiers() & Qt.ControlModifier and event.key() == Qt.Key_A:
                 self.photo_table.selectAll()
                 return True
+            if event.key() == Qt.Key_F2:
+                return self._edit_current_photo_table_item()
         return super().eventFilter(obj, event)
 
     # ---- UI building ----
@@ -705,6 +837,7 @@ class SpecimenWindow(QMainWindow):
             ("导入工作区", self.import_workspace),
             ("导入数据", self.import_data_file),
             ("导出数据", self.export_data),
+            ("批量导出", self.open_batch_export),  # 批量导出：类似 NCBI Batch Entrez
             ("切换工作区", self.switch_workspace),
             ("撤回", self.undo),
             ("返回", self.redo),
@@ -833,10 +966,20 @@ class SpecimenWindow(QMainWindow):
         # Search + quick filter
         filter_row = QHBoxLayout()
         self._voucher_search = QLineEdit()
-        self._voucher_search.setPlaceholderText("搜索编号...")
+        self._voucher_search.setPlaceholderText("搜索编号/照片名...")
         self._voucher_search.setClearButtonEnabled(True)
         self._voucher_search.textChanged.connect(self._apply_voucher_filter)
         filter_row.addWidget(self._voucher_search)
+        self._search_scope = QComboBox()
+        self._search_scope.addItems(["全部", "入库编号", "管内编号", "照片名"])
+        self._search_scope.setFixedWidth(80)
+        self._search_scope.currentIndexChanged.connect(self._apply_voucher_filter)
+        filter_row.addWidget(self._search_scope)
+        # 复选框：显示/隐藏关联照片列
+        self._show_photos_checkbox = QCheckBox("照片名")
+        self._show_photos_checkbox.setToolTip("在凭证列表中显示关联的照片文件名")
+        self._show_photos_checkbox.toggled.connect(self._toggle_photo_names_column)
+        filter_row.addWidget(self._show_photos_checkbox)
         voucher_layout.addLayout(filter_row)
         quick_row = QHBoxLayout()
         quick_row.setSpacing(2)
@@ -853,10 +996,12 @@ class SpecimenWindow(QMainWindow):
         self._active_filter = "all"
         voucher_layout.addLayout(quick_row)
         # Table: 入库编号 | 标本 | 照片 | 分类 | 认领 | 照片数
-        self.voucher_table = QTableWidget(0, 6)
-        self.voucher_table.setHorizontalHeaderLabels(["入库编号","标本","照片","分类","认领","照片数"])
+        self.voucher_table = QTableWidget(0, 7)
+        self.voucher_table.setHorizontalHeaderLabels(["入库编号","标本","照片","分类","认领","照片数","关联照片"])
         self.voucher_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.voucher_table.setSelectionMode(QTableWidget.SingleSelection)
+        # 原代码：SingleSelection 仅单选；改为 ExtendedSelection 支持 Windows 操作习惯：
+        # Ctrl+Click 多选 / Shift+Click 范围选 / 拖拽多选
+        self.voucher_table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.voucher_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.voucher_table.verticalHeader().setVisible(False)
         self.voucher_table.setColumnWidth(0, 85)
@@ -865,14 +1010,18 @@ class SpecimenWindow(QMainWindow):
         self.voucher_table.setColumnWidth(3, 36)
         self.voucher_table.setColumnWidth(4, 52)
         self.voucher_table.setColumnWidth(5, 42)
+        self.voucher_table.setColumnWidth(6, 0)  # 关联照片列：默认隐藏，通过复选框切换
         self.voucher_table.horizontalHeader().setStretchLastSection(True)
         self.voucher_table.setFont(QFont("Consolas", 10))
         self.voucher_table.itemSelectionChanged.connect(self._on_voucher_table_selected)
         self.voucher_table.horizontalHeader().sectionClicked.connect(self._on_voucher_header_clicked)
         self.voucher_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.voucher_table.customContextMenuRequested.connect(self._voucher_context_menu)
+        # Ctrl+A 全选快捷键（Windows 操作习惯）
+        _ = QShortcut(QKeySequence("Ctrl+A"), self.voucher_table, self._select_all_vouchers)
         self._col_filters: dict[int, str] = {}  # col_index -> filter value
-        self._col_header_labels = ["入库编号","标本","照片","分类","认领","照片数"]
+        self._col_header_labels = ["入库编号","标本","照片","分类","认领","照片数","关联照片"]
+        self._show_photo_names = False
         voucher_layout.addWidget(self.voucher_table, stretch=1)
         # Pagination
         page_row = QHBoxLayout()
@@ -921,13 +1070,14 @@ class SpecimenWindow(QMainWindow):
         self.photo_table = QTableWidget(0, 4)
         self.photo_table.setHorizontalHeaderLabels(["序号", "文件名", "相对路径", "描述"])
         self.photo_table.horizontalHeader().setStretchLastSection(True)
-        self.photo_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.photo_table.setSelectionBehavior(QTableWidget.SelectItems)
         self.photo_table.setSelectionMode(QTableWidget.ExtendedSelection)
-        self.photo_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.photo_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed | QTableWidget.SelectedClicked)
         self.photo_table.setColumnWidth(0, 44)
         self.photo_table.setColumnWidth(1, 150)
         self.photo_table.setColumnWidth(2, 210)
         self.photo_table.currentCellChanged.connect(self._on_photo_table_row_changed)
+        self.photo_table.itemChanged.connect(self._on_photo_table_item_changed)
         self.photo_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.photo_table.customContextMenuRequested.connect(self._photo_table_context_menu)
         self.photo_table.installEventFilter(self)
@@ -949,6 +1099,8 @@ class SpecimenWindow(QMainWindow):
             if field == "相对路径":
                 widget.setReadOnly(True)
             elif field == "文件名":
+                widget.setReadOnly(False)
+                widget.setClearButtonEnabled(True)
                 widget.textChanged.connect(lambda text, f=field: self.schedule_save("photo", f))
                 widget.setContextMenuPolicy(Qt.CustomContextMenu)
                 widget.customContextMenuRequested.connect(lambda pos, w=widget: self._filename_context_menu(w, pos))
@@ -961,19 +1113,21 @@ class SpecimenWindow(QMainWindow):
         photo_save_btn.clicked.connect(lambda: self._save_panel("photo"))
         pf_layout.addWidget(photo_save_btn)
         self.photo_panel = self._create_panel("照片信息", photo_content)
+        # 存储照片面板标题 QLabel，以便切换标本时动态显示当前入库编号
+        self._photo_panel_title = self.photo_panel.findChild(QLabel)
 
         # Right: classification panel
         class_content = QWidget()
         cf_layout = QFormLayout(class_content)
         cf_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
         cf_layout.setContentsMargins(0, 0, 0, 0)
-        for field in CLASSIFICATION_HEADERS[1:]:
+        for field in EDITABLE_CLASSIFICATION_COLUMNS:
             widget = QLineEdit()
             widget.textChanged.connect(lambda text, f=field: self.schedule_save("classification", f))
             cf_layout.addRow(field, widget)
             self.class_widgets[field] = widget
-            if field == "种名*":
-                self._setup_species_completer(widget)
+            if field in TAXONOMY_LOOKUP_INPUT_COLUMNS:
+                self._attach_taxonomy_lookup_to_classification_field(field, widget)
         class_save_btn = QPushButton("保存分类信息")
         class_save_btn.clicked.connect(lambda: self._save_panel("classification"))
         cf_layout.addRow(class_save_btn)
@@ -1055,47 +1209,158 @@ class SpecimenWindow(QMainWindow):
         esc_shortcut.triggered.connect(self.return_to_grid)
         self.addAction(esc_shortcut)
 
-    # ---- Species autocomplete ----
+        self._photo_filename_fill_action = QAction("从照片文件名填充标本信息", self)
+        self._photo_filename_fill_action.triggered.connect(self.fill_current_photo_from_filename)
+        self.addAction(self._photo_filename_fill_action)
+        self._apply_photo_filename_fill_shortcut()
 
-    def _setup_species_completer(self, line_edit: QLineEdit) -> None:
-        self._species_completer = QCompleter(self)
-        self._species_model = QStringListModel(self)
-        self._species_completer.setModel(self._species_model)
-        self._species_completer.setCaseSensitivity(Qt.CaseInsensitive)
-        self._species_completer.activated.connect(self._on_species_activated)
-        line_edit.setCompleter(self._species_completer)
-        self._species_match_map: dict[str, SpeciesMatch] = {}
-        line_edit.textChanged.connect(self._update_species_suggestions)
-
-    def _update_species_suggestions(self, text: str) -> None:
-        if not text or len(text) < 1:
+    def _apply_photo_filename_fill_shortcut(self) -> None:
+        if self._photo_filename_fill_action is None:
             return
-        matches = self.matcher.matches(text)
-        display_list = []
-        self._species_match_map.clear()
-        for m in matches:
-            display = f"{m.chinese_name}  {m.latin_name}  {m.family_name}"
-            display_list.append(display)
-            self._species_match_map[display] = m
-        self._species_model.setStringList(display_list)
+        settings = load_settings()
+        shortcut = settings.photo_filename_fill_shortcut or DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT
+        self._photo_filename_fill_action.setShortcut(QKeySequence(shortcut))
+        self._photo_filename_fill_action.setShortcutContext(Qt.ApplicationShortcut)
 
-    def _on_species_activated(self, text: str) -> None:
-        match = self._species_match_map.get(text)
-        if not match or not self.current_voucher:
-            return
-        self._loading = True
-        self.class_widgets["种名*"].setText(match.chinese_name)
-        self.class_widgets["种拉丁"].setText(match.latin_name)
-        self.class_widgets["科*"].setText(match.family_name)
-        self.class_widgets["科拉丁"].setText(match.family_latin)
-        self.store.set_fields(
-            "classification", self.current_voucher,
-            {"种名*": match.chinese_name, "种拉丁": match.latin_name,
-             "科*": match.family_name, "科拉丁": match.family_latin},
-            action_type="classification_autofill",
+    # ---- Taxonomy lookup ----
+
+    def _attach_taxonomy_lookup_to_classification_field(self, field: str, line_edit: QLineEdit) -> None:
+        completer = FieldValueCompleter(self)
+        model = QStandardItemModel(self)
+        completer.setModel(model)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setCompletionMode(QCompleter.UnfilteredPopupCompletion)
+        completer.setMaxVisibleItems(20)
+        completer.activated[QModelIndex].connect(
+            lambda index, f=field: self._fill_fields_from_selected_taxonomy_candidate(f, index)
         )
+        line_edit.setCompleter(completer)
+        line_edit.textChanged.connect(
+            lambda text, f=field, w=line_edit: self._refresh_taxonomy_lookup_candidates(f, text, w)
+        )
+        line_edit.editingFinished.connect(lambda f=field: self._fill_fields_from_unique_taxonomy_match(f))
+        self._taxonomy_candidate_models[field] = model
+        self._taxonomy_candidate_rows[field] = []
+
+    def _refresh_taxonomy_lookup_candidates(self, field: str, text: str, line_edit: QLineEdit) -> None:
+        model = self._taxonomy_candidate_models.get(field)
+        if model is None:
+            return
+        model.clear()
+        candidates: list[tuple[str, SpeciesMatch | FamilyMatch]] = []
+        self._taxonomy_candidate_rows[field] = candidates
+        if self._loading or not text.strip():
+            return
+
+        if field in SPECIES_LOOKUP_INPUT_COLUMNS:
+            for match in self.matcher.species_matches(text):
+                self._add_taxonomy_candidate_to_model(model, candidates, field, "species", match)
+        elif field in FAMILY_LOOKUP_INPUT_COLUMNS:
+            for match in self.matcher.family_matches(text):
+                self._add_taxonomy_candidate_to_model(model, candidates, field, "family", match)
+
+        completer = line_edit.completer()
+        if candidates and completer is not None and line_edit.hasFocus():
+            completer.complete()
+
+    def _add_taxonomy_candidate_to_model(
+        self,
+        model: QStandardItemModel,
+        candidates: list[tuple[str, SpeciesMatch | FamilyMatch]],
+        field: str,
+        kind: str,
+        match: SpeciesMatch | FamilyMatch,
+    ) -> None:
+        insert_value = classification_column_value_from_taxonomy_match(field, kind, match)
+        if not insert_value:
+            return
+        item = QStandardItem(format_taxonomy_candidate_label(field, kind, match))
+        item.setEditable(False)
+        item.setData(insert_value, TAXONOMY_INSERT_TEXT_ROLE)
+        item.setData(len(candidates), TAXONOMY_CANDIDATE_ROW_ROLE)
+        model.appendRow(item)
+        candidates.append((kind, match))
+
+    def _fill_fields_from_selected_taxonomy_candidate(self, field: str, index: QModelIndex) -> None:
+        raw_row = index.data(TAXONOMY_CANDIDATE_ROW_ROLE)
+        if raw_row is None:
+            return
+        try:
+            row = int(raw_row)
+        except (TypeError, ValueError):
+            return
+        candidates = self._taxonomy_candidate_rows.get(field, [])
+        if not 0 <= row < len(candidates):
+            return
+        kind, match = candidates[row]
+        QTimer.singleShot(
+            0,
+            lambda k=kind, m=match: self._fill_classification_fields_from_taxonomy_match(k, m),
+        )
+
+    def _fill_fields_from_unique_taxonomy_match(self, field: str) -> None:
+        if self._loading or not self.current_voucher:
+            return
+        widget = self.class_widgets.get(field)
+        if widget is None:
+            return
+        text = widget.text().strip()
+        if not text:
+            return
+        if field in SPECIES_LOOKUP_INPUT_COLUMNS:
+            match = self.matcher.resolve_unique_species(text)
+            if match is not None:
+                self._fill_classification_fields_from_taxonomy_match("species", match)
+        elif field in FAMILY_LOOKUP_INPUT_COLUMNS:
+            match = self.matcher.resolve_unique_family(text)
+            if match is not None:
+                self._fill_classification_fields_from_taxonomy_match("family", match)
+
+    def _fill_classification_fields_from_taxonomy_match(self, kind: str, match: SpeciesMatch | FamilyMatch) -> None:
+        if kind == "species" and isinstance(match, SpeciesMatch):
+            updates = classification_values_from_species_match(match)
+        elif kind == "family" and isinstance(match, FamilyMatch):
+            updates = classification_values_from_family_match(match)
+        else:
+            updates = {}
+        self._apply_classification_updates(updates)
+
+    def _apply_classification_updates(self, updates: dict[str, str]) -> None:
+        if not self.current_voucher:
+            return
+        updates = {field: value for field, value in updates.items() if field in self.class_widgets}
+        if not updates:
+            return
+        self._cancel_pending_classification_saves(updates)
+        try:
+            self.store.set_fields(
+                "classification",
+                self.current_voucher,
+                updates,
+                action_type="classification_autofill",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "保存失败", str(exc))
+            return
+
+        self._loading = True
+        try:
+            for field, value in updates.items():
+                widget = self.class_widgets.get(field)
+                if widget is None:
+                    continue
+                widget.blockSignals(True)
+                widget.setText(value)
+                widget.blockSignals(False)
+        finally:
+            self._loading = False
         self.refresh_list()
-        self._loading = False
+
+    def _cancel_pending_classification_saves(self, updates: dict[str, str]) -> None:
+        for field in updates:
+            timer = self._save_timers.pop(f"classification:{field}", None)
+            if timer is not None:
+                timer.stop()
 
     # ---- Voucher list ----
 
@@ -1107,6 +1372,17 @@ class SpecimenWindow(QMainWindow):
         self._all_vouchers = self.store.list_vouchers()
         self._all_flags = self.store.all_status_flags()
         self._all_photo_counts = self.store.voucher_photo_counts()
+        self._all_tube_numbers = {}
+        # 每个凭证的关联照片文件名列表（用于搜索和显示）
+        self._all_photo_filenames: dict[str, list[str]] = {}
+        for voucher in self._all_vouchers:
+            specimen = self.store.get_specimen(voucher)
+            if specimen:
+                tube = str(specimen.get("管内编号*", "") or "").strip()
+                if tube:
+                    self._all_tube_numbers[voucher] = tube
+            photos = self.store.get_photos(voucher)
+            self._all_photo_filenames[voucher] = [str(p.get("文件名", "")) for p in photos if p.get("文件名")]
         self._apply_voucher_filter()
         if current and current in self._all_flags:
             self._select_voucher_in_table(current)
@@ -1114,7 +1390,7 @@ class SpecimenWindow(QMainWindow):
 
     def _on_voucher_header_clicked(self, col: int) -> None:
         """Cycle column filter: all -> √ -> × -> all (or all -> 已认领 -> 未认领 -> all for col 4)."""
-        if col == 0 or col == 5:  # 入库编号 or 照片数 — no per-column filter
+        if col in (0, 5, 6):  # 入库编号、照片数、关联照片 — no per-column filter
             return
         # Clear quick filter when using column filters
         self._active_filter = "all"
@@ -1143,7 +1419,20 @@ class SpecimenWindow(QMainWindow):
         vouchers = self._all_vouchers
         # Apply search
         if search:
-            vouchers = [v for v in vouchers if search in v.lower()]
+            scope = self._search_scope.currentText()
+            if scope == "入库编号":
+                vouchers = [v for v in vouchers if search in v.lower()]
+            elif scope == "管内编号":
+                vouchers = [v for v in vouchers if search in self._all_tube_numbers.get(v, "").lower()]
+            elif scope == "照片名":
+                vouchers = [v for v in vouchers if any(search in fn.lower() for fn in self._all_photo_filenames.get(v, []))]
+            else:  # 全部：搜索入库编号 + 管内编号 + 照片名
+                vouchers = [
+                    v for v in vouchers
+                    if search in v.lower()
+                    or search in self._all_tube_numbers.get(v, "").lower()
+                    or any(search in fn.lower() for fn in self._all_photo_filenames.get(v, []))
+                ]
         # Apply quick filter
         af = self._active_filter
         if af == "claimed":
@@ -1181,6 +1470,11 @@ class SpecimenWindow(QMainWindow):
             self.voucher_table.setItem(i, 3, QTableWidgetItem(label[2]))
             self.voucher_table.setItem(i, 4, QTableWidgetItem(claimed))
             self.voucher_table.setItem(i, 5, QTableWidgetItem(str(pc)))
+            # 关联照片列：显示逗号分隔的照片文件名（可通过复选框隐藏）
+            fnames = self._all_photo_filenames.get(v, [])
+            photo_item = QTableWidgetItem("，".join(fnames) if fnames else "")
+            photo_item.setToolTip("\n".join(fnames) if fnames else "")
+            self.voucher_table.setItem(i, 6, photo_item)
         self.voucher_table.blockSignals(False)
         self._voucher_page_label.setText(f"第 {self._voucher_page + 1}/{total_pages} 页")
         self._voucher_prev_btn.setEnabled(self._voucher_page > 0)
@@ -1194,6 +1488,14 @@ class SpecimenWindow(QMainWindow):
         self._update_header_labels()
         self._voucher_page = 0
         self._apply_voucher_filter()
+
+    def _toggle_photo_names_column(self, show: bool) -> None:
+        """切换凭证列表中'关联照片'列的显示/隐藏。"""
+        self._show_photo_names = show
+        if show:
+            self.voucher_table.setColumnWidth(6, 200)
+        else:
+            self.voucher_table.setColumnWidth(6, 0)
 
     def _voucher_prev_page(self) -> None:
         if self._voucher_page > 0:
@@ -1210,8 +1512,10 @@ class SpecimenWindow(QMainWindow):
         rows = self.voucher_table.selectionModel().selectedRows()
         if not rows:
             return
-        voucher = self.voucher_table.item(rows[0].row(), 0).text()
-        self.select_voucher(voucher)
+        # 单选时自动跳转到该标本（保持原有行为）；多选时不跳转（避免混乱）
+        if len(rows) == 1:
+            voucher = self.voucher_table.item(rows[0].row(), 0).text()
+            self.select_voucher(voucher)
 
     def _select_voucher_in_table(self, voucher: str) -> None:
         for row in range(self.voucher_table.rowCount()):
@@ -1219,6 +1523,10 @@ class SpecimenWindow(QMainWindow):
             if item and item.text() == voucher:
                 self.voucher_table.selectRow(row)
                 return
+
+    def _select_all_vouchers(self) -> None:
+        """Ctrl+A 全选凭证列表中当前可见的所有行。"""
+        self.voucher_table.selectAll()
 
     def _update_dashboard(self) -> None:
         if not hasattr(self, "_dashboard_timer"):
@@ -1243,6 +1551,9 @@ class SpecimenWindow(QMainWindow):
         self._save_current_photo_view_state()
         self._loading = True
         self.current_voucher = voucher
+        # 动态更新照片面板标题，显示当前入库编号
+        if hasattr(self, "_photo_panel_title") and self._photo_panel_title:
+            self._photo_panel_title.setText(f"照片信息 — {voucher}")
         specimen = self.store.get_specimen(voucher) or {}
         classification = self.store.get_classification(voucher) or {}
         for field, widget in self.specimen_widgets.items():
@@ -1282,6 +1593,19 @@ class SpecimenWindow(QMainWindow):
             timer.stop()
         self._save_timers.clear()
 
+    def _flush_pending_saves(self, category: str | None = None) -> int:
+        saved = 0
+        for key, timer in list(self._save_timers.items()):
+            if category is not None and not key.startswith(category + ":"):
+                continue
+            timer.stop()
+            parts = key.split(":", 1)
+            if len(parts) == 2:
+                self.save_field(parts[0], parts[1], self.current_voucher)
+                saved += 1
+            self._save_timers.pop(key, None)
+        return saved
+
     def save_field(self, category: str, field: str, voucher: str | None = None) -> None:
         if voucher is None:
             voucher = self.current_voucher
@@ -1298,10 +1622,15 @@ class SpecimenWindow(QMainWindow):
                 if changed:
                     specimen = self.store.get_specimen(voucher) or {}
                     self._loading = True
-                    for auto_field in ("采集日期", "采集地点缩写*"):
+                    # 原代码只刷新“采集日期”和“采集地点缩写*”；现在管内编号也会派生“保存方式”。
+                    for auto_field in ("采集日期", "采集地点缩写*", "保存方式"):
                         w = self.specimen_widgets[auto_field]
                         w.blockSignals(True)
-                        w.setText(str(specimen.get(auto_field, "")))
+                        value = str(specimen.get(auto_field, ""))
+                        if isinstance(w, QComboBox):
+                            w.setCurrentText(value)
+                        else:
+                            w.setText(value)
                         w.blockSignals(False)
                     self._loading = False
             elif category == "classification":
@@ -1310,16 +1639,19 @@ class SpecimenWindow(QMainWindow):
                 if field == "描述":
                     self.store.set_photo_description(voucher, self.current_photo_index, self.photo_widgets["描述"].text())
                 elif field == "文件名":
-                    rows = self.store.read_rows("photo")
-                    matches = [i for i, r in enumerate(rows) if self.store._value(r, "入库编号*") == voucher]
-                    if self.current_photo_index < len(matches):
-                        idx = matches[self.current_photo_index]
-                        rows[idx]["文件名"] = self.photo_widgets["文件名"].text()
-                        self.store._write_rows("photo", rows)
-                        self.store._update_summary_modified(voucher)
-                        self.store._record_action("update_photo", voucher, "photo", "文件名", {}, rows[idx].copy())
+                    self.store.set_photo_filename(voucher, self.current_photo_index, self.photo_widgets["文件名"].text())
                 self.current_photos = self.store.get_photos(voucher)
                 self.refresh_photo_table()
+                if field == "文件名":
+                    if self.current_photo_index < len(self.current_photos):
+                        actual = str(self.current_photos[self.current_photo_index].get("文件名", ""))
+                        self.photo_widgets["文件名"].blockSignals(True)
+                        self.photo_widgets["文件名"].setText(actual)
+                        self.photo_widgets["文件名"].blockSignals(False)
+                    cell = self._current_grid_cell()
+                    if cell is not None and self.current_photo_index < len(self.current_photos):
+                        cell.set_filename(str(self.current_photos[self.current_photo_index].get("文件名", "")))
+                    self._refresh_image_index_after_photo_change()
             self._schedule_list_refresh()
         except Exception as exc:
             # Roll back widget to last-known-good value from the store
@@ -1362,15 +1694,20 @@ class SpecimenWindow(QMainWindow):
             QMessageBox.information(self, "清除照片关联", f"{self.current_voucher} 没有关联的照片。")
             return
         if QMessageBox.question(
-            self, "清除照片关联", f"确定清除 {self.current_voucher} 的全部 {len(photos)} 张照片关联吗？\n\n（入库编号、标本信息和分类信息将保留不变）",
+            self,
+            "清除照片关联",
+            f"确定清除 {self.current_voucher} 的全部 {len(photos)} 张照片关联吗？\n\n"
+            "入库编号、标本信息和分类信息将保留不变；未被其他记录引用的工作区归档照片文件也会删除。",
             QMessageBox.Yes | QMessageBox.No,
         ) != QMessageBox.Yes:
             return
         count = self.store.clear_photos(self.current_voucher)
         self.statusBar().showMessage(f"已清除 {self.current_voucher} 的 {count} 张照片关联", 3000)
+        self._refresh_image_index_after_photo_change()
         self.reload_current()
 
     def _voucher_context_menu(self, pos) -> None:
+        """右键菜单：单行操作 + 多选批量删除。"""
         index = self.voucher_table.indexAt(pos)
         if not index.isValid():
             return
@@ -1381,14 +1718,47 @@ class SpecimenWindow(QMainWindow):
         if not voucher_text:
             return
 
+        # 获取当前选中的所有行（支持 ExtendedSelection 多选）
+        selected_rows = self.voucher_table.selectionModel().selectedRows()
+        selected_vouchers: list[str] = []
+        for model_index in selected_rows:
+            item = self.voucher_table.item(model_index.row(), 0)
+            if item and item.text().strip():
+                selected_vouchers.append(item.text().strip())
+
         menu = QMenu(self)
+        # 批量导出：将选中的入库编号带入对话框（单行也支持，方便快捷导出当前标本）
+        if len(selected_vouchers) >= 1:
+            menu.addAction(
+                f"批量导出选中 ({len(selected_vouchers)}个)",
+                lambda: self._context_batch_export(selected_vouchers),
+            )
+            menu.addSeparator()
         menu.addAction("清除照片关联", lambda: self._context_clear_photos(voucher_text))
         menu.addSeparator()
+
+        # 单行删除（右键点击的行）
         has_photos = bool(self.store.get_photos(voucher_text))
         if not has_photos:
             menu.addAction("删除入库编号", lambda: self._context_delete_voucher(voucher_text))
         else:
             menu.addAction("删除入库编号（需先清除照片关联）").setEnabled(False)
+
+        # 多选批量删除：仅当选中 >= 2 行时显示
+        if len(selected_vouchers) >= 2:
+            menu.addSeparator()
+            # 统计可删除的（无照片关联的）数量
+            eligible = [v for v in selected_vouchers if not self.store.get_photos(v)]
+            skipped = len(selected_vouchers) - len(eligible)
+            label = f"删除选中的入库编号 ({len(eligible)}个)"
+            if skipped:
+                label += f"，跳过{skipped}个有照片的"
+            action = menu.addAction(label)
+            if not eligible:
+                action.setEnabled(False)
+            else:
+                action.triggered.connect(lambda: self._context_batch_delete_vouchers(eligible))
+
         menu.exec_(self.voucher_table.viewport().mapToGlobal(pos))
 
     def _context_clear_photos(self, voucher: str) -> None:
@@ -1397,12 +1767,16 @@ class SpecimenWindow(QMainWindow):
             QMessageBox.information(self, "清除照片关联", f"{voucher} 没有关联的照片。")
             return
         if QMessageBox.question(
-            self, "清除照片关联", f"确定清除 {voucher} 的全部 {len(photos)} 张照片关联吗？\n\n（入库编号、标本信息和分类信息将保留不变）",
+            self,
+            "清除照片关联",
+            f"确定清除 {voucher} 的全部 {len(photos)} 张照片关联吗？\n\n"
+            "入库编号、标本信息和分类信息将保留不变；未被其他记录引用的工作区归档照片文件也会删除。",
             QMessageBox.Yes | QMessageBox.No,
         ) != QMessageBox.Yes:
             return
         count = self.store.clear_photos(voucher)
         self.statusBar().showMessage(f"已清除 {voucher} 的 {count} 张照片关联", 3000)
+        self._refresh_image_index_after_photo_change()
         self.reload_current()
 
     def _context_delete_voucher(self, voucher: str) -> None:
@@ -1431,6 +1805,48 @@ class SpecimenWindow(QMainWindow):
         if vouchers:
             self.select_voucher(vouchers[0])
         self.statusBar().showMessage(f"已删除 {voucher}", 3000)
+
+    def _context_batch_delete_vouchers(self, vouchers: list[str]) -> None:
+        """批量删除选中的入库编号（不含照片关联的凭证）。"""
+        if not vouchers:
+            return
+        # 密码验证（一次）
+        password, ok = QInputDialog.getText(
+            self, "批量删除入库编号",
+            f"将删除 {len(vouchers)} 个入库编号及对应的标本信息、分类信息。\n\n"
+            f"编号列表：{', '.join(vouchers[:10])}"
+            + (f" ...等共{len(vouchers)}个" if len(vouchers) > 10 else "")
+            + "\n\n请输入管理密码确认删除：",
+            QLineEdit.Password,
+        )
+        if not ok or not password:
+            return
+        if password != "123":
+            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
+            return
+        # 二次确认
+        answer = QMessageBox.warning(
+            self, "确认批量删除",
+            f"密码验证通过。\n\n确定要永久删除以下 {len(vouchers)} 个入库编号吗？\n"
+            + "\n".join(f"  · {v}" for v in vouchers[:20])
+            + ("\n  ..." if len(vouchers) > 20 else "")
+            + "\n\n此操作不可恢复（可逐条撤回）。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        # 逐一删除（每条记录独立可撤回）
+        deleted = 0
+        for voucher in vouchers:
+            self.store.delete_specimen(voucher)
+            deleted += 1
+        self.current_voucher = None
+        self.refresh_list()
+        vouchers_remaining = self.store.list_vouchers()
+        if vouchers_remaining:
+            self.select_voucher(vouchers_remaining[0])
+        self.statusBar().showMessage(f"已批量删除 {deleted} 个入库编号", 5000)
 
     def undo(self) -> None:
         action = self.store.undo_last()
@@ -1477,7 +1893,7 @@ class SpecimenWindow(QMainWindow):
             return
         paths, _ = QFileDialog.getOpenFileNames(
             self, "选择照片", "",
-            "图片文件 (*.tif *.tiff *.jpg *.jpeg *.png *.bmp);;所有文件 (*.*)",
+            image_file_filter(),
         )
         if paths:
             self.add_photo_paths_async(paths)
@@ -1492,6 +1908,8 @@ class SpecimenWindow(QMainWindow):
             return 0
         photo_paths = self._check_photo_conflicts(photo_paths, self.current_voucher)
         if not photo_paths:
+            return 0
+        if not self._confirm_archive_name_conflicts(photo_paths):
             return 0
         try:
             added_rows = self.store.add_photos(self.current_voucher, photo_paths, allow_outside=allow_outside)
@@ -1522,6 +1940,8 @@ class SpecimenWindow(QMainWindow):
             return
         photo_paths = self._check_photo_conflicts(photo_paths, voucher)
         if not photo_paths:
+            return
+        if not self._confirm_archive_name_conflicts(photo_paths):
             return
         # Show batch confirmation for 3+ photos
         if len(photo_paths) >= 3:
@@ -1582,13 +2002,17 @@ class SpecimenWindow(QMainWindow):
             self.search_index = None
             QTimer.singleShot(200, self._build_search_index_background)
 
+    def _refresh_image_index_after_photo_change(self) -> None:
+        clear_image_index()
+        self.search_index = None
+        QTimer.singleShot(200, lambda: self._build_search_index_background(force_rebuild=True))
+
     def _prepare_photo_paths(self, paths: list[str], ask_for_outside: bool = True) -> tuple[list[Path], bool, list[str]]:
         skipped: list[str] = []
         photo_paths: list[Path] = []
-        allowed_suffixes = {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp"}
         for raw in paths:
             path = Path(raw).resolve()
-            if path.suffix.lower() not in allowed_suffixes:
+            if not is_supported_image(path):
                 skipped.append(path.name)
                 continue
             photo_paths.append(path)
@@ -1608,6 +2032,22 @@ class SpecimenWindow(QMainWindow):
         self.statusBar().showMessage(f"已跳过已分配照片：{names}{extra}", 5000)
         return [p for p in photo_paths if p.resolve() not in conflict_resolved]
 
+    def _confirm_archive_name_conflicts(self, photo_paths: list[Path]) -> bool:
+        conflicts = self.store.find_archive_name_conflicts(photo_paths)
+        if not conflicts:
+            return True
+        names = "\n".join(f"{Path(src).name}  ->  已存在 {Path(dst).name}" for src, dst in list(conflicts.items())[:10])
+        extra = f"\n等 {len(conflicts)} 个同名文件。" if len(conflicts) > 10 else ""
+        reply = QMessageBox.question(
+            self,
+            "照片同名提醒",
+            "工作区照片目录中已存在同名但内容不同的照片。\n\n"
+            f"{names}{extra}\n\n"
+            "继续导入时，软件会自动使用 _2、_3 后缀保存新照片，不会覆盖已有照片。是否继续？",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
     def delete_photo(self) -> None:
         if not self.current_voucher or not self.current_photos:
             return
@@ -1624,6 +2064,7 @@ class SpecimenWindow(QMainWindow):
         self.refresh_photo_table()
         self.load_current_photo()
         self.refresh_list()
+        self._refresh_image_index_after_photo_change()
 
     def shift_photo(self, delta: int) -> None:
         if not self.current_photos:
@@ -1647,10 +2088,10 @@ class SpecimenWindow(QMainWindow):
         self.photo_table.setRowCount(len(page_photos))
         for idx, row in enumerate(page_photos):
             real_idx = start + idx
-            self.photo_table.setItem(idx, 0, QTableWidgetItem(str(real_idx + 1)))
-            self.photo_table.setItem(idx, 1, QTableWidgetItem(str(row.get("文件名", ""))))
-            self.photo_table.setItem(idx, 2, QTableWidgetItem(str(row.get("相对路径", ""))))
-            self.photo_table.setItem(idx, 3, QTableWidgetItem(str(row.get("描述", ""))))
+            self.photo_table.setItem(idx, 0, self._photo_table_item(str(real_idx + 1), editable=False))
+            self.photo_table.setItem(idx, 1, self._photo_table_item(str(row.get("文件名", "")), editable=True))
+            self.photo_table.setItem(idx, 2, self._photo_table_item(str(row.get("相对路径", "")), editable=False))
+            self.photo_table.setItem(idx, 3, self._photo_table_item(str(row.get("描述", "")), editable=True))
         self.photo_table.blockSignals(False)
         self._select_photo_table_row()
 
@@ -1665,6 +2106,16 @@ class SpecimenWindow(QMainWindow):
             self._page_label.setText(f"共 {total} 张")
             self._prev_page_btn.hide()
             self._next_page_btn.hide()
+
+    def _photo_table_item(self, text: str, editable: bool) -> QTableWidgetItem:
+        item = QTableWidgetItem(text)
+        flags = item.flags() | Qt.ItemIsSelectable | Qt.ItemIsEnabled
+        if editable:
+            flags |= Qt.ItemIsEditable
+        else:
+            flags &= ~Qt.ItemIsEditable
+        item.setFlags(flags)
+        return item
 
     def _photo_prev_page(self) -> None:
         if self._photo_page > 0:
@@ -1696,21 +2147,77 @@ class SpecimenWindow(QMainWindow):
         real_idx = self._photo_page * self._photo_page_size + row
         if real_idx >= len(self.current_photos):
             return
+        self._flush_pending_saves()
         self._save_current_photo_view_state()
         self.current_photo_index = real_idx
         self.load_current_photo()
 
+    def _on_photo_table_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._loading or not self.current_voucher:
+            return
+        column_fields = {1: "文件名", 3: "描述"}
+        field = column_fields.get(item.column())
+        if not field:
+            return
+        real_idx = self._photo_page * self._photo_page_size + item.row()
+        if real_idx < 0 or real_idx >= len(self.current_photos):
+            return
+        value = item.text()
+        try:
+            # 表格内编辑与下方照片信息栏共用同一套保存逻辑，避免两处显示不一致。
+            if field == "文件名":
+                self.store.set_photo_filename(self.current_voucher, real_idx, value)
+            else:
+                self.store.set_photo_description(self.current_voucher, real_idx, value)
+            self.current_photos = self.store.get_photos(self.current_voucher)
+            self.refresh_photo_table()
+            if real_idx == self.current_photo_index:
+                widget = self.photo_widgets[field]
+                widget.blockSignals(True)
+                widget.setText(str(self.current_photos[real_idx].get(field, "")))
+                widget.blockSignals(False)
+                if field == "文件名":
+                    cell = self._current_grid_cell()
+                    if cell is not None:
+                        cell.set_filename(str(self.current_photos[real_idx].get("文件名", "")))
+                    self._refresh_image_index_after_photo_change()
+            self._schedule_list_refresh()
+        except Exception as exc:
+            self.current_photos = self.store.get_photos(self.current_voucher)
+            fallback = ""
+            if 0 <= real_idx < len(self.current_photos):
+                fallback = str(self.current_photos[real_idx].get(field, ""))
+            self.photo_table.blockSignals(True)
+            item.setText(fallback)
+            self.photo_table.blockSignals(False)
+            QMessageBox.critical(self, "保存失败", str(exc))
+
     def _photo_table_context_menu(self, pos) -> None:
+        clicked = self.photo_table.itemAt(pos)
+        if clicked is not None and not clicked.isSelected():
+            self.photo_table.clearSelection()
+            self.photo_table.setCurrentItem(clicked)
+            clicked.setSelected(True)
         menu = QMenu(self)
         rows = sorted(set(idx.row() for idx in self.photo_table.selectedItems()))
         if not rows:
             return
-        # Copy filename
         real_rows = [self._photo_page * self._photo_page_size + r for r in rows if r < self.photo_table.rowCount()]
+        menu.addAction("复制选中内容", self._copy_photo_table_selection)
         if real_rows:
             menu.addAction("复制文件名", lambda: self._copy_photo_filename(real_rows[0]))
+            menu.addAction("复制相对路径", lambda: self.copy_photo_relative_path(real_rows[0]))
+            fill_action = menu.addAction(
+                "从照片文件名填充标本信息",
+                lambda idx=real_rows[0]: self.fill_photo_from_filename(idx),
+            )
+            if self._photo_filename_fill_action is not None:
+                fill_action.setShortcut(self._photo_filename_fill_action.shortcut())
         menu.addSeparator()
         if len(rows) == 1:
+            menu.addAction("编辑文件名", lambda: self._edit_photo_table_cell(real_rows[0], 1))
+            menu.addAction("编辑描述", lambda: self._edit_photo_table_cell(real_rows[0], 3))
+            menu.addSeparator()
             menu.addAction("替换此照片", self._replace_current_photo)
             menu.addAction("删除此照片", self.delete_photo)
         else:
@@ -1724,16 +2231,81 @@ class SpecimenWindow(QMainWindow):
 
     def _filename_context_menu(self, widget: QLineEdit, pos) -> None:
         menu = widget.createStandardContextMenu()
+        menu.addSeparator()
+        menu.addAction("复制完整文件名", lambda: QApplication.clipboard().setText(widget.text()))
+        menu.addAction("全选文件名", widget.selectAll)
+        menu.addSeparator()
+        action = menu.addAction("从照片文件名填充标本信息", self.fill_current_photo_from_filename)
+        if self._photo_filename_fill_action is not None:
+            action.setShortcut(self._photo_filename_fill_action.shortcut())
         menu.exec_(widget.mapToGlobal(pos))
+
+    def _copy_photo_table_selection(self) -> bool:
+        indexes = self.photo_table.selectedIndexes()
+        if not indexes:
+            item = self.photo_table.currentItem()
+            if item is None:
+                return False
+            QApplication.clipboard().setText(item.text())
+            return True
+        rows = sorted({idx.row() for idx in indexes})
+        cols = sorted({idx.column() for idx in indexes})
+        lines: list[str] = []
+        for row in rows:
+            values: list[str] = []
+            for col in cols:
+                if any(idx.row() == row and idx.column() == col for idx in indexes):
+                    cell = self.photo_table.item(row, col)
+                    values.append(cell.text() if cell else "")
+                else:
+                    values.append("")
+            lines.append("\t".join(values))
+        QApplication.clipboard().setText("\n".join(lines))
+        return True
+
+    def _edit_current_photo_table_item(self) -> bool:
+        item = self.photo_table.currentItem()
+        if item is None:
+            return False
+        if item.column() not in (1, 3):
+            return False
+        self.photo_table.editItem(item)
+        return True
+
+    def _edit_photo_table_cell(self, real_idx: int, column: int) -> None:
+        row = real_idx - self._photo_page * self._photo_page_size
+        if row < 0 or row >= self.photo_table.rowCount():
+            return
+        item = self.photo_table.item(row, column)
+        if item is None:
+            return
+        self.photo_table.setCurrentItem(item)
+        self.photo_table.editItem(item)
 
     def _replace_current_photo(self) -> None:
         if not self.current_voucher or self.current_photo_index >= len(self.current_photos):
             return
-        paths, _ = QFileDialog.getOpenFileNames(self, "选择替换照片", "", "图片 (*.tif *.tiff *.jpg *.jpeg *.png *.bmp)")
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择替换照片", "", image_file_filter())
         if not paths:
             return
-        self.delete_photo_at(self.current_photo_index)
-        self.add_photo_paths(paths)
+        new_path = Path(paths[0]).resolve()
+        if not is_supported_image(new_path):
+            QMessageBox.warning(self, "格式不支持", "仅支持图片文件。")
+            return
+        if not self._confirm_archive_name_conflicts([new_path]):
+            return
+        try:
+            new_row = self.store.replace_photo(self.current_voucher, self.current_photo_index, new_path, allow_outside=True)
+        except Exception as exc:
+            QMessageBox.critical(self, "替换失败", str(exc))
+            return
+        if new_row:
+            self.current_photos = self.store.get_photos(self.current_voucher)
+            self.refresh_photo_table()
+            self.load_current_photo()
+            self.refresh_list()
+            self._append_added_photos_to_image_index([new_row])
+            self._refresh_image_index_after_photo_change()
 
     def _delete_selected_photos(self) -> None:
         if not self.current_voucher or not self.current_photos:
@@ -1886,6 +2458,11 @@ class SpecimenWindow(QMainWindow):
         self.statusBar().showMessage("就绪")
 
     def _render_grid(self) -> None:
+        """Render photo grid view.
+
+        根据实际显示的照片数量自适应网格形状，而非固定使用按钮计数。
+        例如：只有1张照片时选6宫格 → 1×1；2张时 → 2×1。
+        """
         self._clear_grid()
         self._grid_load_token += 1
         token = self._grid_load_token
@@ -1893,9 +2470,12 @@ class SpecimenWindow(QMainWindow):
             return
         self._thumb_worker.clear_pending()
         count = self._grid_count()
-        cols, rows = grid_shape(count)
+        # 计算当前页的照片索引范围
         page_start = (self.current_photo_index // count) * count
         page_indices = list(range(page_start, min(page_start + count, len(self.current_photos))))
+        # 原代码：grid_shape(count) 始终基于按钮数量，1张照片也按3×2显示 → 变形
+        # 改为基于实际照片数自适应：1→1×1, 2→2×1, 3-4→2×2, 5-6→3×2, 7-8→4×2
+        cols, rows = grid_shape(len(page_indices))
 
         self.photo_view.hide()
         self._placeholder_label.hide()
@@ -1916,6 +2496,7 @@ class SpecimenWindow(QMainWindow):
             label.set_filename(filename)
             if path.exists():
                 self._grid_requests[token * 100 + slot] = slot
+                # 缩略图尺寸与网格单元格匹配，使用固定的预览尺寸
                 self._thumb_worker.enqueue(path, (320, 240), token * 100 + slot)
             else:
                 label.set_error("照片不存在")
@@ -1947,6 +2528,7 @@ class SpecimenWindow(QMainWindow):
     def _on_grid_cell_clicked(self, photo_index: int) -> None:
         if photo_index < 0 or photo_index >= len(self.current_photos):
             return
+        self._flush_pending_saves()
         self.current_photo_index = photo_index
         self._select_photo_table_row()
         self._populate_photo_fields(self.current_photos[photo_index])
@@ -1983,7 +2565,9 @@ class SpecimenWindow(QMainWindow):
         menu.addAction("分配入库编号", self._assign_voucher_to_selected)
         menu.addAction("删除照片", lambda: self.delete_photo_at(photo_index))
         menu.addSeparator()
-        menu.addAction("从照片名提取信息", lambda: self._extract_info_from_photo(photo_index))
+        fill_action = menu.addAction("从照片文件名填充标本信息", lambda: self.fill_photo_from_filename(photo_index))
+        if self._photo_filename_fill_action is not None:
+            fill_action.setShortcut(self._photo_filename_fill_action.shortcut())
         menu.addAction("复制相对路径", lambda: self.copy_photo_relative_path(photo_index))
         menu.exec_(event.globalPos())
 
@@ -2026,23 +2610,8 @@ class SpecimenWindow(QMainWindow):
         elif voucher not in self.store.list_vouchers():
             QMessageBox.warning(self, "编号不存在", f"入库编号 {voucher} 不存在，请先创建或使用已有编号。")
             return
-        # Move the selected photos to the target voucher
-        moved = 0
-        photo_rows = self.current_photos  # snapshot before deletion
-        for photo_index in sorted(indices, reverse=True):
-            if photo_index < len(photo_rows):
-                photo = photo_rows[photo_index]
-                path = self.store.resolve_photo_path(photo)
-                if path.exists():
-                    try:
-                        self.store.add_photo(voucher, path)
-                        moved += 1
-                    except Exception:
-                        pass
-                try:
-                    self.store.delete_photo(self.current_voucher, photo_index)
-                except Exception:
-                    pass
+        # 原代码逐张 add_photo 后 delete_photo；add 失败时仍可能删除源记录。
+        moved = self.store.move_photos(self.current_voucher or "", voucher, indices)
         self.current_photos = self.store.get_photos(self.current_voucher or "")
         self.current_photo_index = min(self.current_photo_index, max(0, len(self.current_photos) - 1))
         self.refresh_photo_table()
@@ -2054,15 +2623,7 @@ class SpecimenWindow(QMainWindow):
         """Save all pending changes for a specific panel."""
         if not self.current_voucher:
             return
-        saved = 0
-        for key, timer in list(self._save_timers.items()):
-            if key.startswith(category + ":"):
-                timer.stop()
-                parts = key.split(":", 1)
-                if len(parts) == 2:
-                    self.save_field(parts[0], parts[1], self.current_voucher)
-                self._save_timers.pop(key, None)
-                saved += 1
+        saved = self._flush_pending_saves(category)
         names = {"specimen": "标本信息", "photo": "照片信息", "classification": "分类信息"}
         self.statusBar().showMessage(f"{names.get(category, category)}已保存 ({saved} 项)", 2000)
 
@@ -2076,38 +2637,70 @@ class SpecimenWindow(QMainWindow):
         """Force-save any pending field changes and show confirmation."""
         self._save_all_panels()
 
-    def _extract_info_from_photo(self, photo_index: int) -> None:
-        if not self.current_voucher or photo_index >= len(self.current_photos):
-            return
-        filename = str(self.current_photos[photo_index].get("文件名", ""))
-        tube = extract_tube_from_filename(filename)
-        date_str = extract_photo_date(filename)
-        location = extract_location_code(tube) if tube else ""
-        if not tube and not date_str:
-            QMessageBox.information(self, "无法提取", "该照片文件名中未找到规范的编号或日期信息。")
-            return
-        # Update specimen fields
-        if tube:
-            self._loading = True
-            self.specimen_widgets["管内编号*"].setText(tube)
-            if location:
-                self.specimen_widgets["采集地点缩写*"].setText(location)
+    def fill_current_photo_from_filename(self) -> None:
+        self.fill_photo_from_filename(self.current_photo_index)
+
+    def _photo_filename_info(self, photo_index: int) -> tuple[dict[str, str], str]:
+        if photo_index < 0 or photo_index >= len(self.current_photos):
+            return {}, ""
+        filename = photo_filename_source_for_specimen_fill(self.current_photos[photo_index])
+        return specimen_updates_from_photo_filename(filename), filename
+
+    def fill_photo_from_filename(self, photo_index: int) -> bool:
+        if not self.current_voucher:
+            return False
+        self._flush_pending_saves()
+        self.current_photos = self.store.get_photos(self.current_voucher)
+        updates, filename = self._photo_filename_info(photo_index)
+        if not updates:
+            QMessageBox.information(self, "无法填充", "该照片文件名中未找到规范的编号、日期或保存方式。")
+            return False
+
+        current_specimen = self.store.get_specimen(self.current_voucher) or {}
+        dialog = PhotoFilenameFillDialog(filename, updates, current_specimen, self)
+        if dialog.exec_() != QDialog.Accepted:
+            return False
+        selected = dialog.selected_updates()
+        if not selected:
+            self.statusBar().showMessage("未选择要填充的标本字段", 2500)
+            return False
+
+        try:
+            changed = self.store.set_fields(
+                "specimen",
+                self.current_voucher,
+                selected,
+                action_type="photo_filename_fill",
+                auto_derive_specimen_fields=False,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "填充失败", str(exc))
+            return False
+
+        specimen = self.store.get_specimen(self.current_voucher) or {}
+        self._loading = True
+        try:
+            for field in PHOTO_FILENAME_FILL_FIELDS:
+                widget = self.specimen_widgets.get(field)
+                if widget is None:
+                    continue
+                value = str(specimen.get(field, "") or "")
+                widget.blockSignals(True)
+                if isinstance(widget, QComboBox):
+                    widget.setCurrentText(value)
+                else:
+                    widget.setText(value)
+                widget.blockSignals(False)
+        finally:
             self._loading = False
-            self.store.set_fields("specimen", self.current_voucher, {
-                "管内编号*": tube,
-                **({"采集地点缩写*": location} if location else {}),
-            })
-        if date_str:
-            self._loading = True
-            self.specimen_widgets["采集日期"].setText(date_str)
-            self._loading = False
-            self.store.set_fields("specimen", self.current_voucher, {"采集日期": date_str})
-        details = []
-        if tube: details.append(f"管内编号：{tube}")
-        if location: details.append(f"地点：{location}")
-        if date_str: details.append(f"日期：{date_str}")
-        self.refresh_list()
-        QMessageBox.information(self, "已提取", "\n".join(details) or "已提取信息。")
+
+        if changed:
+            self.refresh_list()
+            fields = "、".join(selected.keys())
+            self.statusBar().showMessage(f"已从照片文件名填充：{fields}", 3000)
+        else:
+            self.statusBar().showMessage("标本信息没有变化", 2500)
+        return changed
 
     def adjust_zoom(self, factor: float) -> None:
         if self._is_grid_mode():
@@ -2137,7 +2730,7 @@ class SpecimenWindow(QMainWindow):
         if not path.exists():
             QMessageBox.critical(self, "照片不存在", str(path))
             return
-        if path.suffix.lower() not in {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp"}:
+        if not is_supported_image(path):
             QMessageBox.critical(self, "安全限制", "仅支持打开图片文件。")
             return
         _open_path(path)
@@ -2213,7 +2806,14 @@ class SpecimenWindow(QMainWindow):
             return
         try:
             result = self.store.import_workspace(source)
-            QMessageBox.information(self, "导入完成", f"导入 {result.imported} 个标本，跳过 {result.skipped} 个重复记录，关联照片 {result.photos_imported} 张。")
+            # 原代码导入后保留旧图片索引；新导入照片或图谱目录需要重新建索引才能被检索到。
+            self.search_index = None
+            clear_image_index()
+            QTimer.singleShot(200, self._build_search_index_background)
+            message = f"导入 {result.imported} 个标本，跳过 {result.skipped} 个重复记录，关联照片 {result.photos_imported} 张。"
+            if result.report_path:
+                message += f"\n缺失照片报告：{result.report_path}"
+            QMessageBox.information(self, "导入完成", message)
             self.refresh_list()
         except ImportConflictError as exc:
             detail = str(exc)
@@ -2224,6 +2824,7 @@ class SpecimenWindow(QMainWindow):
             QMessageBox.critical(self, "导入失败", str(exc))
 
     def export_data(self) -> None:
+        """原有导出功能：导出全部数据到单个 Excel 文件。"""
         default_path = str(self.workspace_root / "标本数据导出.xlsx")
         path, _ = QFileDialog.getSaveFileName(self, "导出数据", default_path, "Excel 文件 (*.xlsx)")
         if not path:
@@ -2233,6 +2834,28 @@ class SpecimenWindow(QMainWindow):
             QMessageBox.information(self, "导出完成", f"已导出 {count} 条记录到\n{path}")
         except Exception as exc:
             QMessageBox.critical(self, "导出失败", str(exc))
+
+    def open_batch_export(self, preselected: list[str] | None = None) -> None:
+        """打开批量导出对话框（工具栏按钮入口）。
+
+        类似 NCBI Batch Entrez：可选择导出标本信息、分类信息、照片路径和照片文件。
+        支持从当前凭证列表多选带入编号，也可在对话框中手动粘贴。
+        """
+        # 如果没有传入预选编号，尝试从当前凭证表获取选中的行
+        if preselected is None:
+            rows = self.voucher_table.selectionModel().selectedRows()
+            preselected = []
+            for model_index in rows:
+                item = self.voucher_table.item(model_index.row(), 0)
+                if item and item.text().strip():
+                    preselected.append(item.text().strip())
+
+        dlg = BatchExportDialog(self.store, preselected=preselected, parent=self)
+        dlg.exec_()
+
+    def _context_batch_export(self, vouchers: list[str]) -> None:
+        """右键菜单入口：将选中的入库编号带入批量导出对话框。"""
+        self.open_batch_export(preselected=vouchers)
 
     def import_data_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "导入数据", "", "Excel 文件 (*.xlsx)")
@@ -2331,11 +2954,11 @@ class SpecimenWindow(QMainWindow):
 
     # ---- Search index ----
 
-    def _build_search_index_background(self) -> None:
+    def _build_search_index_background(self, force_rebuild: bool = False) -> None:
         """Build the image search index in the background after startup."""
         if self._is_closing or self._index_build_worker is not None:
             return
-        self._index_build_worker = IndexBuildWorker(self.workspace_root, self)
+        self._index_build_worker = IndexBuildWorker(self.workspace_root, self, force_rebuild=force_rebuild)
         self._index_build_worker.index_ready.connect(self._on_index_ready)
         self._index_build_worker.finished.connect(
             lambda: setattr(self, "_index_build_worker", None)
@@ -2361,8 +2984,10 @@ class SpecimenWindow(QMainWindow):
             quality_keys = list(PREVIEW_QUALITY_OPTIONS.keys())
             idx = dlg.quality_combo.currentIndex()
             current_settings.preview_quality = quality_keys[idx] if 0 <= idx < len(quality_keys) else "compressed"
+            current_settings.photo_filename_fill_shortcut = dlg.photo_filename_fill_shortcut
             save_settings(current_settings)
             self._cached_preview_quality = current_settings.preview_quality
+            self._apply_photo_filename_fill_shortcut()
 
     # ---- Panel helpers ----
 
@@ -2424,6 +3049,7 @@ class SpecimenWindow(QMainWindow):
 DEFAULT_PHOTO_SCOPE = "工作区/照片"
 WORKSPACE_SCOPE = "整个工作区"
 IMAGE_TYPE_CHOICES = [
+    ("全部图片", "all"),
     ("TIF", "tif"),
     ("JPG", "jpg"),
     ("TIF+JPG", "tif_jpg"),
@@ -2435,9 +3061,10 @@ class IndexBuildWorker(QThread):
 
     index_ready = pyqtSignal(object)  # ImageSearchIndex | None
 
-    def __init__(self, workspace_root: Path, parent=None):
+    def __init__(self, workspace_root: Path, parent=None, force_rebuild: bool = False):
         super().__init__(parent)
         self.workspace_root = workspace_root
+        self.force_rebuild = force_rebuild
 
     def run(self) -> None:
         try:
@@ -2451,7 +3078,7 @@ class IndexBuildWorker(QThread):
                 roots,
                 max_depth=0,
                 should_stop=self.isInterruptionRequested,
-                force_rebuild=False,
+                force_rebuild=self.force_rebuild,
                 cache_root=self.workspace_root,
             )
             self.index_ready.emit(index)
@@ -2476,6 +3103,7 @@ class ImageSearchWorker(QThread):
         search_index: ImageSearchIndex | None = None,
         force_rebuild: bool = False,
         limit: int = 50,
+        path_to_vouchers: dict[str, list[str]] | None = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -2491,6 +3119,7 @@ class ImageSearchWorker(QThread):
         self.search_index = search_index
         self.force_rebuild = force_rebuild
         self.limit = limit
+        self.path_to_vouchers = path_to_vouchers
 
     def run(self) -> None:
         try:
@@ -2507,6 +3136,7 @@ class ImageSearchWorker(QThread):
                 should_stop=self.isInterruptionRequested,
                 search_index=self.search_index,
                 force_rebuild=self.force_rebuild,
+                path_to_vouchers=self.path_to_vouchers,
             )
         except Exception as exc:
             self.result_ready.emit(self.token, [], exc)
@@ -2664,6 +3294,7 @@ class ImageSearchDialog(QDialog):
         self._refresh_timer.start(250)
 
     def rescan_results(self) -> None:
+        self.app.search_index = None
         self.refresh_results(force_rebuild=True)
 
     def refresh_results(self, force_rebuild: bool = False) -> None:
@@ -2689,6 +3320,7 @@ class ImageSearchDialog(QDialog):
             self.status_label.setText(f"正在建立图片索引，并检索 {query}...")
 
         linked_paths = [self.app.store.resolve_photo_path(row) for row in self.app.current_photos]
+        path_to_vouchers = self.app.store.get_all_photo_voucher_map()
         specimen = self.app.store.get_specimen(self.app.current_voucher) or {}
         classification = self.app.store.get_classification(self.app.current_voucher) or {}
         self._search_token += 1
@@ -2706,9 +3338,11 @@ class ImageSearchDialog(QDialog):
             query=query,
             search_roots=search_roots,
             image_type=self._selected_image_type(),
-            search_index=self.app.search_index,
+            # 原代码所有范围都传启动索引；自定义目录和整个工作区应使用对应范围的新索引。
+            search_index=self.app.search_index if search_roots is None and not force_rebuild else None,
             force_rebuild=force_rebuild,
             limit=self.result_limit,
+            path_to_vouchers=path_to_vouchers,
             parent=self,
         )
         worker.result_ready.connect(self._on_search_ready)
@@ -2760,8 +3394,17 @@ class ImageSearchDialog(QDialog):
         self._update_status()
 
     def _create_card(self, index: int, result: ImageSearchResult) -> QFrame:
+        """创建单张搜索结果卡片。
+
+        卡片背景：
+        - 已关联到当前标本（is_linked=True）：灰色 #eceff2
+        - 已关联到其他标本（linked_vouchers 非空但 is_linked=False）：浅黄 #fef9e7
+        - 未关联：白色 #ffffff
+        """
         selected = index in self.selected_indices
-        bg = self._card_background(selected, result.is_linked)
+        # 判断是否关联到任意标本（当前或其他）
+        has_any_link = bool(result.linked_vouchers)
+        bg = self._card_background(selected, result.is_linked, has_any_link)
         card = QFrame()
         card.setStyleSheet(f"QFrame {{ background-color: {bg}; border: 1px solid #ccc; padding: 6px; }}")
         card_layout = QVBoxLayout(card)
@@ -2773,12 +3416,27 @@ class ImageSearchDialog(QDialog):
         image_label.setStyleSheet("color: #59666b; background-color: #e8eaed;")
         card_layout.addWidget(image_label)
 
+        # 标题：文件名 + 关联信息（不限当前标本，显示所有关联到的入库编号）
         title = result.file_name
-        if result.is_linked:
-            title += "  已关联"
-        title_label = QLabel(_shorten(title, 26))
+        if result.linked_vouchers:
+            title += f"  已关联: {', '.join(result.linked_vouchers)}"
+        title_label = QLabel(_shorten(title, 36))
         title_label.setStyleSheet("font-weight: bold;")
         card_layout.addWidget(title_label)
+        # 可点击的入库编号链接（任何关联都显示，不限当前标本）
+        if result.linked_vouchers:
+            voucher_widget = QWidget()
+            voucher_layout = QHBoxLayout(voucher_widget)
+            voucher_layout.setContentsMargins(0, 2, 0, 0)
+            voucher_layout.setSpacing(4)
+            for voucher in result.linked_vouchers:
+                link = QLabel(f'<a href="{voucher}" style="color:#2a6fbd;">{voucher}</a>')
+                link.setCursor(Qt.PointingHandCursor)
+                link.setToolTip(f"点击跳转到 {voucher}")
+                link.linkActivated.connect(self._navigate_to_voucher)
+                voucher_layout.addWidget(link)
+            voucher_layout.addStretch()
+            card_layout.addWidget(voucher_widget)
         path_label = QLabel(_shorten(result.relative_path, 32))
         path_label.setStyleSheet("color: #59666b;")
         card_layout.addWidget(path_label)
@@ -2869,16 +3527,34 @@ class ImageSearchDialog(QDialog):
         self.refresh_results()
         self.status_label.setText(f"已添加 {added} 张图片。")
 
-    def _card_background(self, selected: bool, linked: bool) -> str:
+    def _navigate_to_voucher(self, link: str) -> None:
+        """Navigate the main window to the given voucher, keeping this dialog open."""
+        voucher = link.strip()
+        if voucher:
+            self.app.select_voucher(voucher)
+
+    def _card_background(self, selected: bool, linked: bool, has_any_link: bool = False) -> str:
+        """搜索结果卡片背景色。
+
+        - 选中：蓝色 #d8ebff
+        - 已关联到当前标本：灰色 #eceff2
+        - 已关联到其他标本：浅黄 #fef9e7（提醒用户注意核对）
+        - 未关联：白色 #ffffff
+        """
         if selected:
             return "#d8ebff"
         if linked:
             return "#eceff2"
+        # 照片已关联到其他标本（非当前打开的标本）
+        if has_any_link:
+            return "#fef9e7"
         return "#ffffff"
 
     def _update_status(self) -> None:
-        linked_count = sum(1 for item in self.results if item.is_linked)
-        self.status_label.setText(f"结果 {len(self.results)} 张；已关联 {linked_count} 张；已选 {len(self.selected_indices)} 张")
+        # 统计所有已关联的照片（不限当前标本，linked_vouchers 非空即为已关联到任意标本）
+        linked_count = sum(1 for item in self.results if item.linked_vouchers)
+        current_linked = sum(1 for item in self.results if item.is_linked)
+        self.status_label.setText(f"结果 {len(self.results)} 张；已关联 {linked_count} 张（当前{current_linked}）；已选 {len(self.selected_indices)} 张")
 
     def keyPressEvent(self, event) -> None:
         if event.modifiers() & Qt.ControlModifier and event.key() == Qt.Key_A:
@@ -2968,6 +3644,18 @@ class IngestSummaryDialog(QDialog):
         self._total_photos = 0
         self._build_photo_counts()
 
+        # 构建管内编号和照片文件名映射（用于多字段搜索）
+        self._tube_numbers: dict[str, str] = {}
+        self._photo_filenames: dict[str, list[str]] = {}
+        for v in self.all_vouchers:
+            specimen = self.store.get_specimen(v)
+            if specimen:
+                tube = str(specimen.get("管内编号*", "") or "").strip()
+                if tube:
+                    self._tube_numbers[v] = tube
+            photos = self.store.get_photos(v)
+            self._photo_filenames[v] = [str(p.get("文件名", "")) for p in photos if p.get("文件名")]
+
         self.filtered_vouchers: list[str] = list(self.all_vouchers)
         self.current_page = 0
         self.selected_voucher: str | None = None
@@ -3012,11 +3700,17 @@ class IngestSummaryDialog(QDialog):
 
         # Search + page nav
         nav = QHBoxLayout()
-        nav.addWidget(QLabel("搜索编号"))
+        nav.addWidget(QLabel("搜索"))
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("输入编号前缀筛选")
+        self.search_edit.setPlaceholderText("输入关键词筛选...")
         self.search_edit.textChanged.connect(self._on_search_changed)
         nav.addWidget(self.search_edit, stretch=1)
+        # 搜索范围选择器：与主凭证列表一致的 4 个选项
+        self._search_scope = QComboBox()
+        self._search_scope.addItems(["全部", "入库编号", "管内编号", "照片名"])
+        self._search_scope.setFixedWidth(80)
+        self._search_scope.currentIndexChanged.connect(lambda: self._on_search_changed(self.search_edit.text()))
+        nav.addWidget(self._search_scope)
         self.page_label = QLabel()
         nav.addWidget(self.page_label)
         self._make_btn("上一页", self._prev_page, nav)
@@ -3131,11 +3825,30 @@ class IngestSummaryDialog(QDialog):
             self._load_page(self.current_page + 1)
 
     def _on_search_changed(self, text: str) -> None:
+        """搜索过滤：根据下拉选择范围搜索入库编号/管内编号/照片名。
+
+        原代码仅支持入库编号前缀匹配（startswith）。
+        改为子字符串匹配 + 多字段搜索，与主凭证列表行为一致。
+        """
         query = text.strip().lower()
         if query:
-            self.filtered_vouchers = [
-                v for v in self.all_vouchers if v.lower().startswith(query)
-            ]
+            scope = self._search_scope.currentText()
+            if scope == "入库编号":
+                self.filtered_vouchers = [v for v in self.all_vouchers if query in v.lower()]
+            elif scope == "管内编号":
+                self.filtered_vouchers = [v for v in self.all_vouchers if query in self._tube_numbers.get(v, "").lower()]
+            elif scope == "照片名":
+                self.filtered_vouchers = [
+                    v for v in self.all_vouchers
+                    if any(query in fn.lower() for fn in self._photo_filenames.get(v, []))
+                ]
+            else:  # 全部
+                self.filtered_vouchers = [
+                    v for v in self.all_vouchers
+                    if query in v.lower()
+                    or query in self._tube_numbers.get(v, "").lower()
+                    or any(query in fn.lower() for fn in self._photo_filenames.get(v, []))
+                ]
         else:
             self.filtered_vouchers = list(self.all_vouchers)
         self.selected_voucher = None
@@ -3270,7 +3983,7 @@ class IngestSummaryDialog(QDialog):
         reply = QMessageBox.question(
             self, "取消关联",
             f"确定要取消 {self.selected_voucher} 下选中的 {count} 张照片关联吗？\n\n"
-            "照片文件不会被删除。",
+            "未被其他记录引用的工作区归档照片文件也会删除。",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
@@ -3287,6 +4000,7 @@ class IngestSummaryDialog(QDialog):
         self._load_page(self.current_page)
         self.app._update_dashboard()
         self.app.refresh_list()
+        self.app._refresh_image_index_after_photo_change()
 
     def _move_selected(self) -> None:
         if not self.selected_voucher or not self._selected_photos:
@@ -3316,6 +4030,7 @@ class IngestSummaryDialog(QDialog):
             return
         # Check for conflicts with target before moving
         paths_to_move = []
+        conflict_set = set()
         for photo_idx in sorted(indices):
             photo = self._selected_photos[photo_idx]
             path = self.store.resolve_photo_path(photo)
@@ -3336,21 +4051,15 @@ class IngestSummaryDialog(QDialog):
                     return
                 conflict_set = {Path(p).resolve() for p in conflicts}
                 paths_to_move = [p for p in paths_to_move if p.resolve() not in conflict_set]
-        # Move photos to target (reverse order delete so indices stay valid)
-        moved = 0
-        for photo_idx in sorted(indices, reverse=True):
+        # 原代码逐张 add_photo/delete_photo，冲突跳过时仍可能删除源记录；现在只移动确认保留的索引。
+        indices_to_move = []
+        for photo_idx in sorted(indices):
             photo = self._selected_photos[photo_idx]
             path = self.store.resolve_photo_path(photo)
-            if path.exists() and path in paths_to_move:
-                try:
-                    self.store.add_photo(target, path)
-                    moved += 1
-                except Exception:
-                    continue
-            try:
-                self.store.delete_photo(self.selected_voucher, photo_idx)
-            except Exception:
-                pass
+            if path.exists() and path.resolve() in conflict_set:
+                continue
+            indices_to_move.append(photo_idx)
+        moved = self.store.move_photos(self.selected_voucher, target, indices_to_move)
         self._selected_photos = self.store.get_photos(self.selected_voucher)
         self._photo_counts[self.selected_voucher] = len(self._selected_photos)
         target_count = len(self.store.get_photos(target))
@@ -3382,17 +4091,19 @@ class IngestSummaryDialog(QDialog):
         old_idx = next(iter(indices))
         paths, _ = QFileDialog.getOpenFileNames(
             self, "选择替换照片", "",
-            "图片文件 (*.tif *.tiff *.jpg *.jpeg *.png *.bmp);;所有文件 (*.*)",
+            image_file_filter(),
         )
         if not paths:
             return
         new_path = Path(paths[0]).resolve()
-        if new_path.suffix.lower() not in {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp"}:
+        if not is_supported_image(new_path):
             QMessageBox.warning(self, "格式不支持", "仅支持图片文件。")
             return
+        if not self.app._confirm_archive_name_conflicts([new_path]):
+            return
         try:
-            self.store.delete_photo(self.selected_voucher, old_idx)
-            self.store.add_photo(self.selected_voucher, new_path)
+            # 原代码先 delete_photo 再 add_photo；新照片校验失败会丢失旧关联。
+            new_row = self.store.replace_photo(self.selected_voucher, old_idx, new_path, allow_outside=True)
         except Exception as exc:
             QMessageBox.critical(self, "替换失败", str(exc))
             return
@@ -3404,6 +4115,9 @@ class IngestSummaryDialog(QDialog):
         self._load_page(self.current_page)
         self.app._update_dashboard()
         self.app.refresh_list()
+        if new_row:
+            self.app._append_added_photos_to_image_index([new_row])
+        self.app._refresh_image_index_after_photo_change()
         self.status_label.setText(f"已替换照片：{new_path.name}")
 
     # ---- Drag-drop photo replacement ----
@@ -3447,14 +4161,17 @@ class IngestSummaryDialog(QDialog):
             event.ignore()
             return
         new_path = Path(paths[0]).resolve()
-        if new_path.suffix.lower() not in {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp"}:
+        if not is_supported_image(new_path):
             QMessageBox.warning(self, "格式不支持", "仅支持图片文件。")
+            event.ignore()
+            return
+        if not self.app._confirm_archive_name_conflicts([new_path]):
             event.ignore()
             return
         old_idx = next(iter(indices))
         try:
-            self.store.delete_photo(self.selected_voucher, old_idx)
-            self.store.add_photo(self.selected_voucher, new_path)
+            # 原代码先 delete_photo 再 add_photo；拖拽外部照片失败会丢失旧关联。
+            new_row = self.store.replace_photo(self.selected_voucher, old_idx, new_path, allow_outside=True)
         except Exception as exc:
             QMessageBox.critical(self, "替换失败", str(exc))
             event.ignore()
@@ -3468,6 +4185,9 @@ class IngestSummaryDialog(QDialog):
         self._load_page(self.current_page)
         self.app._update_dashboard()
         self.app.refresh_list()
+        if new_row:
+            self.app._append_added_photos_to_image_index([new_row])
+        self.app._refresh_image_index_after_photo_change()
         self.status_label.setText(f"已拖入替换照片：{new_path.name}")
         event.acceptProposedAction()
 
@@ -3673,6 +4393,67 @@ class VersionManagerDialog(QDialog):
 # Settings dialog
 # ---------------------------------------------------------------------------
 
+class PhotoFilenameFillDialog(QDialog):
+    def __init__(self, filename: str, updates: dict[str, str], current: dict[str, Any], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("从照片文件名填充标本信息")
+        self._checks: dict[str, tuple[QCheckBox, str]] = {}
+
+        layout = QVBoxLayout(self)
+        source = QLabel(f"文件名：{filename}")
+        source.setWordWrap(True)
+        source.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(source)
+
+        note = QLabel("已有值默认不覆盖；需要覆盖时请手动勾选。")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        grid = QGridLayout()
+        for column, label in enumerate(("填充", "字段", "当前值", "识别值")):
+            header = QLabel(label)
+            header.setStyleSheet("font-weight: bold;")
+            grid.addWidget(header, 0, column)
+
+        default_fields = set(default_photo_filename_fill_fields(updates, current))
+        row = 1
+        for field in PHOTO_FILENAME_FILL_FIELDS:
+            new_value = str(updates.get(field, "") or "")
+            if not new_value:
+                continue
+            current_value = str(current.get(field, "") or "")
+            checkbox = QCheckBox()
+            checkbox.setChecked(field in default_fields)
+            if current_value == new_value:
+                checkbox.setChecked(False)
+                checkbox.setEnabled(False)
+            self._checks[field] = (checkbox, new_value)
+            grid.addWidget(checkbox, row, 0, alignment=Qt.AlignCenter)
+            grid.addWidget(QLabel(field), row, 1)
+            grid.addWidget(QLabel(current_value or "（空）"), row, 2)
+            grid.addWidget(QLabel(new_value), row, 3)
+            row += 1
+        layout.addLayout(grid)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        ok_button = buttons.button(QDialogButtonBox.Ok)
+        if ok_button is not None:
+            ok_button.setText("填充选中字段")
+        cancel_button = buttons.button(QDialogButtonBox.Cancel)
+        if cancel_button is not None:
+            cancel_button.setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_updates(self) -> dict[str, str]:
+        return {
+            field: value
+            for field, (checkbox, value) in self._checks.items()
+            if checkbox.isChecked()
+        }
+
+
 class SettingsDialog(QDialog):
     def __init__(self, app: SpecimenWindow):
         super().__init__(app)
@@ -3695,6 +4476,10 @@ class SettingsDialog(QDialog):
         self.quality_combo.setCurrentIndex(current_idx)
         layout.addRow("图片预览质量", self.quality_combo)
 
+        self.photo_fill_shortcut_edit = QLineEdit(current_settings.photo_filename_fill_shortcut)
+        self.photo_fill_shortcut_edit.setPlaceholderText(DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT)
+        layout.addRow("照片名填充快捷键", self.photo_fill_shortcut_edit)
+
         btn_row = QHBoxLayout()
         btn_row.addWidget(QPushButton("保存", clicked=self.accept))
         restore_btn = QPushButton("恢复默认设置")
@@ -3709,17 +4494,24 @@ class SettingsDialog(QDialog):
         quality_keys = list(PREVIEW_QUALITY_OPTIONS.keys())
         default_idx = quality_keys.index(defaults.preview_quality) if defaults.preview_quality in quality_keys else 0
         self.quality_combo.setCurrentIndex(default_idx)
+        self.photo_fill_shortcut_edit.setText(defaults.photo_filename_fill_shortcut)
         # Apply immediately
         self.app.store.set_undo_depth(200)
         save_settings(defaults)
         self.app._cached_preview_quality = defaults.preview_quality
         self.app._show_grid_filenames = defaults.show_grid_filenames
         self.app._show_filename_check.setChecked(defaults.show_grid_filenames)
+        self.app._apply_photo_filename_fill_shortcut()
         QMessageBox.information(self, "已恢复", "所有设置已恢复为默认值。")
 
     @property
     def undo_depth(self) -> int:
         return self.undo_spin.value()
+
+    @property
+    def photo_filename_fill_shortcut(self) -> str:
+        value = self.photo_fill_shortcut_edit.text().strip()
+        return value or DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT
 
 
 # ---------------------------------------------------------------------------

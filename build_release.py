@@ -75,7 +75,7 @@ def build_release(version: str, project_root: Path) -> Path:
     if icon_ico and icon_ico.exists():
         command.extend(["--icon", str(icon_ico)])
     command.append("run_app.py")
-    ]
+    # 原代码保留说明：这里曾多出一个独立的 "]"，会导致 build_release.py 语法错误。
     subprocess.run(command, cwd=project_root, check=True)
 
     versioned_dir = release_dir / versioned_name

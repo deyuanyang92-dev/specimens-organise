@@ -4,6 +4,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .classification_fields import (
+    CLASSIFICATION_COLUMNS,
+    CLASSIFICATION_SUMMARY_FIELDS,
+    REQUIRED_CLASSIFICATION_COLUMNS,
+)
+
 
 SPECIMEN_FILE = "标本信息.xlsx"
 PHOTO_FILE = "照片信息.xlsx"
@@ -14,7 +20,7 @@ ACTION_LOG_FILE = "操作记录.xlsx"
 DATA_VERSION_LOG_FILE = "数据版本记录.xlsx"
 WORKSPACE_CONFIG_FILE = "工作区配置.json"
 DATA_VERSION_DIR = "数据版本"
-CURRENT_DATA_SCHEMA_VERSION = "1.0.0"
+CURRENT_DATA_SCHEMA_VERSION = "1.1.2"
 
 SPECIMEN_HEADERS = [
     "入库编号*",
@@ -29,9 +35,21 @@ SPECIMEN_HEADERS = [
     "备注",
 ]
 
-PHOTO_HEADERS = ["入库编号*", "文件名", "相对路径", "描述", "来源工作区根路径"]
+PHOTO_HEADERS = [
+    "入库编号*",
+    "文件名",
+    "相对路径",
+    "描述",
+    "来源工作区根路径",
+    "原始文件名",
+    "原始路径",
+    "文件SHA256",
+    "文件大小",
+    "归档时间",
+    "归档状态",
+]
 
-CLASSIFICATION_HEADERS = ["入库编号*", "种名*", "种拉丁", "科*", "科拉丁"]
+CLASSIFICATION_HEADERS = list(CLASSIFICATION_COLUMNS)
 
 INDEX_HEADERS = ["入库编号", "record_id", "创建时间", "来源工作区", "来源记录ID", "记录指纹"]
 
@@ -78,7 +96,7 @@ DATA_VERSION_LOG_HEADERS = [
 ]
 
 SPECIMEN_REQUIRED = ["入库编号*", "管内编号*", "采集地点缩写*"]
-CLASSIFICATION_REQUIRED = ["入库编号*", "种名*", "科*"]
+CLASSIFICATION_REQUIRED = list(REQUIRED_CLASSIFICATION_COLUMNS)
 
 SAVE_METHOD_OPTIONS = ["9E", "7E", "79", "RE", "FE"]
 
