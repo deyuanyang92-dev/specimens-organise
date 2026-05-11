@@ -22,6 +22,12 @@ PREVIEW_QUALITY_SIZES = {
     "original": None,
 }
 
+PHOTO_MANAGEMENT_OPTIONS = {
+    "copy_with_absolute": "复制到工作区照片库，并记录绝对路径",
+    "absolute_only": "仅记录绝对路径，不复制",
+    "copy_to_custom_library": "复制到自定义照片库，并记录绝对路径",
+}
+
 DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT = "Ctrl+Alt+F"
 
 
@@ -30,6 +36,8 @@ class AppSettings:
     last_workspace: str = ""
     recent_workspaces: list[str] = field(default_factory=list)
     preview_quality: str = "standard"
+    photo_management_mode: str = "copy_with_absolute"
+    photo_library_path: str = ""
     search_paths: list[str] = field(default_factory=list)
     show_grid_filenames: bool = True
     photo_filename_fill_shortcut: str = DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT
@@ -68,10 +76,15 @@ def load_settings() -> AppSettings:
         splitter_sizes = raw_sizes
     else:
         splitter_sizes = []
+    photo_management_mode = str(data.get("photo_management_mode", "copy_with_absolute"))
+    if photo_management_mode not in PHOTO_MANAGEMENT_OPTIONS:
+        photo_management_mode = "copy_with_absolute"
     return AppSettings(
         last_workspace=str(data.get("last_workspace", "")),
         recent_workspaces=[str(item) for item in data.get("recent_workspaces", []) if item],
         preview_quality=str(data.get("preview_quality", "standard")),
+        photo_management_mode=photo_management_mode,
+        photo_library_path=str(data.get("photo_library_path", "")),
         search_paths=[str(item) for item in data.get("search_paths", []) if item],
         show_grid_filenames=show_grid_filenames,
         photo_filename_fill_shortcut=photo_filename_fill_shortcut.strip(),
@@ -87,6 +100,8 @@ def save_settings(settings: AppSettings) -> None:
         "last_workspace": settings.last_workspace,
         "recent_workspaces": settings.recent_workspaces[:10],
         "preview_quality": settings.preview_quality,
+        "photo_management_mode": settings.photo_management_mode,
+        "photo_library_path": settings.photo_library_path,
         "search_paths": settings.search_paths[:20],
         "show_grid_filenames": settings.show_grid_filenames,
         "photo_filename_fill_shortcut": settings.photo_filename_fill_shortcut or DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT,

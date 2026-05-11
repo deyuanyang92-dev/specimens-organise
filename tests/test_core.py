@@ -50,6 +50,7 @@ from specimen_app.parsing import (
 from specimen_app.release_manager import list_releases
 from specimen_app.species import FamilyMatch, SpeciesMatch, SpeciesMatcher
 from specimen_app.ui import (
+    WindowManager,
     classification_column_value_from_taxonomy_match,
     default_photo_filename_fill_fields,
     format_taxonomy_candidate_label,
@@ -88,6 +89,57 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(store.create_specimen(), "YZZ000001")
         self.assertEqual(store.create_specimen(), "YZZ000002")
         self.assertEqual(store.list_vouchers(), ["YZZ000001", "YZZ000002"])
+
+    def test_workspace_overview_matches_list_status_data(self) -> None:
+        store = ExcelStore(self.tmp)
+        first = store.create_specimen()
+        second = store.create_specimen()
+        store.set_fields("specimen", first, {"管内编号*": "QD-CK-SC008", "采集地点缩写*": "QD"})
+        store.set_fields("classification", first, {
+            "种名*": "Nicon moniloceras",
+            "科*": "Nereididae",
+            "物种中文名": "珠角裸沙蚕",
+            "物种拉丁名": "Nicon moniloceras",
+            "科中文名": "沙蚕科",
+            "科拉丁名": "Nereididae",
+        })
+        photo = self.tmp / "overview.jpg"
+        photo.write_bytes(b"photo")
+        store.add_photo(first, photo, allow_outside=True)
+
+        overview = store.workspace_overview()
+
+        self.assertEqual(overview["vouchers"], [first, second])
+        self.assertEqual(overview["photo_counts"], {first: 1})
+        self.assertEqual(overview["tube_numbers"], {first: "QD-CK-SC008"})
+        self.assertEqual(overview["photo_filenames"], {first: ["overview.jpg"]})
+        self.assertEqual(overview["flags"][first].label(), "√√√")
+        self.assertEqual(overview["flags"][second].label(), "×××")
+
+    def test_window_manager_focuses_existing_workspace(self) -> None:
+        class FakeWindow:
+            def __init__(self, root: Path):
+                self.workspace_root = root
+                self.events: list[str] = []
+
+            def show(self) -> None:
+                self.events.append("show")
+
+            def raise_(self) -> None:
+                self.events.append("raise")
+
+            def activateWindow(self) -> None:
+                self.events.append("activate")
+
+        manager = WindowManager(app=None)
+        window = FakeWindow(self.tmp / "workspace")
+        manager.register(window)
+
+        self.assertTrue(manager.focus_workspace(self.tmp / "workspace"))
+        self.assertEqual(window.events, ["show", "raise", "activate"])
+        self.assertFalse(manager.focus_workspace(self.tmp / "workspace", exclude=window))
+        manager.unregister(window)
+        self.assertFalse(manager.focus_workspace(self.tmp / "workspace"))
 
     def test_build_release_script_compiles(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
@@ -567,9 +619,60 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(Path(row["原始路径"]), outside)
         self.assertEqual(row["来源工作区根路径"], "")
         self.assertEqual(row["相对路径"], "./照片/outside.jpg")
+        self.assertEqual(Path(row["绝对路径"]), resolved)
         self.assertEqual(resolved.parent, workspace / "照片")
         self.assertTrue(resolved.exists())
         self.assertTrue(outside.exists())
+
+    def test_absolute_only_photo_records_source_without_copying(self) -> None:
+        workspace = self.tmp / "workspace_absolute_only"
+        workspace.mkdir()
+        outside = self.tmp / "absolute_only.jpg"
+        outside.write_bytes(b"original")
+        store = ExcelStore(workspace)
+        voucher = store.create_specimen()
+
+        row = store.add_photo(
+            voucher,
+            outside,
+            allow_outside=True,
+            photo_management_mode="absolute_only",
+        )
+
+        self.assertEqual(row["归档状态"], "仅记录")
+        self.assertEqual(row["相对路径"], "")
+        self.assertEqual(Path(row["绝对路径"]), outside)
+        self.assertEqual(store.resolve_photo_path(row), outside)
+        self.assertFalse((workspace / "照片" / outside.name).exists())
+        self.assertTrue(outside.exists())
+
+    def test_custom_photo_library_copies_original_and_cleans_managed_copy(self) -> None:
+        workspace = self.tmp / "workspace_custom_library"
+        library = self.tmp / "managed_library"
+        workspace.mkdir()
+        source = self.tmp / "custom_source.tif"
+        source.write_bytes(b"full-resolution-data")
+        store = ExcelStore(workspace)
+        voucher = store.create_specimen()
+
+        row = store.add_photo(
+            voucher,
+            source,
+            allow_outside=True,
+            photo_management_mode="copy_to_custom_library",
+            photo_library_path=library,
+        )
+        managed = Path(row["绝对路径"])
+
+        self.assertEqual(row["归档状态"], "已归档")
+        self.assertEqual(row["相对路径"], "")
+        self.assertEqual(managed.parent, library)
+        self.assertEqual(managed.read_bytes(), source.read_bytes())
+        self.assertTrue(source.exists())
+
+        self.assertTrue(store.delete_photo(voucher, 0))
+        self.assertFalse(managed.exists())
+        self.assertTrue(source.exists())
 
     def test_delete_photo_removes_unreferenced_archive_file(self) -> None:
         workspace = self.tmp / "workspace_delete_photo"
@@ -747,13 +850,18 @@ class CoreTests(unittest.TestCase):
             settings = load_settings()
             self.assertTrue(settings.show_grid_filenames)
             self.assertEqual(settings.photo_filename_fill_shortcut, DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT)
+            self.assertEqual(settings.photo_management_mode, "copy_with_absolute")
 
             settings.show_grid_filenames = False
             settings.photo_filename_fill_shortcut = "Ctrl+Shift+F"
+            settings.photo_management_mode = "absolute_only"
+            settings.photo_library_path = str(self.tmp / "library")
             save_settings(settings)
             reloaded = load_settings()
             self.assertFalse(reloaded.show_grid_filenames)
             self.assertEqual(reloaded.photo_filename_fill_shortcut, "Ctrl+Shift+F")
+            self.assertEqual(reloaded.photo_management_mode, "absolute_only")
+            self.assertEqual(reloaded.photo_library_path, str(self.tmp / "library"))
         finally:
             if old_appdata is None:
                 os.environ.pop("APPDATA", None)

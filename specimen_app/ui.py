@@ -52,6 +52,7 @@ from PyQt5.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 from . import __version__
 from .app_settings import (
     DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT,
+    PHOTO_MANAGEMENT_OPTIONS,
     PREVIEW_QUALITY_OPTIONS,
     PREVIEW_QUALITY_SIZES,
     load_settings,
@@ -643,8 +644,9 @@ class GridPhotoCell(QFrame):
 # ---------------------------------------------------------------------------
 
 class SpecimenWindow(QMainWindow):
-    def __init__(self, workspace_root: Path | str | None):
+    def __init__(self, workspace_root: Path | str | None, manager: "WindowManager | None" = None):
         super().__init__()
+        self.manager = manager
         self.setWindowTitle("标本入库管理")
         self.setWindowIcon(get_app_icon())
         self.resize(1320, 820)
@@ -655,6 +657,9 @@ class SpecimenWindow(QMainWindow):
             self.close()
             raise SystemExit
         self.workspace_root, create_workspace_files = prepared
+        if self.manager is not None and self.manager.focus_workspace(self.workspace_root):
+            self.close()
+            raise SystemExit
 
         try:
             self.store = ExcelStore(self.workspace_root, lock=True, create_if_missing=create_workspace_files)
@@ -724,11 +729,18 @@ class SpecimenWindow(QMainWindow):
         self._build_ui()
 
         remember_workspace(self.workspace_root)
+        self.statusBar().showMessage("正在加载工作区数据...")
+        QTimer.singleShot(0, self._finish_initial_load)
+
+    def _finish_initial_load(self) -> None:
+        if self._is_closing:
+            return
         self.refresh_list()
-        vouchers = self.store.list_vouchers()
+        vouchers = self._all_vouchers
         if vouchers:
-            self.select_voucher(vouchers[0])
-        QTimer.singleShot(500, self._build_search_index_background)
+            self.select_voucher(vouchers[0], defer_preview=True)
+        self.statusBar().showMessage("工作区已加载", 2000)
+        QTimer.singleShot(1200, self._build_search_index_background)
 
     # ---- workspace preparation ----
 
@@ -811,6 +823,8 @@ class SpecimenWindow(QMainWindow):
                 store.close()
             except Exception:
                 pass
+        if self.manager is not None:
+            self.manager.unregister(self)
         event.accept()
 
     def eventFilter(self, obj, event) -> bool:
@@ -1092,11 +1106,11 @@ class SpecimenWindow(QMainWindow):
         self._next_page_btn.clicked.connect(self._photo_next_page)
         page_row.addWidget(self._next_page_btn)
         pf_layout.addLayout(page_row)
-        for field in ("文件名", "相对路径", "描述"):
+        for field in ("文件名", "相对路径", "绝对路径", "描述"):
             row = QHBoxLayout()
             row.addWidget(QLabel(field))
             widget = QLineEdit()
-            if field == "相对路径":
+            if field in {"相对路径", "绝对路径"}:
                 widget.setReadOnly(True)
             elif field == "文件名":
                 widget.setReadOnly(False)
@@ -1369,20 +1383,12 @@ class SpecimenWindow(QMainWindow):
 
     def refresh_list(self) -> None:
         current = self.current_voucher
-        self._all_vouchers = self.store.list_vouchers()
-        self._all_flags = self.store.all_status_flags()
-        self._all_photo_counts = self.store.voucher_photo_counts()
-        self._all_tube_numbers = {}
-        # 每个凭证的关联照片文件名列表（用于搜索和显示）
-        self._all_photo_filenames: dict[str, list[str]] = {}
-        for voucher in self._all_vouchers:
-            specimen = self.store.get_specimen(voucher)
-            if specimen:
-                tube = str(specimen.get("管内编号*", "") or "").strip()
-                if tube:
-                    self._all_tube_numbers[voucher] = tube
-            photos = self.store.get_photos(voucher)
-            self._all_photo_filenames[voucher] = [str(p.get("文件名", "")) for p in photos if p.get("文件名")]
+        overview = self.store.workspace_overview()
+        self._all_vouchers = list(overview["vouchers"])
+        self._all_flags = dict(overview["flags"])
+        self._all_photo_counts = dict(overview["photo_counts"])
+        self._all_tube_numbers = dict(overview["tube_numbers"])
+        self._all_photo_filenames = dict(overview["photo_filenames"])
         self._apply_voucher_filter()
         if current and current in self._all_flags:
             self._select_voucher_in_table(current)
@@ -1547,7 +1553,7 @@ class SpecimenWindow(QMainWindow):
         if hasattr(self, "_status_dashboard"):
             self._status_dashboard.setText(text)
 
-    def select_voucher(self, voucher: str) -> None:
+    def select_voucher(self, voucher: str, defer_preview: bool = False) -> None:
         self._save_current_photo_view_state()
         self._loading = True
         self.current_voucher = voucher
@@ -1572,7 +1578,10 @@ class SpecimenWindow(QMainWindow):
         self._photo_page = 0
         self._loading = False
         self.refresh_photo_table()
-        self.load_current_photo()
+        if defer_preview:
+            QTimer.singleShot(250, self.load_current_photo)
+        else:
+            self.load_current_photo()
 
     # ---- Field save (debounced) ----
 
@@ -1912,7 +1921,14 @@ class SpecimenWindow(QMainWindow):
         if not self._confirm_archive_name_conflicts(photo_paths):
             return 0
         try:
-            added_rows = self.store.add_photos(self.current_voucher, photo_paths, allow_outside=allow_outside)
+            mode, library_path = self._photo_management_settings()
+            added_rows = self.store.add_photos(
+                self.current_voucher,
+                photo_paths,
+                allow_outside=allow_outside,
+                photo_management_mode=mode,
+                photo_library_path=library_path,
+            )
             added = len(added_rows)
         except Exception as exc:
             QMessageBox.critical(self, "照片关联失败", str(exc))
@@ -1948,25 +1964,38 @@ class SpecimenWindow(QMainWindow):
             dlg = PhotoBatchDialog(voucher, photo_paths, self)
             if dlg.exec_() != QDialog.Accepted or not dlg.confirmed:
                 return
+        try:
+            mode, library_path = self._photo_management_settings()
+        except Exception as exc:
+            QMessageBox.critical(self, "照片关联失败", str(exc))
+            return
         self._import_job_active = True
         self.statusBar().showMessage(f"正在关联 {len(photo_paths)} 张照片...")
 
         class ImportThread(QThread):
             finished = pyqtSignal(list, str)
-            def __init__(self, store, voucher, paths, allow_outside):
+            def __init__(self, store, voucher, paths, allow_outside, mode, library_path):
                 super().__init__()
                 self.store = store
                 self.voucher = voucher
                 self.paths = paths
                 self.allow_outside = allow_outside
+                self.mode = mode
+                self.library_path = library_path
             def run(self):
                 try:
-                    rows = self.store.add_photos(self.voucher, self.paths, allow_outside=self.allow_outside)
+                    rows = self.store.add_photos(
+                        self.voucher,
+                        self.paths,
+                        allow_outside=self.allow_outside,
+                        photo_management_mode=self.mode,
+                        photo_library_path=self.library_path,
+                    )
                     self.finished.emit(rows, "")
                 except Exception as e:
                     self.finished.emit([], str(e))
 
-        self._import_thread = ImportThread(self.store, voucher, photo_paths, allow_outside)
+        self._import_thread = ImportThread(self.store, voucher, photo_paths, allow_outside, mode, library_path)
         self._import_thread.finished.connect(
             lambda rows, err: self._on_import_done(voucher, rows, err, skipped)
         )
@@ -2017,6 +2046,14 @@ class SpecimenWindow(QMainWindow):
                 continue
             photo_paths.append(path)
         return photo_paths, True, skipped
+
+    def _photo_management_settings(self) -> tuple[str, str]:
+        settings = load_settings()
+        mode = settings.photo_management_mode if settings.photo_management_mode in PHOTO_MANAGEMENT_OPTIONS else "copy_with_absolute"
+        library_path = settings.photo_library_path.strip()
+        if mode == "copy_to_custom_library" and not library_path:
+            raise ValueError("请先在设置中选择自定义照片库目录。")
+        return mode, library_path
 
     def _show_skipped_photos(self, skipped: list[str]) -> None:
         if skipped:
@@ -2207,6 +2244,7 @@ class SpecimenWindow(QMainWindow):
         if real_rows:
             menu.addAction("复制文件名", lambda: self._copy_photo_filename(real_rows[0]))
             menu.addAction("复制相对路径", lambda: self.copy_photo_relative_path(real_rows[0]))
+            menu.addAction("复制绝对路径", lambda: self.copy_photo_absolute_path(real_rows[0]))
             fill_action = menu.addAction(
                 "从照片文件名填充标本信息",
                 lambda idx=real_rows[0]: self.fill_photo_from_filename(idx),
@@ -2218,6 +2256,8 @@ class SpecimenWindow(QMainWindow):
             menu.addAction("编辑文件名", lambda: self._edit_photo_table_cell(real_rows[0], 1))
             menu.addAction("编辑描述", lambda: self._edit_photo_table_cell(real_rows[0], 3))
             menu.addSeparator()
+            menu.addAction("打开原图", lambda: self.open_current_photo_external(real_rows[0]))
+            menu.addAction("打开原图所在位置", lambda: self.open_photo_location(real_rows[0]))
             menu.addAction("替换此照片", self._replace_current_photo)
             menu.addAction("删除此照片", self.delete_photo)
         else:
@@ -2295,7 +2335,15 @@ class SpecimenWindow(QMainWindow):
         if not self._confirm_archive_name_conflicts([new_path]):
             return
         try:
-            new_row = self.store.replace_photo(self.current_voucher, self.current_photo_index, new_path, allow_outside=True)
+            mode, library_path = self._photo_management_settings()
+            new_row = self.store.replace_photo(
+                self.current_voucher,
+                self.current_photo_index,
+                new_path,
+                allow_outside=True,
+                photo_management_mode=mode,
+                photo_library_path=library_path,
+            )
         except Exception as exc:
             QMessageBox.critical(self, "替换失败", str(exc))
             return
@@ -2409,6 +2457,9 @@ class SpecimenWindow(QMainWindow):
         self.photo_widgets["相对路径"].blockSignals(True)
         self.photo_widgets["相对路径"].setText(str(row.get("相对路径", "")))
         self.photo_widgets["相对路径"].blockSignals(False)
+        self.photo_widgets["绝对路径"].blockSignals(True)
+        self.photo_widgets["绝对路径"].setText(str(row.get("绝对路径", "")))
+        self.photo_widgets["绝对路径"].blockSignals(False)
         self.photo_widgets["描述"].blockSignals(True)
         self.photo_widgets["描述"].setText(str(row.get("描述", "")))
         self.photo_widgets["描述"].blockSignals(False)
@@ -2542,7 +2593,7 @@ class SpecimenWindow(QMainWindow):
             self._zoom_label.setText(f"宫格 {int(zoom * 100)}%")
 
     def _populate_photo_fields(self, row: dict[str, Any]) -> None:
-        for field in ("文件名", "相对路径", "描述"):
+        for field in ("文件名", "相对路径", "绝对路径", "描述"):
             widget = self.photo_widgets[field]
             widget.blockSignals(True)
             widget.setText(str(row.get(field, "")))
@@ -2562,6 +2613,7 @@ class SpecimenWindow(QMainWindow):
         menu = QMenu(self)
         menu.addAction("放大显示", lambda: self.enlarge_photo_from_grid(photo_index))
         menu.addAction("打开原图", lambda: self.open_current_photo_external(photo_index))
+        menu.addAction("打开原图所在位置", lambda: self.open_photo_location(photo_index))
         menu.addAction("分配入库编号", self._assign_voucher_to_selected)
         menu.addAction("删除照片", lambda: self.delete_photo_at(photo_index))
         menu.addSeparator()
@@ -2569,6 +2621,7 @@ class SpecimenWindow(QMainWindow):
         if self._photo_filename_fill_action is not None:
             fill_action.setShortcut(self._photo_filename_fill_action.shortcut())
         menu.addAction("复制相对路径", lambda: self.copy_photo_relative_path(photo_index))
+        menu.addAction("复制绝对路径", lambda: self.copy_photo_absolute_path(photo_index))
         menu.exec_(event.globalPos())
 
     def _get_selected_photo_indices(self) -> list[int]:
@@ -2768,6 +2821,21 @@ class SpecimenWindow(QMainWindow):
             return
         QApplication.clipboard().setText(str(self.current_photos[photo_index].get("相对路径", "")))
 
+    def copy_photo_absolute_path(self, photo_index: int) -> None:
+        if photo_index < 0 or photo_index >= len(self.current_photos):
+            return
+        row = self.current_photos[photo_index]
+        QApplication.clipboard().setText(str(row.get("绝对路径", "") or self.store.resolve_photo_path(row)))
+
+    def open_photo_location(self, photo_index: int) -> None:
+        if photo_index < 0 or photo_index >= len(self.current_photos):
+            return
+        directory = self.store.resolve_photo_path(self.current_photos[photo_index]).parent
+        if not directory.exists():
+            QMessageBox.critical(self, "目录不存在", str(directory))
+            return
+        _open_path(directory)
+
     def _on_grid_drop(self, event) -> None:
         self.grid_frame.setStyleSheet("")
         paths = []
@@ -2880,6 +2948,9 @@ class SpecimenWindow(QMainWindow):
         target_path = Path(target).resolve()
         if target_path == self.workspace_root:
             return
+        if self.manager is not None and self.manager.focus_workspace(target_path, exclude=self):
+            self.statusBar().showMessage("该工作区已在其他窗口打开", 3000)
+            return
         if is_generated_workspace_path(target_path):
             QMessageBox.critical(
                 self, "不能使用软件目录",
@@ -2901,6 +2972,8 @@ class SpecimenWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "切换失败", str(exc))
             return
+        if self.manager is not None:
+            self.manager.unregister(self)
         self.store.close()
         self.store = new_store
         self.workspace_root = target_path
@@ -2915,12 +2988,14 @@ class SpecimenWindow(QMainWindow):
         self._thumb_worker.start()
         self.workspace_label.setText(f"当前工作目录：{self.workspace_root}")
         remember_workspace(self.workspace_root)
+        if self.manager is not None:
+            self.manager.register(self)
         self.current_voucher = None
         self.current_photos = []
         self.current_photo_index = 0
         self._photo_view_states.clear()
         self.refresh_list()
-        vouchers = self.store.list_vouchers()
+        vouchers = self._all_vouchers
         if vouchers:
             self.select_voucher(vouchers[0])
         else:
@@ -2934,6 +3009,13 @@ class SpecimenWindow(QMainWindow):
                 w.blockSignals(False)
             self._loading = False
             self.load_current_photo()
+
+    def open_new_window(self) -> None:
+        if self.manager is not None:
+            self.manager.open_workspace(None)
+            return
+        window = SpecimenWindow(None)
+        window.show()
 
     # ---- Image search ----
 
@@ -2984,6 +3066,9 @@ class SpecimenWindow(QMainWindow):
             quality_keys = list(PREVIEW_QUALITY_OPTIONS.keys())
             idx = dlg.quality_combo.currentIndex()
             current_settings.preview_quality = quality_keys[idx] if 0 <= idx < len(quality_keys) else "compressed"
+            mode_key = dlg.photo_management_combo.currentData()
+            current_settings.photo_management_mode = mode_key if mode_key in PHOTO_MANAGEMENT_OPTIONS else "copy_with_absolute"
+            current_settings.photo_library_path = dlg.photo_library_edit.text().strip()
             current_settings.photo_filename_fill_shortcut = dlg.photo_filename_fill_shortcut
             save_settings(current_settings)
             self._cached_preview_quality = current_settings.preview_quality
@@ -4103,7 +4188,15 @@ class IngestSummaryDialog(QDialog):
             return
         try:
             # 原代码先 delete_photo 再 add_photo；新照片校验失败会丢失旧关联。
-            new_row = self.store.replace_photo(self.selected_voucher, old_idx, new_path, allow_outside=True)
+            mode, library_path = self.app._photo_management_settings()
+            new_row = self.store.replace_photo(
+                self.selected_voucher,
+                old_idx,
+                new_path,
+                allow_outside=True,
+                photo_management_mode=mode,
+                photo_library_path=library_path,
+            )
         except Exception as exc:
             QMessageBox.critical(self, "替换失败", str(exc))
             return
@@ -4171,7 +4264,15 @@ class IngestSummaryDialog(QDialog):
         old_idx = next(iter(indices))
         try:
             # 原代码先 delete_photo 再 add_photo；拖拽外部照片失败会丢失旧关联。
-            new_row = self.store.replace_photo(self.selected_voucher, old_idx, new_path, allow_outside=True)
+            mode, library_path = self.app._photo_management_settings()
+            new_row = self.store.replace_photo(
+                self.selected_voucher,
+                old_idx,
+                new_path,
+                allow_outside=True,
+                photo_management_mode=mode,
+                photo_library_path=library_path,
+            )
         except Exception as exc:
             QMessageBox.critical(self, "替换失败", str(exc))
             event.ignore()
@@ -4476,6 +4577,22 @@ class SettingsDialog(QDialog):
         self.quality_combo.setCurrentIndex(current_idx)
         layout.addRow("图片预览质量", self.quality_combo)
 
+        self.photo_management_combo = QComboBox()
+        management_keys = list(PHOTO_MANAGEMENT_OPTIONS.keys())
+        for key in management_keys:
+            self.photo_management_combo.addItem(PHOTO_MANAGEMENT_OPTIONS[key], key)
+        management_idx = management_keys.index(current_settings.photo_management_mode) if current_settings.photo_management_mode in management_keys else 0
+        self.photo_management_combo.setCurrentIndex(management_idx)
+        layout.addRow("照片管理方式", self.photo_management_combo)
+
+        library_row = QHBoxLayout()
+        self.photo_library_edit = QLineEdit(current_settings.photo_library_path)
+        library_row.addWidget(self.photo_library_edit, stretch=1)
+        browse_btn = QPushButton("选择")
+        browse_btn.clicked.connect(self._choose_photo_library)
+        library_row.addWidget(browse_btn)
+        layout.addRow("自定义照片库", library_row)
+
         self.photo_fill_shortcut_edit = QLineEdit(current_settings.photo_filename_fill_shortcut)
         self.photo_fill_shortcut_edit.setPlaceholderText(DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT)
         layout.addRow("照片名填充快捷键", self.photo_fill_shortcut_edit)
@@ -4494,6 +4611,10 @@ class SettingsDialog(QDialog):
         quality_keys = list(PREVIEW_QUALITY_OPTIONS.keys())
         default_idx = quality_keys.index(defaults.preview_quality) if defaults.preview_quality in quality_keys else 0
         self.quality_combo.setCurrentIndex(default_idx)
+        management_keys = list(PHOTO_MANAGEMENT_OPTIONS.keys())
+        management_idx = management_keys.index(defaults.photo_management_mode)
+        self.photo_management_combo.setCurrentIndex(management_idx)
+        self.photo_library_edit.setText(defaults.photo_library_path)
         self.photo_fill_shortcut_edit.setText(defaults.photo_filename_fill_shortcut)
         # Apply immediately
         self.app.store.set_undo_depth(200)
@@ -4503,6 +4624,12 @@ class SettingsDialog(QDialog):
         self.app._show_filename_check.setChecked(defaults.show_grid_filenames)
         self.app._apply_photo_filename_fill_shortcut()
         QMessageBox.information(self, "已恢复", "所有设置已恢复为默认值。")
+
+    def _choose_photo_library(self) -> None:
+        current = self.photo_library_edit.text().strip()
+        directory = QFileDialog.getExistingDirectory(self, "选择自定义照片库", current or str(self.app.workspace_root))
+        if directory:
+            self.photo_library_edit.setText(directory)
 
     @property
     def undo_depth(self) -> int:
@@ -4518,17 +4645,51 @@ class SettingsDialog(QDialog):
 # Entry point
 # ---------------------------------------------------------------------------
 
+class WindowManager:
+    def __init__(self, app: QApplication):
+        self.app = app
+        self._windows: dict[Path, SpecimenWindow] = {}
+
+    def register(self, window: SpecimenWindow) -> None:
+        self._windows[window.workspace_root.resolve()] = window
+
+    def unregister(self, window: SpecimenWindow) -> None:
+        key = window.workspace_root.resolve()
+        if self._windows.get(key) is window:
+            self._windows.pop(key, None)
+
+    def focus_workspace(self, workspace_root: Path | str, exclude: SpecimenWindow | None = None) -> bool:
+        key = Path(workspace_root).resolve()
+        window = self._windows.get(key)
+        if window is None or window is exclude:
+            return False
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        return True
+
+    def open_workspace(self, workspace_root: Path | str | None) -> SpecimenWindow | None:
+        if workspace_root is not None and self.focus_workspace(workspace_root):
+            return self._windows.get(Path(workspace_root).resolve())
+        try:
+            window = SpecimenWindow(workspace_root, manager=self)
+        except SystemExit:
+            return None
+        except Exception as exc:
+            QMessageBox.critical(None, "启动失败", str(exc))
+            return None
+        self.register(window)
+        window.show()
+        return window
+
+
 def run_app(workspace_root: Path | str | None) -> None:
     if workspace_root is None:
         workspace_root = default_workspace()
     app = QApplication.instance() or QApplication(sys.argv)
-    try:
-        window = SpecimenWindow(workspace_root)
-    except SystemExit:
+    manager = WindowManager(app)
+    window = manager.open_workspace(workspace_root)
+    if window is None:
         QMessageBox.warning(None, "标本入库管理", "未选择工作区，程序将退出。")
         return
-    except Exception as exc:
-        QMessageBox.critical(None, "启动失败", str(exc))
-        return
-    window.show()
     app.exec_()

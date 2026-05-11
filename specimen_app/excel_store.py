@@ -61,6 +61,7 @@ from .models import (
     Row,
     StatusFlags,
 )
+from .app_settings import PHOTO_MANAGEMENT_OPTIONS
 from .parsing import derive_specimen_fields_from_tube_number, format_voucher, parse_voucher_serial
 
 
@@ -186,6 +187,51 @@ class ExcelStore:
         rows = self.read_rows("specimen")
         vouchers = [self._value(row, "入库编号*") for row in rows if self._value(row, "入库编号*")]
         return sorted(vouchers, key=lambda value: parse_voucher_serial(value) or 0)
+
+    def workspace_overview(self) -> dict[str, Any]:
+        specimens = self.read_rows("specimen")
+        classifications = self.read_rows("classification")
+        photos = self.read_rows("photo")
+        class_by_voucher = {
+            self._value(row, "入库编号*"): row
+            for row in classifications
+            if self._value(row, "入库编号*")
+        }
+        photo_counts: dict[str, int] = {}
+        photo_filenames: dict[str, list[str]] = {}
+        for row in photos:
+            voucher = self._value(row, "入库编号*")
+            if not voucher:
+                continue
+            photo_counts[voucher] = photo_counts.get(voucher, 0) + 1
+            file_name = self._value(row, "文件名")
+            if file_name:
+                photo_filenames.setdefault(voucher, []).append(file_name)
+        vouchers: list[str] = []
+        flags: dict[str, StatusFlags] = {}
+        tube_numbers: dict[str, str] = {}
+        for row in specimens:
+            voucher = self._value(row, "入库编号*")
+            if not voucher:
+                continue
+            vouchers.append(voucher)
+            tube = self._value(row, "管内编号*")
+            if tube:
+                tube_numbers[voucher] = tube
+            class_row = class_by_voucher.get(voucher, {})
+            flags[voucher] = StatusFlags(
+                specimen_complete=all(self._value(row, field) for field in SPECIMEN_REQUIRED),
+                has_photo=photo_counts.get(voucher, 0) > 0,
+                classification_complete=bool(class_row) and all(self._value(class_row, field) for field in CLASSIFICATION_REQUIRED),
+            )
+        vouchers.sort(key=lambda value: parse_voucher_serial(value) or 0)
+        return {
+            "vouchers": vouchers,
+            "flags": flags,
+            "photo_counts": photo_counts,
+            "tube_numbers": tube_numbers,
+            "photo_filenames": photo_filenames,
+        }
 
     def voucher_photo_counts(self) -> dict[str, int]:
         """Return {voucher: photo_count} for all vouchers that have photos."""
@@ -342,15 +388,44 @@ class ExcelStore:
         self._record_action(action_type, voucher, category, "", old_row, new_row)
         return True
 
-    def add_photo(self, voucher: str, photo_path: Path | str, allow_outside: bool = False) -> Row:
-        row = self._photo_row(voucher, photo_path, allow_outside=allow_outside)
+    def add_photo(
+        self,
+        voucher: str,
+        photo_path: Path | str,
+        allow_outside: bool = False,
+        photo_management_mode: str = "copy_with_absolute",
+        photo_library_path: Path | str | None = None,
+    ) -> Row:
+        row = self._photo_row(
+            voucher,
+            photo_path,
+            allow_outside=allow_outside,
+            photo_management_mode=photo_management_mode,
+            photo_library_path=photo_library_path,
+        )
         self._append_row("photo", row)
         self._update_summary_modified(voucher)
         self._record_action("add_photo", voucher, "photo", "", {}, row)
         return row
 
-    def add_photos(self, voucher: str, photo_paths: list[Path | str], allow_outside: bool = False) -> list[Row]:
-        rows_to_add = [self._photo_row(voucher, path, allow_outside=allow_outside) for path in photo_paths]
+    def add_photos(
+        self,
+        voucher: str,
+        photo_paths: list[Path | str],
+        allow_outside: bool = False,
+        photo_management_mode: str = "copy_with_absolute",
+        photo_library_path: Path | str | None = None,
+    ) -> list[Row]:
+        rows_to_add = [
+            self._photo_row(
+                voucher,
+                path,
+                allow_outside=allow_outside,
+                photo_management_mode=photo_management_mode,
+                photo_library_path=photo_library_path,
+            )
+            for path in photo_paths
+        ]
         if not rows_to_add:
             return []
         rows = self.read_rows("photo")
@@ -489,13 +564,23 @@ class ExcelStore:
         photo_path: Path | str,
         allow_outside: bool = False,
         source_row: Row | None = None,
+        photo_management_mode: str = "copy_with_absolute",
+        photo_library_path: Path | str | None = None,
     ) -> Row:
         original_name = self._value(source_row, "原始文件名") or self._value(source_row, "文件名") or Path(photo_path).name
-        archived = self._archive_photo_file(Path(photo_path), original_name=original_name)
+        mode = photo_management_mode if photo_management_mode in PHOTO_MANAGEMENT_OPTIONS else "copy_with_absolute"
+        if source_row is not None:
+            # 导入其他工作区时沿用旧逻辑：复制为当前工作区副本，保证目标工作区可独立使用。
+            mode = "copy_with_absolute"
+        if mode == "absolute_only":
+            return self._absolute_photo_row(voucher, Path(photo_path), original_name, source_row)
+        archive_dir = Path(photo_library_path).expanduser() if mode == "copy_to_custom_library" and photo_library_path else None
+        archived = self._archive_photo_file(Path(photo_path), original_name=original_name, archive_dir=archive_dir)
         return {
             "入库编号*": voucher,
             "文件名": archived["file_name"],
             "相对路径": archived["relative_path"],
+            "绝对路径": archived["path"],
             "描述": self._value(source_row, "描述"),
             "来源工作区根路径": "",
             "原始文件名": archived["original_name"],
@@ -504,6 +589,25 @@ class ExcelStore:
             "文件大小": archived["size"],
             "归档时间": archived["archived_at"],
             "归档状态": "已归档",
+        }
+
+    def _absolute_photo_row(self, voucher: str, source: Path, original_name: str, source_row: Row | None = None) -> Row:
+        source = source.resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"照片文件不存在：{source}")
+        return {
+            "入库编号*": voucher,
+            "文件名": source.name,
+            "相对路径": "",
+            "绝对路径": str(source),
+            "描述": self._value(source_row, "描述"),
+            "来源工作区根路径": "",
+            "原始文件名": Path(original_name or source.name).name,
+            "原始路径": str(source),
+            "文件SHA256": self._file_sha256(source),
+            "文件大小": str(source.stat().st_size),
+            "归档时间": "",
+            "归档状态": "仅记录",
         }
 
     def delete_photo(self, voucher: str, photo_index: int) -> bool:
@@ -550,13 +654,17 @@ class ExcelStore:
             return False
         position = matching_positions[photo_index]
         old_row = rows[position].copy()
+        if self._value(old_row, "归档状态") == "仅记录":
+            return self._set_photo_text_field(voucher, photo_index, "文件名", filename)
         old_path = self.resolve_photo_path(old_row)
         if not old_path.exists():
             raise FileNotFoundError(f"照片文件不存在：{old_path}")
-        target = self._move_archive_file_to_name(old_path, filename)
+        archive_dir = old_path.parent if not self._is_workspace_archive_path(old_path) else None
+        target = self._move_archive_file_to_name(old_path, filename, archive_dir=archive_dir)
         new_row = old_row.copy()
         new_row["文件名"] = target.name
-        new_row["相对路径"] = self._archive_relative_path(target)
+        new_row["相对路径"] = self._archive_relative_path(target) if self._is_under_root(target, self.root) else ""
+        new_row["绝对路径"] = str(target.resolve())
         new_row["来源工作区根路径"] = ""
         if old_row == new_row:
             return False
@@ -567,13 +675,27 @@ class ExcelStore:
         self._record_action("update_photo", voucher, "photo", "文件名", old_row, rows[position].copy())
         return True
 
-    def replace_photo(self, voucher: str, photo_index: int, photo_path: Path | str, allow_outside: bool = False) -> Row | None:
+    def replace_photo(
+        self,
+        voucher: str,
+        photo_index: int,
+        photo_path: Path | str,
+        allow_outside: bool = False,
+        photo_management_mode: str = "copy_with_absolute",
+        photo_library_path: Path | str | None = None,
+    ) -> Row | None:
         rows = self.read_rows("photo")
         matching_positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == voucher]
         if photo_index < 0 or photo_index >= len(matching_positions):
             return None
         position = matching_positions[photo_index]
-        new_row = self._photo_row(voucher, photo_path, allow_outside=allow_outside)
+        new_row = self._photo_row(
+            voucher,
+            photo_path,
+            allow_outside=allow_outside,
+            photo_management_mode=photo_management_mode,
+            photo_library_path=photo_library_path,
+        )
         old_row = rows[position].copy()
         if old_row == new_row:
             return new_row
@@ -851,32 +973,49 @@ class ExcelStore:
 
     def resolve_photo_path(self, photo_row: Row) -> Path:
         relative = self._value(photo_row, "相对路径")
-        candidates = [self._resolve_relative(self.root, relative)]
+        candidates: list[Path] = []
+        if relative:
+            candidates.append(self._resolve_relative(self.root, relative))
         source_root = self._value(photo_row, "来源工作区根路径")
-        if source_root:
+        if relative and source_root:
             src = Path(source_root)
             if src.is_dir():
                 candidates.append(self._resolve_relative(src, relative))
+        absolute = self._value(photo_row, "绝对路径")
+        if absolute:
+            candidates.append(Path(absolute).expanduser().resolve())
+        original = self._value(photo_row, "原始路径")
+        if original:
+            candidates.append(Path(original).expanduser().resolve())
         for path in candidates:
             if path.exists():
                 return path
-        return candidates[0]
+        if candidates:
+            return candidates[0]
+        return self.root / self._value(photo_row, "文件名")
 
     def _resolve_import_photo_path(self, photo_row: Row, source_root: Path) -> Path:
         relative = self._value(photo_row, "相对路径")
-        candidates = [self._resolve_relative(source_root, relative)]
+        candidates = []
+        if relative:
+            candidates.append(self._resolve_relative(source_root, relative))
         source_photo_root = self._value(photo_row, "来源工作区根路径")
-        if source_photo_root:
+        if relative and source_photo_root:
             src = Path(source_photo_root)
             if src.is_dir():
                 candidates.append(self._resolve_relative(src, relative))
+        absolute_path = self._value(photo_row, "绝对路径")
+        if absolute_path:
+            candidates.append(Path(absolute_path).resolve())
         original_path = self._value(photo_row, "原始路径")
         if original_path:
             candidates.append(Path(original_path).resolve())
         for path in candidates:
             if path.exists():
                 return path
-        return candidates[0]
+        if candidates:
+            return candidates[0]
+        return source_root / self._value(photo_row, "文件名")
 
     def relative_photo_path(self, path: Path, allow_outside: bool = False) -> str:
         path = path.resolve()
@@ -898,12 +1037,17 @@ class ExcelStore:
             # 原代码会把外部照片保存成 ../xxx；现在用来源根路径 + 文件名避免路径穿越。
             return "./" + path.name, str(path.parent)
 
-    def _archive_photo_file(self, source: Path, original_name: str | None = None) -> dict[str, str]:
+    def _archive_photo_file(
+        self,
+        source: Path,
+        original_name: str | None = None,
+        archive_dir: Path | None = None,
+    ) -> dict[str, str]:
         source = source.resolve()
         if not source.is_file():
             raise FileNotFoundError(f"照片文件不存在：{source}")
         digest = self._file_sha256(source)
-        archive_dir = self._photo_archive_dir()
+        archive_dir = (archive_dir or self._photo_archive_dir()).resolve()
         archive_dir.mkdir(parents=True, exist_ok=True)
         clean_name = self._safe_photo_filename(original_name or source.name)
         target = self._archive_target_path(archive_dir, digest, clean_name)
@@ -923,7 +1067,7 @@ class ExcelStore:
         return {
             "path": str(target),
             "file_name": target.name,
-            "relative_path": self._archive_relative_path(target),
+            "relative_path": self._archive_relative_path(target) if self._is_under_root(target, self.root) else "",
             "original_name": Path(original_name or source.name).name,
             "source_path": str(source),
             "sha256": digest,
@@ -939,6 +1083,13 @@ class ExcelStore:
 
     def _archive_relative_path(self, path: Path) -> str:
         return "./" + path.resolve().relative_to(self.root).as_posix()
+
+    def _is_under_root(self, path: Path, root: Path) -> bool:
+        try:
+            path.resolve().relative_to(root.resolve())
+            return True
+        except ValueError:
+            return False
 
     def _available_archive_target(self, archive_dir: Path, clean_name: str, digest: str | None = None) -> Path:
         target = archive_dir / clean_name
@@ -964,12 +1115,12 @@ class ExcelStore:
                 return False
         return False
 
-    def _move_archive_file_to_name(self, source: Path, filename: str) -> Path:
+    def _move_archive_file_to_name(self, source: Path, filename: str, archive_dir: Path | None = None) -> Path:
         source = source.resolve()
         if not source.is_file():
             raise FileNotFoundError(f"照片文件不存在：{source}")
         digest = self._file_sha256(source)
-        archive_dir = self._photo_archive_dir()
+        archive_dir = (archive_dir or self._photo_archive_dir()).resolve()
         archive_dir.mkdir(parents=True, exist_ok=True)
         default_suffix = source.suffix if source.suffix else ""
         clean_name = self._safe_photo_filename(filename, default_suffix=default_suffix)
@@ -1000,7 +1151,7 @@ class ExcelStore:
             path = self.resolve_photo_path(photo_row).resolve()
         except Exception:
             return False
-        if not self._is_workspace_archive_path(path) or not path.exists():
+        if not self._is_managed_photo_path(photo_row, path) or not path.exists():
             return False
         rows = remaining_rows if remaining_rows is not None else self.read_rows("photo")
         for row in rows:
@@ -1014,7 +1165,7 @@ class ExcelStore:
 
     def _delete_archive_file_if_safe(self, path: Path) -> bool:
         path = path.resolve()
-        if not self._is_workspace_archive_path(path) or not path.exists():
+        if not path.exists():
             return False
         try:
             path.unlink()
@@ -1028,6 +1179,21 @@ class ExcelStore:
             return True
         except ValueError:
             return False
+
+    def _is_managed_photo_path(self, photo_row: Row, path: Path) -> bool:
+        if self._is_workspace_archive_path(path):
+            return True
+        if self._value(photo_row, "归档状态") != "已归档":
+            return False
+        original = self._value(photo_row, "原始路径")
+        if original:
+            try:
+                if Path(original).resolve() == path.resolve():
+                    return False
+            except OSError:
+                return False
+        absolute = self._value(photo_row, "绝对路径")
+        return bool(absolute) and Path(absolute).expanduser().resolve() == path.resolve()
 
     def _safe_photo_filename(self, filename: str, default_suffix: str = "") -> str:
         name = Path(filename or "photo").name.strip() or "photo"
@@ -1085,9 +1251,19 @@ class ExcelStore:
     def ensure_index(self) -> None:
         index_rows = self._read_plain_rows(self.data_dir / INDEX_FILE)
         indexed = {self._value(row, "入库编号") for row in index_rows if self._value(row, "入库编号")}
+        specimens = self.read_rows("specimen")
+        classifications = self.read_rows("classification")
+        class_by_voucher = {
+            self._value(row, "入库编号*"): row
+            for row in classifications
+            if self._value(row, "入库编号*")
+        }
         now = self._now()
         changed = False
-        for voucher in self.list_vouchers():
+        for row in specimens:
+            voucher = self._value(row, "入库编号*")
+            if not voucher:
+                continue
             if voucher not in indexed:
                 index_rows.append(
                     {
@@ -1096,7 +1272,7 @@ class ExcelStore:
                         "创建时间": now,
                         "来源工作区": "",
                         "来源记录ID": "",
-                        "记录指纹": self.record_fingerprint(voucher),
+                        "记录指纹": self._fingerprint_from_rows(row, class_by_voucher.get(voucher)),
                     }
                 )
                 changed = True
