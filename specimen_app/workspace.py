@@ -19,6 +19,26 @@ def is_generated_workspace_path(path: Path | str) -> bool:
     return any(part.lower() in GENERATED_DIR_NAMES for part in parts)
 
 
+def is_unsafe_workspace_root(path: Path | str) -> bool:
+    """判断路径是否"范围过大、不该作为工作区"：文件系统根 / 盘符根 / 用户主目录。
+
+    把这类目录当工作区，会让全工作区扫描（图片索引等）遍历海量文件，可能拖垮整机。
+    """
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        return False
+    # 文件系统根 / 盘符根：自身的 parent 等于自身（如 "/"、"C:\\"）。
+    if resolved.parent == resolved:
+        return True
+    try:
+        if resolved == Path.home().resolve():
+            return True
+    except (OSError, RuntimeError):
+        pass
+    return False
+
+
 def has_workspace_templates(path: Path | str) -> bool:
     root = Path(path)
     return (root / "字段模版" / "表格信息预设字段.xlsx").exists()

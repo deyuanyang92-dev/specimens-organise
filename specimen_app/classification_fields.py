@@ -6,7 +6,10 @@ existing workbooks; missing new columns are appended when a workspace opens.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .species import FamilyMatch, SpeciesMatch
 
 
 CLASSIFICATION_COLUMNS = [
@@ -59,7 +62,7 @@ CLASSIFICATION_SUMMARY_FIELDS = [
 ]
 
 
-def classification_values_from_species_match(match: Any) -> dict[str, str]:
+def classification_values_from_species_match(match: "SpeciesMatch") -> dict[str, str]:
     values: dict[str, str] = {}
     for column, attr in SPECIES_MATCH_TO_CLASSIFICATION_COLUMNS.items():
         if column not in CLASSIFICATION_COLUMNS:
@@ -68,7 +71,7 @@ def classification_values_from_species_match(match: Any) -> dict[str, str]:
     return values
 
 
-def classification_values_from_family_match(match: Any) -> dict[str, str]:
+def classification_values_from_family_match(match: "FamilyMatch") -> dict[str, str]:
     values: dict[str, str] = {}
     for column, attr in FAMILY_MATCH_TO_CLASSIFICATION_COLUMNS.items():
         if column not in CLASSIFICATION_COLUMNS:

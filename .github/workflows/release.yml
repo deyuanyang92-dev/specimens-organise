@@ -1,0 +1,53 @@
+name: Release
+
+# 推送 v* 标签时，在 Windows 和 Linux 上各自构建发布包，
+# 并把 zip + 对应的 .sha256 作为 GitHub Release 资产上传。
+# 应用内"检查 GitHub 更新"会读取最新 Release 的这些资产。
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+          - os: ubuntu-latest
+            platform: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release
+        run: python build_release.py --version ${{ steps.ver.outputs.version }}
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            releases/v${{ steps.ver.outputs.version }}/*.zip
+            releases/v${{ steps.ver.outputs.version }}/*.zip.sha256
+            releases/v${{ steps.ver.outputs.version }}/update_manifest_*.json

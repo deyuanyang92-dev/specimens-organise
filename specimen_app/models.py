@@ -101,6 +101,52 @@ CLASSIFICATION_REQUIRED = list(REQUIRED_CLASSIFICATION_COLUMNS)
 
 SAVE_METHOD_OPTIONS = ["9E", "7E", "79", "RE", "FE"]
 
+# 录入加速：一批标本里往往相同的标本信息字段。用于"沿用上条"和"多选批量设置"。
+CARRY_OVER_SPECIMEN_FIELDS = ("标本存放位置", "信息录入人员", "核对人员", "保存方式")
+
+# 入库汇总视图：把分散在多个 Excel 的字段汇总成一张宽表（纯内存视图，不改任何文件结构）。
+# PHOTO_COUNT_COLUMN 是计算列；SPECIMEN_HEADERS 与 CLASSIFICATION_HEADERS 都含"备注"，
+# 汇总表里 classification 的"备注"用 CLASSIFICATION_NOTE_DISPLAY 消歧（仅显示名，回写时映射回真实列名）。
+PHOTO_COUNT_COLUMN = "照片数"
+CLASSIFICATION_NOTE_DISPLAY = "分类备注"
+
+# 汇总表列顺序：入库编号* + 标本其余列 + 分类其余列（备注消歧）+ 照片数。
+SUMMARY_COLUMNS = (
+    ["入库编号*"]
+    + [col for col in SPECIMEN_HEADERS if col != "入库编号*"]
+    + [
+        CLASSIFICATION_NOTE_DISPLAY if col == "备注" else col
+        for col in CLASSIFICATION_HEADERS
+        if col != "入库编号*"
+    ]
+    + [PHOTO_COUNT_COLUMN]
+)
+
+# 汇总列 -> (category, excel_field)。category="readonly" 表示不可编辑（主键 / 计算列）。
+# 可编辑列回写时按 category 调 ExcelStore.set_fields(category, voucher, {excel_field: value})。
+SUMMARY_COLUMN_SOURCE: dict[str, tuple[str, str]] = {"入库编号*": ("readonly", "入库编号*")}
+for _col in SPECIMEN_HEADERS:
+    if _col != "入库编号*":
+        SUMMARY_COLUMN_SOURCE[_col] = ("specimen", _col)
+for _col in CLASSIFICATION_HEADERS:
+    if _col == "入库编号*":
+        continue
+    _display = CLASSIFICATION_NOTE_DISPLAY if _col == "备注" else _col
+    SUMMARY_COLUMN_SOURCE[_display] = ("classification", _col)
+SUMMARY_COLUMN_SOURCE[PHOTO_COUNT_COLUMN] = ("readonly", PHOTO_COUNT_COLUMN)
+del _col, _display
+
+# 入库汇总对话框默认显示的列（其余列默认隐藏，用户可在表头右键切换）。
+SUMMARY_DEFAULT_VISIBLE_COLUMNS = [
+    "入库编号*",
+    "管内编号*",
+    "保存方式",
+    "采集日期",
+    "种名*",
+    "科*",
+    PHOTO_COUNT_COLUMN,
+]
+
 CATEGORY_FILES = {
     "specimen": SPECIMEN_FILE,
     "photo": PHOTO_FILE,

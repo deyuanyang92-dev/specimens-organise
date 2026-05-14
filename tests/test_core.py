@@ -851,22 +851,99 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(settings.show_grid_filenames)
             self.assertEqual(settings.photo_filename_fill_shortcut, DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT)
             self.assertEqual(settings.photo_management_mode, "copy_with_absolute")
+            # 旧 settings.json 缺该键时，沿用上条信息默认开启
+            self.assertTrue(settings.carry_over_specimen_fields)
+            # 旧 settings.json 缺该键时，入库汇总可见列为空（运行时回退到默认列集）
+            self.assertEqual(settings.summary_visible_columns, [])
 
             settings.show_grid_filenames = False
             settings.photo_filename_fill_shortcut = "Ctrl+Shift+F"
             settings.photo_management_mode = "absolute_only"
             settings.photo_library_path = str(self.tmp / "library")
+            settings.carry_over_specimen_fields = False
+            settings.summary_visible_columns = ["入库编号*", "管内编号*", "照片数"]
             save_settings(settings)
             reloaded = load_settings()
             self.assertFalse(reloaded.show_grid_filenames)
             self.assertEqual(reloaded.photo_filename_fill_shortcut, "Ctrl+Shift+F")
             self.assertEqual(reloaded.photo_management_mode, "absolute_only")
             self.assertEqual(reloaded.photo_library_path, str(self.tmp / "library"))
+            self.assertFalse(reloaded.carry_over_specimen_fields)
+            self.assertEqual(reloaded.summary_visible_columns, ["入库编号*", "管内编号*", "照片数"])
         finally:
             if old_appdata is None:
                 os.environ.pop("APPDATA", None)
             else:
                 os.environ["APPDATA"] = old_appdata
+
+    def test_summary_records_joins_specimen_classification_and_photos(self) -> None:
+        store = ExcelStore(self.tmp)
+        first = store.create_specimen()
+        second = store.create_specimen()  # 故意不填分类信息，验证左连接
+        store.set_fields("specimen", first, {
+            "管内编号*": "QD-CK-SC008",
+            "采集地点缩写*": "QD",
+            "备注": "标本备注",
+        })
+        store.set_fields("classification", first, {
+            "种名*": "Nicon moniloceras",
+            "科*": "Nereididae",
+            "备注": "分类的备注",
+        })
+        photo = self.tmp / "summary.jpg"
+        photo.write_bytes(b"photo")
+        store.add_photo(first, photo, allow_outside=True)
+
+        records = store.summary_records()
+        by_voucher = {r["入库编号*"]: r for r in records}
+
+        # 左连接：缺分类信息的 second 也在结果里
+        self.assertEqual(sorted(by_voucher), sorted([first, second]))
+        rec = by_voucher[first]
+        self.assertEqual(rec["管内编号*"], "QD-CK-SC008")
+        self.assertEqual(rec["种名*"], "Nicon moniloceras")
+        self.assertEqual(rec["科*"], "Nereididae")
+        # specimen 的"备注"与 classification 的"备注"消歧（后者显示为"分类备注"）
+        self.assertEqual(rec["备注"], "标本备注")
+        self.assertEqual(rec["分类备注"], "分类的备注")
+        self.assertEqual(rec["照片数"], 1)
+        self.assertEqual(rec["照片文件名"], ["summary.jpg"])
+        # 缺分类信息的记录：分类列留空，照片数为 0
+        rec2 = by_voucher[second]
+        self.assertEqual(rec2["种名*"], "")
+        self.assertEqual(rec2["分类备注"], "")
+        self.assertEqual(rec2["照片数"], 0)
+
+    def test_is_unsafe_workspace_root_rejects_root_and_home(self) -> None:
+        from specimen_app.workspace import is_unsafe_workspace_root
+
+        # 文件系统根 / 盘符根、用户主目录：范围过大，判 unsafe
+        self.assertTrue(is_unsafe_workspace_root(Path(self.tmp.anchor)))
+        self.assertTrue(is_unsafe_workspace_root(Path.home()))
+        # 正常工作区子目录：safe
+        workspace = self.tmp / "workspace"
+        workspace.mkdir()
+        self.assertFalse(is_unsafe_workspace_root(workspace))
+
+    def test_image_decode_respects_pixel_cap(self) -> None:
+        from specimen_app import image_cache
+
+        big = Image.new("RGB", (800, 600))  # 480000 px
+        small = Image.new("RGB", (100, 100))
+        original_cap = image_cache._MAX_DECODE_PIXELS
+        try:
+            image_cache._MAX_DECODE_PIXELS = 100_000
+            reduced = image_cache._downsample_if_huge(big, None)
+            self.assertLessEqual(reduced.width * reduced.height, 100_000)
+            # 未超上限的图原样返回（不复制、不降采样）
+            self.assertIs(image_cache._downsample_if_huge(small, None), small)
+            # 端到端：load_source_image 也受上限约束
+            path = self.tmp / "big.png"
+            big.save(path)
+            loaded = image_cache.load_source_image(path, max_size=None)
+            self.assertLessEqual(loaded.width * loaded.height, 100_000)
+        finally:
+            image_cache._MAX_DECODE_PIXELS = original_cap
 
     def test_batch_photo_records_undo_and_redo_as_one_action(self) -> None:
         store = ExcelStore(self.tmp)

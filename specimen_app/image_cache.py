@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import threading
 import uuid
 from collections import OrderedDict
@@ -13,6 +14,11 @@ _NUMPY = None
 _TIFFFILE = None
 _TIFF_IMPORT_ATTEMPTED = False
 DEFAULT_MEMORY_CACHE_BYTES = 64 * 1024 * 1024
+
+# 解码硬上限（像素数）。标本扫描原图常达数亿像素，全分辨率解码进内存 + 多张并发会耗尽
+# 内存导致整机卡死。任何超过此上限的图，在做 exif/convert/缩放等会分配全尺寸缓冲的操作
+# 之前，先按整数倍降采样到上限以内。约 24MP，足够生成任何缩略图/预览。
+_MAX_DECODE_PIXELS = 24_000_000
 
 
 class ThumbnailCache:
@@ -91,12 +97,43 @@ def _image_byte_count(image: Image.Image) -> int:
     return max(1, image.width * image.height * bands)
 
 
+def _downsample_if_huge(image: Image.Image, max_size: tuple[int, int] | None) -> Image.Image:
+    """对超过 _MAX_DECODE_PIXELS 的图先做整数倍降采样（reduce），再交给后续转换。
+
+    原代码直接对全分辨率图做 exif_transpose / convert / thumbnail —— 这些都会分配全尺寸
+    缓冲，超大图会瞬时吃掉数百 MB 内存。reduce() 是高效的整数倍盒式降采样，开销远小于
+    全分辨率转换。返回的图保证像素数 <= _MAX_DECODE_PIXELS。
+    """
+    width, height = image.size
+    pixels = width * height
+    if pixels <= _MAX_DECODE_PIXELS:
+        return image
+    factor = math.ceil(math.sqrt(pixels / _MAX_DECODE_PIXELS))
+    if max_size and max_size[0] > 0 and max_size[1] > 0:
+        # 若已知目标尺寸，可降得更狠（缩略图用途下没必要保留过多分辨率）。
+        factor_for_target = min(width // max_size[0], height // max_size[1])
+        if factor_for_target > factor:
+            factor = factor_for_target
+    factor = max(2, int(factor))
+    try:
+        return image.reduce(factor)
+    except Exception:
+        # reduce 不可用时退回 thumbnail（仍比全分辨率转换省内存）。
+        image.thumbnail((max(1, width // factor), max(1, height // factor)), Image.LANCZOS)
+        return image
+
+
 def load_source_image(path: Path, max_size: tuple[int, int] | None = None) -> Image.Image:
     if path.suffix.lower() in {".tif", ".tiff"}:
         image = _load_tiff(path, max_size=max_size)
         if image is not None:
             return image
     with Image.open(path) as image:
+        # draft() 让 JPEG 在解码阶段就按目标尺寸降比例解码（对其它格式是 no-op）；
+        # 之后 _downsample_if_huge 兜底处理超大图，避免全分辨率中间缓冲导致内存爆。
+        if max_size:
+            image.draft("RGB", max_size)
+        image = _downsample_if_huge(image, max_size)
         image = ImageOps.exif_transpose(image)
         if image.mode not in ("RGB", "L"):
             image = image.convert("RGB")
@@ -116,9 +153,15 @@ def _load_tiff(path: Path, max_size: tuple[int, int] | None = None) -> Image.Ima
                 return None
             shape = getattr(page, "shape", None)
             stride = 1
-            if max_size and shape and len(shape) >= 2:
+            if shape and len(shape) >= 2:
                 h, w = _shape_height_width(shape)
-                stride = max(1, min(h // max(max_size[1], 1), w // max(max_size[0], 1)))
+                if max_size:
+                    stride = max(1, min(h // max(max_size[1], 1), w // max(max_size[0], 1)))
+                # 即使没给 max_size，也按解码上限强制降采样：超大单页 TIFF 整页 materialize
+                # 会耗尽内存，这里保证 stride 后的像素数落在 _MAX_DECODE_PIXELS 以内。
+                if h * w > _MAX_DECODE_PIXELS:
+                    cap_stride = math.ceil(math.sqrt((h * w) / _MAX_DECODE_PIXELS))
+                    stride = max(stride, cap_stride)
             array = _page_asarray_low_memory(page)
             if stride > 1:
                 slices = tuple(

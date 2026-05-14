@@ -84,10 +84,16 @@ from .image_search import (
     suffixes_for_image_type,
 )
 from .batch_export import BatchExportDialog  # 批量导出功能
+from .startup_diag import mark as _startup_mark
 from .models import (
+    CARRY_OVER_SPECIMEN_FIELDS,
     ImportConflictError,
+    PHOTO_COUNT_COLUMN,
     SAVE_METHOD_OPTIONS,
     SPECIMEN_HEADERS,
+    SUMMARY_COLUMNS,
+    SUMMARY_COLUMN_SOURCE,
+    SUMMARY_DEFAULT_VISIBLE_COLUMNS,
     WorkspaceLockedError,
     WorkspaceNotInitializedError,
 )
@@ -96,9 +102,22 @@ from .parsing import (
     extract_specimen_tube_from_filename,
     parse_voucher_serial,
 )
-from .release_manager import list_releases
+from .release_manager import list_releases, release_roots
+from .updater import (
+    check_latest_release,
+    default_download_root,
+    download_release,
+    download_update,
+    is_newer,
+)
 from .species import FamilyMatch, SpeciesMatch, SpeciesMatcher
-from .workspace import default_workspace, has_workspace_data, initialize_workspace, is_generated_workspace_path
+from .workspace import (
+    default_workspace,
+    has_workspace_data,
+    initialize_workspace,
+    is_generated_workspace_path,
+    is_unsafe_workspace_root,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +296,9 @@ class ThumbnailWorker(QThread):
         self.cache = cache
         self._queue: queue.Queue[_ThumbnailRequest | None] = queue.Queue()
         self._running = True
-        self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="thumb")
+        # 原值 max_workers=4：最多 4 张超大图同时解码，峰值内存可达数 GB，易拖垮整机。
+        # 降到 2，限制并发解码的内存峰值（解码内存上限另见 image_cache._MAX_DECODE_PIXELS）。
+        self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="thumb")
 
     def enqueue(self, path: Path, size: tuple[int, int], token: int) -> None:
         self._queue.put(_ThumbnailRequest(path, size, token))
@@ -318,6 +339,43 @@ class ThumbnailWorker(QThread):
             self.result_ready.emit(req.token, qpixmap, None)
         except Exception as exc:
             self.result_ready.emit(req.token, None, exc)
+
+
+# ---------------------------------------------------------------------------
+# Background workers for GitHub update check / download (QThread + signal)
+# ---------------------------------------------------------------------------
+
+class UpdateCheckWorker(QThread):
+    # LatestRelease|None, Exception|None
+    finished_check = pyqtSignal(object, object)
+
+    def run(self) -> None:
+        try:
+            self.finished_check.emit(check_latest_release(), None)
+        except Exception as exc:  # 网络/解析错误统一回传，UI 决定是否提示
+            self.finished_check.emit(None, exc)
+
+
+class UpdateDownloadWorker(QThread):
+    progress = pyqtSignal(int)               # 下载进度百分比
+    # Path|None, incremental(bool), Exception|None
+    finished_download = pyqtSignal(object, object, object)
+
+    def __init__(self, release, dest_root, local_roots=None, parent=None):
+        super().__init__(parent)
+        self._release = release
+        self._dest_root = dest_root
+        self._local_roots = local_roots or []
+
+    def run(self) -> None:
+        try:
+            # download_update 尽量走增量（只下应用包）；老 release 自动回退完整 zip。
+            path, incremental = download_update(
+                self._release, self._dest_root, self._local_roots, self.progress.emit
+            )
+            self.finished_download.emit(path, incremental, None)
+        except Exception as exc:
+            self.finished_download.emit(None, False, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -682,6 +740,7 @@ class SpecimenWindow(QMainWindow):
             self.close()
             raise SystemExit from exc
 
+        _startup_mark("SpecimenWindow: ExcelStore ready")
         self.matcher = SpeciesMatcher(self.workspace_root / "字段模版" / "表格信息预设字段.xlsx")
         self.current_voucher: str | None = None
         self.current_photos: list[dict[str, str]] = []
@@ -727,6 +786,7 @@ class SpecimenWindow(QMainWindow):
         self._all_photo_filenames: dict[str, list[str]] = {}
 
         self._build_ui()
+        _startup_mark("SpecimenWindow._build_ui")
 
         remember_workspace(self.workspace_root)
         self.statusBar().showMessage("正在加载工作区数据...")
@@ -736,11 +796,14 @@ class SpecimenWindow(QMainWindow):
         if self._is_closing:
             return
         self.refresh_list()
+        _startup_mark("_finish_initial_load: refresh_list")
         vouchers = self._all_vouchers
         if vouchers:
             self.select_voucher(vouchers[0], defer_preview=True)
+        _startup_mark("_finish_initial_load: first voucher selected")
         self.statusBar().showMessage("工作区已加载", 2000)
         QTimer.singleShot(1200, self._build_search_index_background)
+        QTimer.singleShot(2500, self._maybe_check_updates_on_startup)
 
     # ---- workspace preparation ----
 
@@ -762,6 +825,15 @@ class SpecimenWindow(QMainWindow):
             QMessageBox.critical(
                 self, "不能使用软件目录",
                 f"不能把 build/dist/releases 等软件构建或版本目录作为工作区：\n{path}\n\n请选择实际保存数据和照片的工作目录。",
+            )
+            return None
+        # 文件系统根 / 盘符根 / 用户主目录范围过大，全工作区扫描会遍历海量文件、拖垮电脑。
+        if is_unsafe_workspace_root(path):
+            QMessageBox.critical(
+                self, "目录范围过大",
+                f"不能把文件系统根目录、盘符根目录或用户主目录作为工作区：\n{path}\n\n"
+                "这类目录过大，软件的全工作区扫描（如图片索引）会遍历海量文件、可能拖垮电脑。\n"
+                "请选择实际保存数据和照片的子目录。",
             )
             return None
         if has_workspace_data(path):
@@ -815,8 +887,12 @@ class SpecimenWindow(QMainWindow):
             ]
             settings.show_grid_filenames = getattr(self, "_show_grid_filenames", settings.show_grid_filenames)
             save_settings(settings)
-        except Exception:
-            pass
+        except OSError as exc:
+            # 磁盘满 / 无权限等环境问题：保存窗口状态失败可容忍，不阻断关闭，但记录到 stderr。
+            # 原代码 except Exception: pass 会静默吞掉一切异常（含真正的 bug）。
+            print(f"[closeEvent] 保存窗口状态失败：{exc}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[closeEvent] 保存窗口状态时发生异常：{exc}", file=sys.stderr)
         store = getattr(self, "store", None)
         if store is not None:
             try:
@@ -848,6 +924,23 @@ class SpecimenWindow(QMainWindow):
         self.addToolBar(toolbar)
         for label, slot in [
             ("＋新增标本", self.new_specimen),
+        ]:
+            action = QAction(label, self)
+            action.triggered.connect(slot)
+            toolbar.addAction(action)
+
+        # 录入加速：可勾选的"沿用上条信息"开关。勾选时新增标本会带上一条的标本信息字段。
+        # 状态静默持久化到 settings.json（控件留在工具栏，不进设置对话框）。
+        self._carry_over_action = QAction("沿用上条信息", self)
+        self._carry_over_action.setCheckable(True)
+        self._carry_over_action.setChecked(load_settings().carry_over_specimen_fields)
+        self._carry_over_action.setToolTip(
+            "新增标本时自动沿用上一条记录的：" + "、".join(CARRY_OVER_SPECIMEN_FIELDS)
+        )
+        self._carry_over_action.toggled.connect(self._on_carry_over_toggled)
+        toolbar.addAction(self._carry_over_action)
+
+        for label, slot in [
             ("导入工作区", self.import_workspace),
             ("导入数据", self.import_data_file),
             ("导出数据", self.export_data),
@@ -1687,9 +1780,35 @@ class SpecimenWindow(QMainWindow):
 
     # ---- Specimen CRUD ----
 
-    def new_specimen(self) -> None:
+    def _on_carry_over_toggled(self, checked: bool) -> None:
+        """工具栏"沿用上条信息"开关变化时，静默持久化到 settings.json。"""
         try:
+            settings = load_settings()
+            settings.carry_over_specimen_fields = bool(checked)
+            save_settings(settings)
+        except Exception:
+            pass  # 持久化失败不影响本次会话内的开关状态
+
+    def new_specimen(self) -> None:
+        # 原逻辑：create_specimen() -> refresh_list() -> select_voucher()，新记录字段全空。
+        # 现在：若"沿用上条信息"开关打开且已有当前标本，则把上一条的标本信息字段
+        # （CARRY_OVER_SPECIMEN_FIELDS）带入新记录，减少重复录入。
+        try:
+            carry: dict[str, str] = {}
+            if (
+                getattr(self, "_carry_over_action", None) is not None
+                and self._carry_over_action.isChecked()
+                and self.current_voucher
+            ):
+                prev = self.store.get_specimen(self.current_voucher) or {}
+                carry = {
+                    field: str(prev.get(field, ""))
+                    for field in CARRY_OVER_SPECIMEN_FIELDS
+                    if str(prev.get(field, "")).strip()
+                }
             voucher = self.store.create_specimen()
+            if carry:
+                self.store.set_fields("specimen", voucher, carry)
             self.refresh_list()
             self.select_voucher(voucher)
         except Exception as exc:
@@ -1741,6 +1860,10 @@ class SpecimenWindow(QMainWindow):
             menu.addAction(
                 f"批量导出选中 ({len(selected_vouchers)}个)",
                 lambda: self._context_batch_export(selected_vouchers),
+            )
+            menu.addAction(
+                f"批量设置标本信息 ({len(selected_vouchers)}个)",
+                lambda: self._batch_set_specimen_fields(selected_vouchers),
             )
             menu.addSeparator()
         menu.addAction("清除照片关联", lambda: self._context_clear_photos(voucher_text))
@@ -2925,6 +3048,38 @@ class SpecimenWindow(QMainWindow):
         """右键菜单入口：将选中的入库编号带入批量导出对话框。"""
         self.open_batch_export(preselected=vouchers)
 
+    def _batch_set_specimen_fields(self, vouchers: list[str]) -> None:
+        """右键菜单入口：对多选的入库编号批量设置标本信息字段。"""
+        if not vouchers:
+            return
+        dlg = BatchSpecimenFieldsDialog(self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        updates = dlg.selected_updates()
+        if not updates:
+            QMessageBox.information(self, "批量设置", "未勾选任何要修改的字段。")
+            return
+        fields_label = "、".join(updates.keys())
+        if QMessageBox.question(
+            self, "确认批量设置",
+            f"将对 {len(vouchers)} 个入库编号写入字段：{fields_label}\n确定吗？",
+            QMessageBox.Yes | QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        # 复用 store.set_fields：每个编号写一条操作记录，可逐条撤回（与批量删除一致）。
+        try:
+            changed = 0
+            for voucher in vouchers:
+                if self.store.set_fields("specimen", voucher, updates):
+                    changed += 1
+        except Exception as exc:
+            QMessageBox.critical(self, "批量设置失败", str(exc))
+            return
+        self.refresh_list()
+        if self.current_voucher in vouchers:
+            self.select_voucher(self.current_voucher)
+        self.statusBar().showMessage(f"已批量设置 {changed} 个入库编号的标本信息", 5000)
+
     def import_data_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "导入数据", "", "Excel 文件 (*.xlsx)")
         if not path:
@@ -3049,12 +3204,48 @@ class SpecimenWindow(QMainWindow):
 
     def _on_index_ready(self, index: ImageSearchIndex | None) -> None:
         self.search_index = index
+        _startup_mark("image search index ready")
 
     # ---- Version manager ----
 
     def open_version_manager(self) -> None:
         dlg = VersionManagerDialog(self)
         dlg.exec_()
+
+    # ---- Startup update check ----
+
+    def _maybe_check_updates_on_startup(self) -> None:
+        """启动后静默检查 GitHub 更新（需在设置中开启，且距上次检查超过 1 天）。"""
+        if self._is_closing:
+            return
+        settings = load_settings()
+        if not settings.check_updates_on_startup:
+            return
+        last = settings.last_update_check
+        if last:
+            try:
+                from datetime import datetime
+                if (datetime.now() - datetime.fromisoformat(last)).total_seconds() < 86400:
+                    return
+            except ValueError:
+                pass  # 时间戳损坏则照常检查
+        worker = UpdateCheckWorker(self)
+        worker.finished_check.connect(self._on_startup_update_checked)
+        worker.finished.connect(lambda: setattr(self, "_startup_update_worker", None))
+        self._startup_update_worker = worker  # 持引用，防止 QThread 被 GC
+        worker.start()
+
+    def _on_startup_update_checked(self, release, error) -> None:
+        from datetime import datetime
+        settings = load_settings()
+        settings.last_update_check = datetime.now().isoformat(timespec="seconds")
+        save_settings(settings)
+        if error is not None or release is None:
+            return  # 启动检查失败保持静默，不打扰用户
+        if is_newer(release.version):
+            self.statusBar().showMessage(
+                f'发现新版本 v{release.version}，可在"版本管理"中下载更新', 10000
+            )
 
     # ---- Settings ----
 
@@ -3070,6 +3261,7 @@ class SpecimenWindow(QMainWindow):
             current_settings.photo_management_mode = mode_key if mode_key in PHOTO_MANAGEMENT_OPTIONS else "copy_with_absolute"
             current_settings.photo_library_path = dlg.photo_library_edit.text().strip()
             current_settings.photo_filename_fill_shortcut = dlg.photo_filename_fill_shortcut
+            current_settings.check_updates_on_startup = dlg.check_updates_box.isChecked()
             save_settings(current_settings)
             self._cached_preview_quality = current_settings.preview_quality
             self._apply_photo_filename_fill_shortcut()
@@ -3153,15 +3345,21 @@ class IndexBuildWorker(QThread):
 
     def run(self) -> None:
         try:
-            roots = [Path(self.workspace_root).resolve() / "照片"]
-            if not roots[0].is_dir():
+            photo_dir = Path(self.workspace_root).resolve() / "照片"
+            if photo_dir.is_dir():
+                roots = [photo_dir]
+                scan_depth = 0  # 专用照片目录，深度不限
+            else:
+                # 原代码：照片目录不存在时 fallback 扫整个工作区且 max_depth=0（无限深度）。
+                # 若工作区本身是个巨大目录，会遍历海量文件、拖垮整机。fallback 改为有界深度。
                 roots = [Path(self.workspace_root).resolve()]
+                scan_depth = 4
             if self.isInterruptionRequested():
                 self.index_ready.emit(None)
                 return
             index = _get_or_build_search_index(
                 roots,
-                max_depth=0,
+                max_depth=scan_depth,
                 should_stop=self.isInterruptionRequested,
                 force_rebuild=self.force_rebuild,
                 cache_root=self.workspace_root,
@@ -3505,8 +3703,13 @@ class ImageSearchDialog(QDialog):
         title = result.file_name
         if result.linked_vouchers:
             title += f"  已关联: {', '.join(result.linked_vouchers)}"
+        # 原代码只显示 _shorten(title,36)，长文件名被截断看不全。
+        # 改为：仍截断显示以保持卡片整齐，但加 tooltip 显示完整文件名，并允许选中复制。
         title_label = QLabel(_shorten(title, 36))
         title_label.setStyleSheet("font-weight: bold;")
+        title_label.setToolTip(result.file_name)
+        title_label.setWordWrap(True)
+        title_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         card_layout.addWidget(title_label)
         # 可点击的入库编号链接（任何关联都显示，不限当前标本）
         if result.linked_vouchers:
@@ -3524,6 +3727,8 @@ class ImageSearchDialog(QDialog):
             card_layout.addWidget(voucher_widget)
         path_label = QLabel(_shorten(result.relative_path, 32))
         path_label.setStyleSheet("color: #59666b;")
+        # tooltip 显示完整相对路径 + 绝对路径，避免截断后看不全。
+        path_label.setToolTip(f"相对路径：{result.relative_path}\n绝对路径：{result.path}")
         card_layout.addWidget(path_label)
         match_text = "核心编号：" + "、".join(result.matched_keywords[:3]) if result.matched_keywords else "核心编号：无"
         match_label = QLabel(match_text)
@@ -3583,8 +3788,35 @@ class ImageSearchDialog(QDialog):
         menu = QMenu(self)
         menu.addAction("添加选中图片", self.add_selected)
         menu.addAction("打开原图", lambda: self._open_preview(index))
+        menu.addAction("查看详情", lambda: self._show_image_detail(index))
+        menu.addSeparator()
+        menu.addAction("复制文件名", lambda: self._copy_file_name(index))
         menu.addAction("复制相对路径", lambda: self._copy_relative_path(index))
         menu.exec_(QCursor.pos())
+
+    def _copy_file_name(self, index: int) -> None:
+        if 0 <= index < len(self.results):
+            QApplication.clipboard().setText(self.results[index].file_name)
+
+    def _show_image_detail(self, index: int) -> None:
+        """弹窗显示图片完整信息，解决卡片上文件名/路径截断看不全的问题。"""
+        if not (0 <= index < len(self.results)):
+            return
+        result = self.results[index]
+        linked = "、".join(result.linked_vouchers) if result.linked_vouchers else "无"
+        keywords = "、".join(result.matched_keywords) if result.matched_keywords else "无"
+        detail = (
+            f"文件名：{result.file_name}\n\n"
+            f"相对路径：{result.relative_path}\n\n"
+            f"绝对路径：{result.path}\n\n"
+            f"已关联入库编号：{linked}\n\n"
+            f"匹配核心编号：{keywords}"
+        )
+        box = QMessageBox(self)
+        box.setWindowTitle("图片详情")
+        box.setText(detail)
+        box.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        box.exec_()
 
     def _open_preview(self, index: int) -> None:
         if 0 <= index < len(self.results):
@@ -3729,17 +3961,17 @@ class IngestSummaryDialog(QDialog):
         self._total_photos = 0
         self._build_photo_counts()
 
-        # 构建管内编号和照片文件名映射（用于多字段搜索）
-        self._tube_numbers: dict[str, str] = {}
-        self._photo_filenames: dict[str, list[str]] = {}
-        for v in self.all_vouchers:
-            specimen = self.store.get_specimen(v)
-            if specimen:
-                tube = str(specimen.get("管内编号*", "") or "").strip()
-                if tube:
-                    self._tube_numbers[v] = tube
-            photos = self.store.get_photos(v)
-            self._photo_filenames[v] = [str(p.get("文件名", "")) for p in photos if p.get("文件名")]
+        # 入库汇总宽表：把分散在多个 Excel 的字段 join 成一张表（纯内存视图）。
+        # 原代码逐编号 get_specimen/get_photos 构建搜索映射；现在统一从 summary_records() 取，
+        # 既支撑宽表展示/编辑/导出，也提供搜索所需的 管内编号 / 照片文件名。
+        self._summary_records: list[dict] = self.store.summary_records()
+        self._record_by_voucher: dict[str, dict] = {
+            r["入库编号*"]: r for r in self._summary_records
+        }
+        # 按列筛选条件：column -> 允许的显示值集合；与顶部全局搜索叠加。
+        self._summary_filters: dict[str, set[str]] = {}
+        self._search_text = ""
+        self._loading = False  # 抑制 itemChanged 在程序填表时误触发回写
 
         self.filtered_vouchers: list[str] = list(self.all_vouchers)
         self.current_page = 0
@@ -3802,20 +4034,50 @@ class IngestSummaryDialog(QDialog):
         self._make_btn("下一页", self._next_page, nav)
         layout.addLayout(nav)
 
-        # Main splitter: voucher table | photo grid
+        # Main splitter: voucher wide table | (detail panel + photo grid)
         splitter = QSplitter(Qt.Horizontal)
 
-        # Left: voucher table
-        self.voucher_table = QTableWidget(0, 3)
-        self.voucher_table.setHorizontalHeaderLabels(["入库编号", "照片数", "管内编号"])
+        # Left: voucher wide table（汇总宽表）
+        # 原代码是固定 3 列、不可编辑的列表；现在改为 SUMMARY_COLUMNS 全字段宽表，
+        # 列可显隐、可排序、可按列筛选，可编辑列直接改单元格回写（密码门控）。
+        self.voucher_table = QTableWidget(0, len(SUMMARY_COLUMNS))
+        self.voucher_table.setHorizontalHeaderLabels(SUMMARY_COLUMNS)
         self.voucher_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.voucher_table.setSelectionMode(QTableWidget.SingleSelection)
-        self.voucher_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.voucher_table.horizontalHeader().setStretchLastSection(True)
+        # 可编辑性由各单元格 flags 控制（只读列不带 ItemIsEditable）。
+        self.voucher_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
+        self.voucher_table.setSortingEnabled(True)
         self.voucher_table.itemSelectionChanged.connect(self._on_voucher_selected)
+        self.voucher_table.itemChanged.connect(self._on_cell_changed)
+        _header = self.voucher_table.horizontalHeader()
+        _header.setContextMenuPolicy(Qt.CustomContextMenu)
+        _header.customContextMenuRequested.connect(self._header_context_menu)
+        self._apply_visible_columns()
         splitter.addWidget(self.voucher_table)
 
-        # Right: photo grid
+        # Right: 上=详情面板，下=照片网格（竖向 splitter）
+        right_splitter = QSplitter(Qt.Vertical)
+
+        # 详情面板：只读展示选中入库编号的全部汇总字段
+        self.detail_scroll = QScrollArea()
+        self.detail_scroll.setWidgetResizable(True)
+        _detail_container = QWidget()
+        self.detail_form = QFormLayout(_detail_container)
+        self._detail_labels: dict[str, QLabel] = {}
+        for _col in SUMMARY_COLUMNS:
+            _lbl = QLabel("")
+            _lbl.setWordWrap(True)
+            _lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            self._detail_labels[_col] = _lbl
+            self.detail_form.addRow(f"{_col}：", _lbl)
+        self._detail_photos_label = QLabel("")
+        self._detail_photos_label.setWordWrap(True)
+        self._detail_photos_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.detail_form.addRow("照片文件名：", self._detail_photos_label)
+        self.detail_scroll.setWidget(_detail_container)
+        right_splitter.addWidget(self.detail_scroll)
+
+        # Right-bottom: photo grid
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -3855,14 +4117,21 @@ class IngestSummaryDialog(QDialog):
         self.overview_scroll.dragMoveEvent = self._overview_drag_move
         self.overview_scroll.dragLeaveEvent = self._overview_drag_leave
         self.overview_scroll.dropEvent = self._overview_drop
-        splitter.addWidget(right)
+        right_splitter.addWidget(right)
+        right_splitter.setSizes([240, 420])
+        splitter.addWidget(right_splitter)
 
-        splitter.setSizes([400, 600])
+        splitter.setSizes([520, 540])
         layout.addWidget(splitter, stretch=1)
 
-        # Bottom
+        # Bottom：状态提示 + 导出 + 关闭
+        # 原代码只有"关闭"按钮，且照片操作里引用了未创建的 self.status_label（隐性 bug）；
+        # 这里补上 status_label，并新增导出 Excel / CSV。
         bottom = QHBoxLayout()
-        bottom.addStretch()
+        self.status_label = QLabel("")
+        bottom.addWidget(self.status_label, stretch=1)
+        self._make_btn("导出 Excel", self._export_excel, bottom)
+        self._make_btn("导出 CSV", self._export_csv, bottom)
         self._make_btn("关闭", self.close, bottom)
         layout.addLayout(bottom)
 
@@ -3882,24 +4151,47 @@ class IngestSummaryDialog(QDialog):
             f"入库编号：{len(self.all_vouchers)} 个  |  已入库照片：{self._total_photos} 张"
         )
 
+    def _make_cell(self, col: str, record: dict) -> QTableWidgetItem:
+        """构造一个汇总宽表单元格；只读列去掉 ItemIsEditable，照片数列用数值排序。"""
+        category, _ = SUMMARY_COLUMN_SOURCE[col]
+        value = record.get(col, "")
+        item = QTableWidgetItem()
+        if col == PHOTO_COUNT_COLUMN:
+            try:
+                item.setData(Qt.DisplayRole, int(value or 0))  # int -> 数值排序
+            except (TypeError, ValueError):
+                item.setText(str(value))
+        else:
+            item.setText(str(value))
+        if category == "readonly":
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        else:
+            item.setFlags(item.flags() | Qt.ItemIsEditable)
+        return item
+
     def _load_page(self, page: int) -> None:
         self.current_page = max(0, min(page, self.total_pages - 1))
         start = self.current_page * self.PAGE_SIZE
         end = start + self.PAGE_SIZE
         page_vouchers = self.filtered_vouchers[start:end]
 
+        # 填表期间关排序 + 置 _loading，避免 itemChanged / 排序错乱。
+        self._loading = True
+        self.voucher_table.setSortingEnabled(False)
         self.voucher_table.setRowCount(0)
         self.voucher_table.setRowCount(len(page_vouchers))
         for i, voucher in enumerate(page_vouchers):
-            self.voucher_table.setItem(i, 0, QTableWidgetItem(voucher))
-            count = self._photo_counts.get(voucher, 0)
-            self.voucher_table.setItem(i, 1, QTableWidgetItem(str(count)))
-            specimen = self.store.get_specimen(voucher) or {}
-            tube = str(specimen.get("管内编号*", "") or "")
-            self.voucher_table.setItem(i, 2, QTableWidgetItem(tube))
+            record = self._record_by_voucher.get(voucher, {})
+            for col_idx, col in enumerate(SUMMARY_COLUMNS):
+                self.voucher_table.setItem(i, col_idx, self._make_cell(col, record))
+        self.voucher_table.setSortingEnabled(True)
+        self._loading = False
 
         self.voucher_table.resizeColumnsToContents()
-        self.page_label.setText(f"第 {self.current_page + 1} / {self.total_pages} 页")
+        self.page_label.setText(
+            f"第 {self.current_page + 1} / {self.total_pages} 页"
+            f"（筛选 {len(self.filtered_vouchers)} 条）"
+        )
 
     def _prev_page(self) -> None:
         if self.current_page > 0:
@@ -3910,34 +4202,53 @@ class IngestSummaryDialog(QDialog):
             self._load_page(self.current_page + 1)
 
     def _on_search_changed(self, text: str) -> None:
-        """搜索过滤：根据下拉选择范围搜索入库编号/管内编号/照片名。
+        """顶部全局搜索：仅记录文本，过滤逻辑统一走 _apply_filters（与按列筛选叠加）。"""
+        self._search_text = text
+        self._apply_filters()
 
-        原代码仅支持入库编号前缀匹配（startswith）。
-        改为子字符串匹配 + 多字段搜索，与主凭证列表行为一致。
+    def _apply_filters(self) -> None:
+        """全局搜索 + 按列筛选叠加，重算 filtered_vouchers 并回到第一页。
+
+        原代码 _on_search_changed 直接算 filtered_vouchers；现在搜索与表头列筛选两套条件
+        统一在此合成，数据源改为 self._summary_records（已 join 的汇总记录）。
         """
-        query = text.strip().lower()
-        if query:
-            scope = self._search_scope.currentText()
-            if scope == "入库编号":
-                self.filtered_vouchers = [v for v in self.all_vouchers if query in v.lower()]
-            elif scope == "管内编号":
-                self.filtered_vouchers = [v for v in self.all_vouchers if query in self._tube_numbers.get(v, "").lower()]
-            elif scope == "照片名":
-                self.filtered_vouchers = [
-                    v for v in self.all_vouchers
-                    if any(query in fn.lower() for fn in self._photo_filenames.get(v, []))
-                ]
-            else:  # 全部
-                self.filtered_vouchers = [
-                    v for v in self.all_vouchers
-                    if query in v.lower()
-                    or query in self._tube_numbers.get(v, "").lower()
-                    or any(query in fn.lower() for fn in self._photo_filenames.get(v, []))
-                ]
-        else:
-            self.filtered_vouchers = list(self.all_vouchers)
+        query = self._search_text.strip().lower()
+        scope = self._search_scope.currentText()
+        result: list[str] = []
+        for record in self._summary_records:
+            voucher = record["入库编号*"]
+            if query:
+                tube = record.get("管内编号*", "").lower()
+                names = [str(n).lower() for n in record.get("照片文件名", [])]
+                if scope == "入库编号":
+                    ok = query in voucher.lower()
+                elif scope == "管内编号":
+                    ok = query in tube
+                elif scope == "照片名":
+                    ok = any(query in n for n in names)
+                else:  # 全部
+                    ok = (
+                        query in voucher.lower()
+                        or query in tube
+                        or any(query in n for n in names)
+                    )
+                if not ok:
+                    continue
+            # 按列筛选：每个被筛选列的显示值必须落在允许集合内
+            if not all(
+                str(record.get(col, "")) in allowed
+                for col, allowed in self._summary_filters.items()
+            ):
+                continue
+            result.append(voucher)
+        self.filtered_vouchers = result
         self.selected_voucher = None
         self._load_page(0)
+
+    def _reload_summary(self) -> None:
+        """数据被修改（编辑单元格 / 照片增删移）后重建汇总记录缓存。"""
+        self._summary_records = self.store.summary_records()
+        self._record_by_voucher = {r["入库编号*"]: r for r in self._summary_records}
 
     # ---- Voucher selection & photo grid ----
 
@@ -3945,10 +4256,255 @@ class IngestSummaryDialog(QDialog):
         rows = self.voucher_table.selectionModel().selectedRows()
         if not rows:
             return
-        voucher = self.voucher_table.item(rows[0].row(), 0).text()
+        # 入库编号* 始终是第 0 列；排序后用可视行号取 item 仍正确。
+        voucher_item = self.voucher_table.item(rows[0].row(), 0)
+        if voucher_item is None:
+            return
+        voucher = voucher_item.text()
         self.selected_voucher = voucher
+        self._populate_detail(voucher)
         self._selected_photos = self.store.get_photos(voucher)
         self._render_photo_grid()
+
+    def _populate_detail(self, voucher: str) -> None:
+        """右侧详情面板：只读展示选中入库编号的全部汇总字段 + 照片文件名。"""
+        record = self._record_by_voucher.get(voucher, {})
+        for col, label in self._detail_labels.items():
+            label.setText(str(record.get(col, "")))
+        names = [str(n) for n in record.get("照片文件名", [])]
+        self._detail_photos_label.setText("\n".join(names) if names else "（无）")
+
+    # ---- Cell editing ----
+
+    def _on_cell_changed(self, item: QTableWidgetItem) -> None:
+        """可编辑单元格回写：密码门控 -> store.set_fields（可撤销）-> 刷新行/详情。"""
+        if self._loading:
+            return
+        col = SUMMARY_COLUMNS[item.column()]
+        category, excel_field = SUMMARY_COLUMN_SOURCE[col]
+        if category == "readonly":
+            return
+        voucher_item = self.voucher_table.item(item.row(), 0)
+        if voucher_item is None:
+            return
+        voucher = voucher_item.text()
+        new_value = item.text()
+        old_value = str(self._record_by_voucher.get(voucher, {}).get(col, ""))
+        if new_value == old_value:
+            return
+        if not self._require_password():
+            self._loading = True
+            item.setText(old_value)
+            self._loading = False
+            return
+        try:
+            # classification 的"分类备注"映射回真实列名"备注"已在 SUMMARY_COLUMN_SOURCE 里完成。
+            self.store.set_fields(category, voucher, {excel_field: new_value})
+        except Exception as exc:
+            QMessageBox.critical(self, "保存失败", str(exc))
+            self._loading = True
+            item.setText(old_value)
+            self._loading = False
+            return
+        # 管内编号改动会联动 采集日期/保存方式/采集地点 —— 重建记录后整行刷新。
+        self._reload_summary()
+        self._loading = True
+        self._update_row_cells(item.row(), voucher)
+        self._loading = False
+        if self.selected_voucher == voucher:
+            self._populate_detail(voucher)
+        self.status_label.setText(f"已保存：{voucher} · {col} = {new_value}")
+        self.app.refresh_list()
+        self.app._update_dashboard()
+
+    def _update_row_cells(self, row: int, voucher: str) -> None:
+        """用最新汇总记录刷新某一行所有单元格（调用方需自行包 _loading 防递归）。"""
+        record = self._record_by_voucher.get(voucher, {})
+        for col_idx, col in enumerate(SUMMARY_COLUMNS):
+            item = self.voucher_table.item(row, col_idx)
+            if item is None:
+                continue
+            value = record.get(col, "")
+            if col == PHOTO_COUNT_COLUMN:
+                try:
+                    item.setData(Qt.DisplayRole, int(value or 0))
+                except (TypeError, ValueError):
+                    item.setText(str(value))
+            else:
+                item.setText(str(value))
+
+    # ---- Column show/hide & per-column filter ----
+
+    def _apply_visible_columns(self) -> None:
+        """按设置应用列显隐；入库编号* 始终可见（选择/编辑定位依赖第 0 列）。"""
+        visible = load_settings().summary_visible_columns or SUMMARY_DEFAULT_VISIBLE_COLUMNS
+        visible_set = set(visible)
+        for idx, col in enumerate(SUMMARY_COLUMNS):
+            hidden = col != "入库编号*" and col not in visible_set
+            self.voucher_table.setColumnHidden(idx, hidden)
+
+    def _save_visible_columns(self) -> None:
+        visible = [
+            col
+            for idx, col in enumerate(SUMMARY_COLUMNS)
+            if not self.voucher_table.isColumnHidden(idx)
+        ]
+        settings = load_settings()
+        settings.summary_visible_columns = visible
+        save_settings(settings)
+
+    def _toggle_column(self, col_idx: int, visible: bool) -> None:
+        if not visible and col_idx == 0:
+            return  # 入库编号* 不允许隐藏
+        self.voucher_table.setColumnHidden(col_idx, not visible)
+        self._save_visible_columns()
+
+    def _header_context_menu(self, pos: QPoint) -> None:
+        header = self.voucher_table.horizontalHeader()
+        col_idx = header.logicalIndexAt(pos)
+        menu = QMenu(self)
+        if col_idx >= 0:
+            col = SUMMARY_COLUMNS[col_idx]
+            menu.addAction(f"按「{col}」筛选…", lambda: self._open_column_filter(col))
+            if col in self._summary_filters:
+                menu.addAction(f"清除「{col}」筛选", lambda: self._clear_column_filter(col))
+        if self._summary_filters:
+            menu.addAction("清除所有筛选", self._clear_all_filters)
+        menu.addSeparator()
+        columns_menu = menu.addMenu("显示列")
+        for idx, col in enumerate(SUMMARY_COLUMNS):
+            act = columns_menu.addAction(col)
+            act.setCheckable(True)
+            act.setChecked(not self.voucher_table.isColumnHidden(idx))
+            act.setEnabled(idx != 0)  # 入库编号* 锁定可见
+            act.toggled.connect(lambda checked, i=idx: self._toggle_column(i, checked))
+        menu.exec_(header.mapToGlobal(pos))
+
+    def _clear_column_filter(self, col: str) -> None:
+        self._summary_filters.pop(col, None)
+        self._apply_filters()
+
+    def _clear_all_filters(self) -> None:
+        self._summary_filters.clear()
+        self._apply_filters()
+
+    def _open_column_filter(self, col: str) -> None:
+        """弹出该列去重值多选 + 文本包含框；全选 = 无筛选。"""
+        values = sorted({str(r.get(col, "")) for r in self._summary_records})
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"筛选「{col}」")
+        dlg.resize(320, 440)
+        v = QVBoxLayout(dlg)
+        contains = QLineEdit()
+        contains.setPlaceholderText("输入文本快速过滤候选值…")
+        v.addWidget(contains)
+        listw = QListWidget()
+        listw.setSelectionMode(QListWidget.NoSelection)
+        current = self._summary_filters.get(col)
+        for val in values:
+            it = QListWidgetItem(val if val != "" else "（空）")
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Checked if (current is None or val in current) else Qt.Unchecked)
+            it.setData(Qt.UserRole, val)
+            listw.addItem(it)
+
+        def _on_contains(text: str) -> None:
+            t = text.strip().lower()
+            for i in range(listw.count()):
+                it = listw.item(i)
+                it.setHidden(bool(t) and t not in str(it.data(Qt.UserRole)).lower())
+
+        contains.textChanged.connect(_on_contains)
+        v.addWidget(listw, stretch=1)
+
+        def _set_all(state) -> None:
+            for i in range(listw.count()):
+                if not listw.item(i).isHidden():
+                    listw.item(i).setCheckState(state)
+
+        btn_row = QHBoxLayout()
+        self._make_btn("全选", lambda: _set_all(Qt.Checked), btn_row)
+        self._make_btn("全不选", lambda: _set_all(Qt.Unchecked), btn_row)
+        btn_row.addStretch()
+        v.addLayout(btn_row)
+        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        box.accepted.connect(dlg.accept)
+        box.rejected.connect(dlg.reject)
+        v.addWidget(box)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        checked = {
+            str(listw.item(i).data(Qt.UserRole))
+            for i in range(listw.count())
+            if listw.item(i).checkState() == Qt.Checked
+        }
+        if len(checked) == len(values):
+            self._summary_filters.pop(col, None)  # 全选 = 无筛选
+        else:
+            self._summary_filters[col] = checked
+        self._apply_filters()
+
+    # ---- Export ----
+
+    def _collect_export_data(self) -> tuple[list[str], list[dict]]:
+        """导出范围 = 当前筛选结果（全部页）；列 = 当前可见列。"""
+        columns = [
+            col
+            for idx, col in enumerate(SUMMARY_COLUMNS)
+            if not self.voucher_table.isColumnHidden(idx)
+        ]
+        rows: list[dict] = []
+        for voucher in self.filtered_vouchers:
+            record = self._record_by_voucher.get(voucher, {})
+            rows.append({col: str(record.get(col, "")) for col in columns})
+        return columns, rows
+
+    def _export_excel(self) -> None:
+        columns, rows = self._collect_export_data()
+        if not rows:
+            QMessageBox.information(self, "无数据", "当前没有可导出的记录。")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "导出 Excel", "入库汇总.xlsx", "Excel 文件 (*.xlsx)")
+        if not path:
+            return
+        try:
+            from openpyxl import Workbook
+            from .batch_export import _auto_width, _write_header_row
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "入库汇总"
+            _write_header_row(ws, columns)
+            for r, row in enumerate(rows, 2):
+                for c, col in enumerate(columns, 1):
+                    ws.cell(row=r, column=c, value=row.get(col, ""))
+            _auto_width(ws)
+            wb.save(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
+            return
+        self.status_label.setText(f"已导出 {len(rows)} 条到 {path}")
+
+    def _export_csv(self) -> None:
+        columns, rows = self._collect_export_data()
+        if not rows:
+            QMessageBox.information(self, "无数据", "当前没有可导出的记录。")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "导出 CSV", "入库汇总.csv", "CSV 文件 (*.csv)")
+        if not path:
+            return
+        try:
+            import csv
+
+            # utf-8-sig：带 BOM，Excel 打开中文不乱码。
+            with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=columns)
+                writer.writeheader()
+                writer.writerows(rows)
+        except Exception as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
+            return
+        self.status_label.setText(f"已导出 {len(rows)} 条到 {path}")
 
     def _set_thumb_size(self, key: str) -> None:
         self._thumb_size_key = key
@@ -3994,6 +4550,7 @@ class IngestSummaryDialog(QDialog):
             name_label.setWordWrap(True)
             name_label.setMaximumHeight(36 if tw > 160 else 28)
             name_label.setStyleSheet("font-size: 10px; color: #3f4b57; padding: 2px 0;")
+            name_label.setToolTip(name)  # 文件名过长时悬停看完整名
             cl.addWidget(name_label)
 
             path = self.store.resolve_photo_path(photo)
@@ -4082,6 +4639,7 @@ class IngestSummaryDialog(QDialog):
         self._total_photos = sum(self._photo_counts.values())
         self._update_stats()
         self._render_photo_grid()
+        self._reload_summary()  # 照片增删移后重建汇总记录，保持"照片数"列同步
         self._load_page(self.current_page)
         self.app._update_dashboard()
         self.app.refresh_list()
@@ -4152,6 +4710,7 @@ class IngestSummaryDialog(QDialog):
         self._total_photos = sum(self._photo_counts.values())
         self._update_stats()
         self._render_photo_grid()
+        self._reload_summary()  # 照片增删移后重建汇总记录，保持"照片数"列同步
         self._load_page(self.current_page)
         self.app._update_dashboard()
         self.app.refresh_list()
@@ -4205,6 +4764,7 @@ class IngestSummaryDialog(QDialog):
         self._total_photos = sum(self._photo_counts.values())
         self._update_stats()
         self._render_photo_grid()
+        self._reload_summary()  # 照片增删移后重建汇总记录，保持"照片数"列同步
         self._load_page(self.current_page)
         self.app._update_dashboard()
         self.app.refresh_list()
@@ -4283,6 +4843,7 @@ class IngestSummaryDialog(QDialog):
         self._total_photos = sum(self._photo_counts.values())
         self._update_stats()
         self._render_photo_grid()
+        self._reload_summary()  # 照片增删移后重建汇总记录，保持"照片数"列同步
         self._load_page(self.current_page)
         self.app._update_dashboard()
         self.app.refresh_list()
@@ -4383,11 +4944,18 @@ class VersionManagerDialog(QDialog):
         self.release_table.setEditTriggers(QTableWidget.NoEditTriggers)
         release_layout.addWidget(self.release_table, stretch=1)
         rel_btn_row = QHBoxLayout()
+        rel_btn_row.addWidget(QPushButton("检查 GitHub 更新", clicked=self._check_github_update))
         rel_btn_row.addWidget(QPushButton("打开版本目录", clicked=self._open_release_dir))
         rel_btn_row.addWidget(QPushButton("启动选中版本", clicked=self._launch_release))
         release_layout.addLayout(rel_btn_row)
+        self._update_status_label = QLabel("")
+        release_layout.addWidget(self._update_status_label)
         tabs.addTab(release_tab, "软件版本")
         self._populate_releases()
+
+        # 后台 worker 引用，防止 QThread 被 GC
+        self._update_worker: UpdateCheckWorker | None = None
+        self._download_worker: UpdateDownloadWorker | None = None
 
         layout.addWidget(tabs, stretch=1)
         layout.addWidget(QPushButton("关闭", clicked=self.close), alignment=Qt.AlignRight)
@@ -4482,12 +5050,91 @@ class VersionManagerDialog(QDialog):
         if not any(str(exe.resolve()).startswith(str(r)) for r in trusted_roots):
             QMessageBox.critical(self, "安全限制", "可执行文件不在受信任的版本目录内。")
             return
+        # 切换版本前提示创建数据快照：新版本若与旧数据不兼容，数据层仍可回退。
+        if QMessageBox.question(
+            self, "数据快照",
+            '启动该版本前是否先创建当前数据快照？\n（新版本出现问题时可在"工作区数据版本"中回退数据）',
+            QMessageBox.Yes | QMessageBox.No,
+        ) == QMessageBox.Yes:
+            try:
+                self.app.store.create_data_snapshot("切换版本前快照", f"启动 {exe.name} 前自动创建")
+            except Exception as exc:
+                QMessageBox.warning(self, "快照失败", f"快照创建失败，仍可继续启动：\n{exc}")
         try:
             if sys.platform != "win32":
                 exe.chmod(exe.stat().st_mode | 0o111)
             subprocess.Popen([str(exe), "--workspace", str(self.app.workspace_root)])
         except Exception as exc:
             QMessageBox.critical(self, "启动失败", str(exc))
+
+    # ---- GitHub update check / download ----
+
+    def _check_github_update(self) -> None:
+        if self._update_worker is not None or self._download_worker is not None:
+            return  # 已有任务在跑
+        self._update_status_label.setText("正在检查 GitHub 更新...")
+        worker = UpdateCheckWorker(self)
+        worker.finished_check.connect(self._on_update_checked)
+        worker.finished.connect(lambda: setattr(self, "_update_worker", None))
+        self._update_worker = worker
+        worker.start()
+
+    def _on_update_checked(self, release, error) -> None:
+        self._update_status_label.setText("")
+        if error is not None:
+            QMessageBox.critical(self, "检查更新失败", str(error))
+            return
+        if release is None:
+            QMessageBox.information(self, "检查更新", "未在 GitHub 上获取到发布信息。")
+            return
+        if not is_newer(release.version):
+            QMessageBox.information(self, "检查更新", f"当前已是最新版本（v{__version__}）。")
+            return
+        notes = (release.notes or "").strip()
+        if len(notes) > 600:
+            notes = notes[:600] + "…"
+        msg = (
+            f"发现新版本 v{release.version}（当前 v{__version__}）。\n\n"
+            "是否下载？下载后请在列表中选择该版本启动，旧版本会保留以便回退。"
+        )
+        if notes:
+            msg += f"\n\n更新说明：\n{notes}"
+        if QMessageBox.question(
+            self, "发现新版本", msg, QMessageBox.Yes | QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        self._start_update_download(release)
+
+    def _start_update_download(self, release) -> None:
+        dest_root = default_download_root(self.app.workspace_root)
+        # local_roots：增量更新扫描这些 releases 根目录，找运行时可复用的本地版本。
+        local_roots = release_roots(self.app.workspace_root)
+        self._update_status_label.setText(f"正在下载 v{release.version} … 0%")
+        worker = UpdateDownloadWorker(release, dest_root, local_roots, self)
+        worker.progress.connect(
+            lambda pct: self._update_status_label.setText(f"正在下载 v{release.version} … {pct}%")
+        )
+        worker.finished_download.connect(self._on_update_downloaded)
+        worker.finished.connect(lambda: setattr(self, "_download_worker", None))
+        self._download_worker = worker
+        worker.start()
+
+    def _on_update_downloaded(self, path, incremental, error) -> None:
+        self._update_status_label.setText("")
+        if error is not None:
+            QMessageBox.critical(self, "下载失败", str(error))
+            return
+        self._populate_releases()
+        mode_note = (
+            "本次为增量更新（仅下载应用包，运行时已复用本地版本）。\n\n"
+            if incremental else ""
+        )
+        QMessageBox.information(
+            self, "下载完成",
+            f"{mode_note}新版本已下载到：\n{path}\n\n"
+            '请在上方列表中选择该版本并点击"启动选中版本"。\n'
+            "启动前会提示创建数据快照，建议保留。",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4555,6 +5202,64 @@ class PhotoFilenameFillDialog(QDialog):
         }
 
 
+class BatchSpecimenFieldsDialog(QDialog):
+    """多选入库编号后，批量设置标本信息字段（CARRY_OVER_SPECIMEN_FIELDS）。
+
+    每行一个勾选框：只有勾选的字段才会写入；勾选但留空表示批量清空该字段。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("批量设置标本信息")
+        self._rows: dict[str, tuple[QCheckBox, QLineEdit | QComboBox]] = {}
+
+        layout = QVBoxLayout(self)
+        note = QLabel("只勾选并填写需要批量修改的字段；未勾选的字段保持不变。\n勾选但留空表示批量清空该字段。")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        grid = QGridLayout()
+        for column, label in enumerate(("修改", "字段", "值")):
+            header = QLabel(label)
+            header.setStyleSheet("font-weight: bold;")
+            grid.addWidget(header, 0, column)
+
+        for row, field in enumerate(CARRY_OVER_SPECIMEN_FIELDS, start=1):
+            checkbox = QCheckBox()
+            if field == "保存方式":
+                editor: QLineEdit | QComboBox = QComboBox()
+                editor.addItems(SAVE_METHOD_OPTIONS)
+                editor.setEditable(True)
+                editor.setCurrentText("")
+            else:
+                editor = QLineEdit()
+            grid.addWidget(checkbox, row, 0, alignment=Qt.AlignCenter)
+            grid.addWidget(QLabel(field), row, 1)
+            grid.addWidget(editor, row, 2)
+            self._rows[field] = (checkbox, editor)
+        layout.addLayout(grid)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        ok_button = buttons.button(QDialogButtonBox.Ok)
+        if ok_button is not None:
+            ok_button.setText("批量设置")
+        cancel_button = buttons.button(QDialogButtonBox.Cancel)
+        if cancel_button is not None:
+            cancel_button.setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_updates(self) -> dict[str, str]:
+        updates: dict[str, str] = {}
+        for field, (checkbox, editor) in self._rows.items():
+            if not checkbox.isChecked():
+                continue
+            value = editor.currentText() if isinstance(editor, QComboBox) else editor.text()
+            updates[field] = value.strip()
+        return updates
+
+
 class SettingsDialog(QDialog):
     def __init__(self, app: SpecimenWindow):
         super().__init__(app)
@@ -4597,6 +5302,10 @@ class SettingsDialog(QDialog):
         self.photo_fill_shortcut_edit.setPlaceholderText(DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT)
         layout.addRow("照片名填充快捷键", self.photo_fill_shortcut_edit)
 
+        self.check_updates_box = QCheckBox("启动时自动检查 GitHub 更新")
+        self.check_updates_box.setChecked(current_settings.check_updates_on_startup)
+        layout.addRow("软件更新", self.check_updates_box)
+
         btn_row = QHBoxLayout()
         btn_row.addWidget(QPushButton("保存", clicked=self.accept))
         restore_btn = QPushButton("恢复默认设置")
@@ -4616,6 +5325,7 @@ class SettingsDialog(QDialog):
         self.photo_management_combo.setCurrentIndex(management_idx)
         self.photo_library_edit.setText(defaults.photo_library_path)
         self.photo_fill_shortcut_edit.setText(defaults.photo_filename_fill_shortcut)
+        self.check_updates_box.setChecked(defaults.check_updates_on_startup)
         # Apply immediately
         self.app.store.set_undo_depth(200)
         save_settings(defaults)

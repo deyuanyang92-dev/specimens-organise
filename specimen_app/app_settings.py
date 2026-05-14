@@ -43,6 +43,10 @@ class AppSettings:
     photo_filename_fill_shortcut: str = DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT
     window_geometry: str = ""
     splitter_sizes: list = field(default_factory=list)
+    check_updates_on_startup: bool = False  # 启动时是否后台检查 GitHub 更新
+    last_update_check: str = ""  # 上次检查更新的 ISO 时间戳，用于限频
+    carry_over_specimen_fields: bool = True  # 新增标本时是否沿用上一条的标本信息字段
+    summary_visible_columns: list[str] = field(default_factory=list)  # 入库汇总宽表可见列（空=用默认集）
 
 
 def app_config_dir() -> Path:
@@ -79,6 +83,17 @@ def load_settings() -> AppSettings:
     photo_management_mode = str(data.get("photo_management_mode", "copy_with_absolute"))
     if photo_management_mode not in PHOTO_MANAGEMENT_OPTIONS:
         photo_management_mode = "copy_with_absolute"
+    check_updates_on_startup = data.get("check_updates_on_startup", False)
+    if not isinstance(check_updates_on_startup, bool):
+        check_updates_on_startup = False
+    carry_over_specimen_fields = data.get("carry_over_specimen_fields", True)
+    if not isinstance(carry_over_specimen_fields, bool):
+        carry_over_specimen_fields = True
+    raw_summary_columns = data.get("summary_visible_columns", [])
+    if isinstance(raw_summary_columns, list):
+        summary_visible_columns = [str(item) for item in raw_summary_columns if item]
+    else:
+        summary_visible_columns = []
     return AppSettings(
         last_workspace=str(data.get("last_workspace", "")),
         recent_workspaces=[str(item) for item in data.get("recent_workspaces", []) if item],
@@ -90,6 +105,10 @@ def load_settings() -> AppSettings:
         photo_filename_fill_shortcut=photo_filename_fill_shortcut.strip(),
         window_geometry=str(data.get("window_geometry", "")),
         splitter_sizes=splitter_sizes,
+        check_updates_on_startup=check_updates_on_startup,
+        last_update_check=str(data.get("last_update_check", "")),
+        carry_over_specimen_fields=carry_over_specimen_fields,
+        summary_visible_columns=summary_visible_columns,
     )
 
 
@@ -107,6 +126,10 @@ def save_settings(settings: AppSettings) -> None:
         "photo_filename_fill_shortcut": settings.photo_filename_fill_shortcut or DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT,
         "window_geometry": settings.window_geometry,
         "splitter_sizes": settings.splitter_sizes,
+        "check_updates_on_startup": settings.check_updates_on_startup,
+        "last_update_check": settings.last_update_check,
+        "carry_over_specimen_fields": settings.carry_over_specimen_fields,
+        "summary_visible_columns": settings.summary_visible_columns,
     }
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)

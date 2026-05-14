@@ -50,11 +50,14 @@ from .models import (
     INDEX_HEADERS,
     ImportConflictError,
     ImportResult,
+    PHOTO_COUNT_COLUMN,
     PHOTO_FILE,
     PHOTO_HEADERS,
     SPECIMEN_FILE,
     SPECIMEN_HEADERS,
     SPECIMEN_REQUIRED,
+    SUMMARY_COLUMNS,
+    SUMMARY_COLUMN_SOURCE,
     WORKSPACE_CONFIG_FILE,
     WorkspaceLockedError,
     WorkspaceNotInitializedError,
@@ -63,6 +66,7 @@ from .models import (
 )
 from .app_settings import PHOTO_MANAGEMENT_OPTIONS
 from .parsing import derive_specimen_fields_from_tube_number, format_voucher, parse_voucher_serial
+from .startup_diag import mark as _startup_mark
 
 
 DEFAULT_CONFIG = {
@@ -96,13 +100,22 @@ class ExcelStore:
             self.acquire_lock()
             import atexit
             atexit.register(self.release_lock)
+        # 启动诊断埋点：逐子步骤打点，定位"启动死机"卡在哪一步。
         self.ensure_files()
+        _startup_mark("ExcelStore.ensure_files")
         self._upgrade_workspace_schema()
+        _startup_mark("ExcelStore._upgrade_workspace_schema")
         self._assert_supported_data_schema()
         self.ensure_index()
+        _startup_mark("ExcelStore.ensure_index")
         self._sync_next_serial()
+        _startup_mark("ExcelStore._sync_next_serial")
 
     def close(self) -> None:
+        """释放工作区锁文件。退出应用前应调用，避免遗留过期锁。
+
+        `__init__` 已注册 atexit 钩子，但显式调用更可靠。
+        """
         self.release_lock()
 
     def acquire_lock(self) -> None:
@@ -184,11 +197,21 @@ class ExcelStore:
         )
 
     def list_vouchers(self) -> list[str]:
+        """返回工作区内全部入库编号，按编号流水号升序排序。"""
         rows = self.read_rows("specimen")
         vouchers = [self._value(row, "入库编号*") for row in rows if self._value(row, "入库编号*")]
         return sorted(vouchers, key=lambda value: parse_voucher_serial(value) or 0)
 
     def workspace_overview(self) -> dict[str, Any]:
+        """汇总主界面凭证列表所需的概览数据（一次性读三张表，避免逐编号查询）。
+
+        返回 dict，键：
+        - ``vouchers``: list[str]，全部入库编号（按流水号排序）
+        - ``flags``: dict[voucher -> StatusFlags]，标本/照片/分类完整度
+        - ``photo_counts``: dict[voucher -> int]，仅含有照片的编号
+        - ``tube_numbers``: dict[voucher -> str]，仅含有管内编号的编号
+        - ``photo_filenames``: dict[voucher -> list[str]]
+        """
         specimens = self.read_rows("specimen")
         classifications = self.read_rows("classification")
         photos = self.read_rows("photo")
@@ -233,6 +256,51 @@ class ExcelStore:
             "photo_filenames": photo_filenames,
         }
 
+    def summary_records(self) -> list[dict[str, Any]]:
+        """把分散在多个 Excel 的字段汇总成一张宽表（纯内存视图，不改任何文件结构）。
+
+        每条记录是扁平 dict，键为 SUMMARY_COLUMNS：标本全字段 + 分类全字段（分类"备注"
+        用"分类备注"消歧）+ 照片数；另附 "照片文件名"(list) 供详情/搜索使用（不在 SUMMARY_COLUMNS 内）。
+        左连接：缺分类信息的入库编号也会出现，分类列留空。
+        """
+        specimens = self.read_rows("specimen")
+        classifications = self.read_rows("classification")
+        photos = self.read_rows("photo")
+        class_by_voucher = {
+            self._value(row, "入库编号*"): row
+            for row in classifications
+            if self._value(row, "入库编号*")
+        }
+        photo_counts: dict[str, int] = {}
+        photo_filenames: dict[str, list[str]] = {}
+        for row in photos:
+            voucher = self._value(row, "入库编号*")
+            if not voucher:
+                continue
+            photo_counts[voucher] = photo_counts.get(voucher, 0) + 1
+            file_name = self._value(row, "文件名")
+            if file_name:
+                photo_filenames.setdefault(voucher, []).append(file_name)
+        records: list[dict[str, Any]] = []
+        for row in specimens:
+            voucher = self._value(row, "入库编号*")
+            if not voucher:
+                continue
+            class_row = class_by_voucher.get(voucher, {})
+            record: dict[str, Any] = {}
+            for col in SUMMARY_COLUMNS:
+                category, excel_field = SUMMARY_COLUMN_SOURCE[col]
+                if col == PHOTO_COUNT_COLUMN:
+                    record[col] = photo_counts.get(voucher, 0)
+                elif category == "classification":
+                    record[col] = self._value(class_row, excel_field)
+                else:  # specimen 列与主键"入库编号*"都取自标本行
+                    record[col] = self._value(row, excel_field)
+            record["照片文件名"] = photo_filenames.get(voucher, [])
+            records.append(record)
+        records.sort(key=lambda r: parse_voucher_serial(r["入库编号*"]) or 0)
+        return records
+
     def voucher_photo_counts(self) -> dict[str, int]:
         """Return {voucher: photo_count} for all vouchers that have photos."""
         counts: dict[str, int] = {}
@@ -276,12 +344,15 @@ class ExcelStore:
         return result
 
     def get_specimen(self, voucher: str) -> Row | None:
+        """返回该入库编号的标本信息行（dict）；不存在返回 None。"""
         return self._find_one("specimen", voucher)
 
     def get_classification(self, voucher: str) -> Row | None:
+        """返回该入库编号的分类信息行（dict）；不存在返回 None。"""
         return self._find_one("classification", voucher)
 
     def get_photos(self, voucher: str) -> list[Row]:
+        """返回该入库编号关联的全部照片信息行（一对多，可能为空 list）。"""
         return [row for row in self.read_rows("photo") if self._value(row, "入库编号*") == voucher]
 
     def get_all_photo_voucher_map(self) -> dict[str, list[str]]:
@@ -351,6 +422,21 @@ class ExcelStore:
         action_type: str = "update_fields",
         auto_derive_specimen_fields: bool = True,
     ) -> bool:
+        """更新某入库编号在 specimen / classification 表中的若干字段。
+
+        Args:
+            category: ``"specimen"`` 或 ``"classification"``。
+            voucher: 入库编号；该编号在目标表中不存在时会新建一行。
+            updates: ``{字段名: 新值}``；不在该表表头里的键会被忽略。
+            action_type: 写入操作日志的类型标签（用于撤销/重做）。
+            auto_derive_specimen_fields: 为 True 且更新了 ``管内编号*`` 时，
+                自动联动推导 ``采集日期`` / ``采集地点缩写*`` / ``保存方式``。
+
+        Returns:
+            是否有字段真正发生变化（无变化返回 False，不写日志）。
+
+        变更会自动写入修改记录并追加可撤销的操作日志条目。
+        """
         if category not in ("specimen", "classification"):
             raise ValueError(f"Unsupported category: {category}")
         headers = CATEGORY_HEADERS[category]

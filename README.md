@@ -22,6 +22,46 @@ pip install -r requirements.txt
 
 依赖说明：`PyQt5` 为 GUI 框架，`openpyxl` 处理 Excel，`Pillow` 处理缩略图，`tifffile` 支持 TIFF 大图。
 
+## 调用 GLM-5.1
+
+如果你想在终端里直接问 GLM-5.1，可以先设置环境变量：
+
+```bash
+export ZAI_API_KEY='你的API_KEY'
+```
+
+然后在仓库根目录运行：
+
+```bash
+python3 glm51_chat.py "你的问题"
+```
+
+或者用更短的启动脚本：
+
+```bash
+bash glm "你的问题"
+```
+
+默认会启用 `thinking={"type": "enabled"}`。如果想看思考过程，加上 `--show-reasoning`。
+
+如果问题里需要识别本地图片，传入 `--image`。脚本会自动改用视觉模型 `glm-5v-turbo`，并把本地图片转换成模型可读的图片输入；`.tif`、`.jpg`、`.png` 等常见格式都可以：
+
+```bash
+bash glm --image "广西海洋大学图谱项目/日本刺沙蚕/6ce9a6e7815d6c1507876e1d966bb5f.jpg" "请描述这张标本图里的主要信息"
+```
+
+可以传多张图片：
+
+```bash
+bash glm --image "A.tif" --image "B.tif" "比较这两张图的差异"
+```
+
+默认会把图片最长边缩放到 2048 像素，避免大 TIFF 直接提交过慢。如果需要保留更高分辨率，可调整：
+
+```bash
+bash glm --image "A.tif" --image-max-edge 4096 "识别比例尺和可见形态特征"
+```
+
 ## 已实现功能
 
 - 新增标本自动生成 `YZZ000001` 格式入库编号。
@@ -47,6 +87,7 @@ pip install -r requirements.txt
 - 撤回/返回覆盖字段、照片、新建、删除等数据操作，默认保存 200 步，可在设置中调整。
 - 导入旧工作区前预检编号冲突；冲突时阻止导入并生成 `导入冲突报告_*.xlsx`。
 - 版本管理窗口支持创建/回退工作区数据快照，并列出 `releases/` 下的历史软件版本。
+- 版本管理窗口可一键检查 GitHub 是否有新版本，下载并校验后解压到 `releases/`；新旧版本并存、不自动覆盖、不自动启动，由用户手动切换，启动前可创建数据快照回退。设置中可开启“启动时自动检查更新”。详见 `docs/release-and-update.md`。
 
 ## 数据文件
 

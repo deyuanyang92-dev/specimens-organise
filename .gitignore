@@ -24,6 +24,7 @@ System Volume Information/
 # Data (user data, not source code)
 数据/
 数据版本/
+广西海洋大学图谱项目/
 
 # Photos (too large for repo)
 照片/
@@ -33,6 +34,8 @@ System Volume Information/
 中间文件/
 其他/
 .codex/
+.codex
+claude-glm51
 Seagate/
 Autorun.inf
 
