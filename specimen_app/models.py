@@ -102,15 +102,22 @@ CLASSIFICATION_REQUIRED = list(REQUIRED_CLASSIFICATION_COLUMNS)
 SAVE_METHOD_OPTIONS = ["9E", "7E", "79", "RE", "FE"]
 
 # 录入加速：一批标本里往往相同的标本信息字段。用于"沿用上条"和"多选批量设置"。
-CARRY_OVER_SPECIMEN_FIELDS = ("标本存放位置", "信息录入人员", "核对人员", "保存方式")
+# 旧：("标本存放位置", "信息录入人员", "核对人员", "保存方式") —— 按需求补入 "备注"，
+# 录入阶段同批标本备注常相同，沿用/批量设置都带上减少重复输入。
+CARRY_OVER_SPECIMEN_FIELDS = ("标本存放位置", "信息录入人员", "核对人员", "保存方式", "备注")
 
 # 入库汇总视图：把分散在多个 Excel 的字段汇总成一张宽表（纯内存视图，不改任何文件结构）。
 # PHOTO_COUNT_COLUMN 是计算列；SPECIMEN_HEADERS 与 CLASSIFICATION_HEADERS 都含"备注"，
 # 汇总表里 classification 的"备注"用 CLASSIFICATION_NOTE_DISPLAY 消歧（仅显示名，回写时映射回真实列名）。
 PHOTO_COUNT_COLUMN = "照片数"
 CLASSIFICATION_NOTE_DISPLAY = "分类备注"
+# 照片聚合列：一个入库编号对应多张照片，下列每格 = 该编号所有照片对应值的拼接（list 值）。
+PHOTO_FILENAME_COLUMN = "照片文件名"
+PHOTO_PATH_COLUMN = "照片绝对路径"
+PHOTO_DESC_COLUMN = "照片描述"
+PHOTO_AGGREGATE_COLUMNS = [PHOTO_FILENAME_COLUMN, PHOTO_PATH_COLUMN, PHOTO_DESC_COLUMN]
 
-# 汇总表列顺序：入库编号* + 标本其余列 + 分类其余列（备注消歧）+ 照片数。
+# 汇总表列顺序：入库编号* + 标本其余列 + 分类其余列（备注消歧）+ 照片数 + 照片聚合列。
 SUMMARY_COLUMNS = (
     ["入库编号*"]
     + [col for col in SPECIMEN_HEADERS if col != "入库编号*"]
@@ -120,6 +127,7 @@ SUMMARY_COLUMNS = (
         if col != "入库编号*"
     ]
     + [PHOTO_COUNT_COLUMN]
+    + PHOTO_AGGREGATE_COLUMNS
 )
 
 # 汇总列 -> (category, excel_field)。category="readonly" 表示不可编辑（主键 / 计算列）。
@@ -134,6 +142,8 @@ for _col in CLASSIFICATION_HEADERS:
     _display = CLASSIFICATION_NOTE_DISPLAY if _col == "备注" else _col
     SUMMARY_COLUMN_SOURCE[_display] = ("classification", _col)
 SUMMARY_COLUMN_SOURCE[PHOTO_COUNT_COLUMN] = ("readonly", PHOTO_COUNT_COLUMN)
+for _col in PHOTO_AGGREGATE_COLUMNS:
+    SUMMARY_COLUMN_SOURCE[_col] = ("readonly", _col)  # 照片聚合列只读，不回写
 del _col, _display
 
 # 入库汇总对话框默认显示的列（其余列默认隐藏，用户可在表头右键切换）。

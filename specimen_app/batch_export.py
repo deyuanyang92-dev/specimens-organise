@@ -22,6 +22,7 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -31,6 +32,8 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSlider,
+    QSpinBox,
     QVBoxLayout,
 )
 
@@ -41,6 +44,10 @@ if TYPE_CHECKING:
 _HEADER_FONT = Font(bold=True, size=11)
 _HEADER_FILL = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
 _HEADER_ALIGNMENT = Alignment(horizontal="center")
+
+# 照片导出格式：「保持原格式」= 原样 shutil.copy2（旧行为，兼容）；其余用 Pillow 重新编码。
+PHOTO_EXPORT_FORMATS = ("保持原格式", "JPG", "PNG", "TIFF")
+_FORMAT_EXT = {"JPG": ".jpg", "PNG": ".png", "TIFF": ".tif"}
 
 
 def _parse_voucher_numbers(text: str) -> list[str]:
@@ -97,10 +104,20 @@ class BatchExportDialog(QDialog):
     支持打包为 ZIP 方便分发。
     """
 
-    def __init__(self, store: "ExcelStore", preselected: list[str] | None = None, parent=None):
+    def __init__(
+        self,
+        store: "ExcelStore",
+        preselected: list[str] | None = None,
+        parent=None,
+        photo_focus: bool = False,
+    ):
+        # photo_focus=True：从「入库汇总 → 导出选中照片」入口进来，只关心照片文件，
+        #   默认只勾「照片文件」、三个 Excel sheet 默认不勾，标题改「导出照片」。
+        # photo_focus=False：工具栏/凭证列表右键的旧入口，保持原默认（旧行为不变）。
         super().__init__(parent)
         self.store = store
-        self.setWindowTitle("批量导出")
+        self._photo_focus = photo_focus
+        self.setWindowTitle("导出照片" if photo_focus else "批量导出")
         self.setMinimumSize(520, 480)
 
         layout = QVBoxLayout(self)
@@ -123,19 +140,26 @@ class BatchExportDialog(QDialog):
         options_group = QGroupBox("导出内容")
         options_layout = QVBoxLayout(options_group)
 
+        # 旧逻辑：标本/分类/照片路径默认勾选、照片文件默认不勾。
+        # photo_focus 入口只导照片：三个非照片选项隐藏 + 取消勾选（控件仍创建，
+        # _do_export 仍按 .isChecked() 引用、判断逻辑不动；隐藏行不占布局空间）。
         self._chk_specimen = QCheckBox("标本信息")
-        self._chk_specimen.setChecked(True)
+        self._chk_specimen.setChecked(not photo_focus)
         options_layout.addWidget(self._chk_specimen)
 
         self._chk_classification = QCheckBox("分类信息")
-        self._chk_classification.setChecked(True)
+        self._chk_classification.setChecked(not photo_focus)
         options_layout.addWidget(self._chk_classification)
 
         self._chk_photo_paths = QCheckBox("照片路径清单")
-        self._chk_photo_paths.setChecked(True)
+        self._chk_photo_paths.setChecked(not photo_focus)
         options_layout.addWidget(self._chk_photo_paths)
 
+        for _chk in (self._chk_specimen, self._chk_classification, self._chk_photo_paths):
+            _chk.setVisible(not photo_focus)
+
         self._chk_photo_files = QCheckBox("照片文件（复制到导出目录）")
+        self._chk_photo_files.setChecked(photo_focus)
         options_layout.addWidget(self._chk_photo_files)
 
         # ZIP 打包选项（仅当勾选照片文件时可用）
@@ -152,6 +176,55 @@ class BatchExportDialog(QDialog):
         options_layout.addLayout(zip_row)
 
         layout.addWidget(options_group)
+
+        # ---- 照片导出格式 / 压缩 ----
+        # 原代码照片只能原样复制；这里新增格式转换 + 压缩，整组仅在勾选「照片文件」时启用。
+        fmt_group = QGroupBox("照片导出格式 / 压缩")
+        fmt_layout = QVBoxLayout(fmt_group)
+
+        fmt_row = QHBoxLayout()
+        fmt_row.addWidget(QLabel("导出格式："))
+        self._photo_format = QComboBox()
+        self._photo_format.addItems(PHOTO_EXPORT_FORMATS)
+        self._photo_format.setToolTip("「保持原格式」= 原样复制；其余用 Pillow 重新编码导出")
+        self._photo_format.currentIndexChanged.connect(self._sync_photo_format_enabled)
+        fmt_row.addWidget(self._photo_format)
+        fmt_row.addStretch()
+        fmt_layout.addLayout(fmt_row)
+
+        quality_row = QHBoxLayout()
+        self._quality_label = QLabel("JPEG 质量：")
+        quality_row.addWidget(self._quality_label)
+        self._quality_slider = QSlider(Qt.Horizontal)
+        self._quality_slider.setRange(1, 100)
+        self._quality_slider.setValue(90)
+        self._quality_value = QLabel("90")
+        self._quality_value.setFixedWidth(28)
+        self._quality_slider.valueChanged.connect(
+            lambda v: self._quality_value.setText(str(v))
+        )
+        quality_row.addWidget(self._quality_slider, stretch=1)
+        quality_row.addWidget(self._quality_value)
+        fmt_layout.addLayout(quality_row)
+
+        resize_row = QHBoxLayout()
+        self._chk_resize = QCheckBox("限制最大边长")
+        self._chk_resize.setToolTip("超过该像素的照片等比缩小（不放大）；TIFF 原图始终不变")
+        self._chk_resize.toggled.connect(self._sync_photo_format_enabled)
+        resize_row.addWidget(self._chk_resize)
+        self._resize_spin = QSpinBox()
+        self._resize_spin.setRange(100, 100000)
+        self._resize_spin.setValue(4000)
+        self._resize_spin.setSuffix(" px")
+        resize_row.addWidget(self._resize_spin)
+        resize_row.addStretch()
+        fmt_layout.addLayout(resize_row)
+
+        layout.addWidget(fmt_group)
+
+        # 「照片文件」勾选状态联动整组启用（与 ZIP 选项同一个信号源）。
+        self._chk_photo_files.toggled.connect(self._sync_photo_format_enabled)
+        self._sync_photo_format_enabled()
 
         # ---- 输出目录 ----
         output_row = QHBoxLayout()
@@ -191,6 +264,20 @@ class BatchExportDialog(QDialog):
         if directory:
             self._output_path.setText(directory)
             self._output_path.setStyleSheet("color: #000;")
+
+    def _sync_photo_format_enabled(self) -> None:
+        """照片格式/压缩组的联动启用：仅勾「照片文件」时可用；质量条仅 JPG 可用；
+        最大边长仅在格式≠保持原格式时可用、数值框再随勾选启用。"""
+        photo_on = self._chk_photo_files.isChecked()
+        fmt = self._photo_format.currentText()
+        self._photo_format.setEnabled(photo_on)
+        is_jpg = photo_on and fmt == "JPG"
+        self._quality_label.setEnabled(is_jpg)
+        self._quality_slider.setEnabled(is_jpg)
+        self._quality_value.setEnabled(is_jpg)
+        can_resize = photo_on and fmt != "保持原格式"
+        self._chk_resize.setEnabled(can_resize)
+        self._resize_spin.setEnabled(can_resize and self._chk_resize.isChecked())
 
     # ---- 导出逻辑 ----
 
@@ -361,15 +448,21 @@ class BatchExportDialog(QDialog):
         _auto_width(ws)
 
     def _export_photo_files(self, vouchers: list[str], export_dir: Path, errors: list[str]) -> int:
-        """复制照片文件到导出目录的 /照片 子文件夹。
+        """导出照片文件到导出目录的 /照片 子文件夹。
 
-        处理同名冲突：使用 _2, _3 后缀。
-        返回成功复制的照片数量。
+        旧逻辑：一律 shutil.copy2 原样复制。保留为「保持原格式」分支（兼容）。
+        新增：选 JPG/PNG/TIFF 时用 Pillow 重新编码（可调质量 + 可选等比缩放），
+              dest 扩展名随目标格式变；原始照片 / 工作区归档副本只读取、不改动。
+        处理同名冲突：使用 _2, _3 后缀。返回成功导出的照片数量。
         """
         photo_dir = export_dir / "照片"
         photo_dir.mkdir(exist_ok=True)
         count = 0
         seen_names: dict[str, int] = {}
+
+        fmt = self._photo_format.currentText()
+        quality = self._quality_slider.value()
+        max_edge = self._resize_spin.value() if self._chk_resize.isChecked() else 0
 
         for voucher in vouchers:
             photos = self.store.get_photos(voucher)
@@ -378,7 +471,11 @@ class BatchExportDialog(QDialog):
                 if not resolved.exists():
                     continue
                 filename = str(photo.get("文件名", "")) or resolved.name
-                # 处理同名冲突
+                # 转格式时把扩展名换成目标格式（「保持原格式」不动，等同旧行为）。
+                if fmt != "保持原格式":
+                    stem, _ext = os.path.splitext(filename)
+                    filename = f"{stem}{_FORMAT_EXT[fmt]}"
+                # 处理同名冲突（基于最终文件名）
                 if filename in seen_names:
                     seen_names[filename] += 1
                     stem, ext = os.path.splitext(filename)
@@ -389,9 +486,32 @@ class BatchExportDialog(QDialog):
 
                 dest = photo_dir / dest_name
                 try:
-                    shutil.copy2(resolved, dest)
+                    if fmt == "保持原格式":
+                        shutil.copy2(resolved, dest)  # 原分支：原样复制
+                    else:
+                        self._reencode_photo(resolved, dest, fmt, quality, max_edge)
                     count += 1
-                except OSError as exc:
-                    errors.append(f"复制照片失败 [{filename}]：{exc}")
+                except Exception as exc:  # Pillow 解码/编码可能抛多种异常，逐张兜底不中断
+                    errors.append(f"导出照片失败 [{filename}]：{exc}")
 
         return count
+
+    @staticmethod
+    def _reencode_photo(src: Path, dest: Path, fmt: str, quality: int, max_edge: int) -> None:
+        """用 Pillow 把 src 重新编码为目标格式写到 dest。
+
+        max_edge>0 时按最大边长等比缩小（不放大）。TIFF 等多页/特殊图先靠 Pillow
+        原生解码；解不开会抛异常，由调用方逐张兜底记入 errors。
+        """
+        from PIL import Image, ImageOps
+
+        with Image.open(src) as opened:
+            img = ImageOps.exif_transpose(opened)  # 按 EXIF 摆正方向
+            if max_edge > 0:
+                img.thumbnail((max_edge, max_edge), Image.LANCZOS)
+            if fmt == "JPG":
+                img.convert("RGB").save(dest, "JPEG", quality=quality, optimize=True)
+            elif fmt == "PNG":
+                img.save(dest, "PNG")
+            else:  # TIFF
+                img.save(dest, "TIFF")

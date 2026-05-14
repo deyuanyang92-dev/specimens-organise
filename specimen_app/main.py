@@ -14,7 +14,9 @@ def main() -> None:
     args = parser.parse_args()
     workspace = Path(args.workspace) if args.workspace else default_workspace()
     if workspace is None:
-        print("未找到工作区，请使用 --workspace 指定目录，或在弹出的对话框中选择。", file=sys.stderr)
+        # 旧文案提到"在弹出的对话框中选择"——那是窗口构建前的裸 QFileDialog。
+        # 现改为：先打开主窗口，再在窗口内提示选择/新建工作区。
+        print("未找到上次使用的工作区，程序将打开主窗口并提示选择或新建工作区。", file=sys.stderr)
     run_app(workspace)
 
 

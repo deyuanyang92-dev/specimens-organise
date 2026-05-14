@@ -47,6 +47,8 @@ class AppSettings:
     last_update_check: str = ""  # 上次检查更新的 ISO 时间戳，用于限频
     carry_over_specimen_fields: bool = True  # 新增标本时是否沿用上一条的标本信息字段
     summary_visible_columns: list[str] = field(default_factory=list)  # 入库汇总宽表可见列（空=用默认集）
+    ui_font_size: int = 0  # 全局界面字体大小（pt）；0=未设置，用系统默认。范围 7–24
+    image_viewer_path: str = ""  # 自定义图片查看器程序路径；空=用系统默认程序打开原图
 
 
 def app_config_dir() -> Path:
@@ -94,6 +96,16 @@ def load_settings() -> AppSettings:
         summary_visible_columns = [str(item) for item in raw_summary_columns if item]
     else:
         summary_visible_columns = []
+    ui_font_size = data.get("ui_font_size", 0)
+    if not isinstance(ui_font_size, int) or isinstance(ui_font_size, bool):
+        ui_font_size = 0
+    elif ui_font_size > 0:
+        ui_font_size = max(7, min(24, ui_font_size))  # 钳制到合理范围
+    else:
+        ui_font_size = 0
+    image_viewer_path = data.get("image_viewer_path", "")
+    if not isinstance(image_viewer_path, str):
+        image_viewer_path = ""
     return AppSettings(
         last_workspace=str(data.get("last_workspace", "")),
         recent_workspaces=[str(item) for item in data.get("recent_workspaces", []) if item],
@@ -109,6 +121,8 @@ def load_settings() -> AppSettings:
         last_update_check=str(data.get("last_update_check", "")),
         carry_over_specimen_fields=carry_over_specimen_fields,
         summary_visible_columns=summary_visible_columns,
+        ui_font_size=ui_font_size,
+        image_viewer_path=image_viewer_path,
     )
 
 
@@ -130,6 +144,8 @@ def save_settings(settings: AppSettings) -> None:
         "last_update_check": settings.last_update_check,
         "carry_over_specimen_fields": settings.carry_over_specimen_fields,
         "summary_visible_columns": settings.summary_visible_columns,
+        "ui_font_size": settings.ui_font_size,
+        "image_viewer_path": settings.image_viewer_path,
     }
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)

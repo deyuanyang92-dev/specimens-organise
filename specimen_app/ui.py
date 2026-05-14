@@ -263,6 +263,12 @@ def pil_to_qpixmap(pil_image: Image.Image) -> QPixmap:
     return QPixmap.fromImage(qimg)
 
 
+# 管理密码：原本硬编码 "123" 散落在删除入库编号流程（_context_delete_voucher /
+# _context_batch_delete_vouchers）。集中为一处常量便于维护，并供「用 Excel 打开
+# 数据文件」复用同一道密码门。值不变，行为完全兼容。
+ADMIN_PASSWORD = "123"
+
+
 def _open_path(path: Path) -> None:
     try:
         if os.name == "nt":
@@ -273,6 +279,45 @@ def _open_path(path: Path) -> None:
             subprocess.Popen(["xdg-open", str(path)])
     except Exception as exc:
         QMessageBox.critical(None, "打开失败", str(exc))
+
+
+def open_image_external(path: Path) -> None:
+    """用外部程序打开原图：设置了自定义图片查看器就用它，否则回退系统默认程序。
+
+    用户要求「打开原图」走外部程序（避免在主界面内载入全分辨率导致卡顿），
+    并可在设置里自定义查看器（settings.image_viewer_path）。
+    """
+    viewer = (load_settings().image_viewer_path or "").strip()
+    if viewer and Path(viewer).exists():
+        try:
+            subprocess.Popen([viewer, str(path)])
+            return
+        except Exception as exc:
+            QMessageBox.critical(None, "打开失败", f"自定义图片查看器启动失败：{exc}\n将改用系统默认程序。")
+    # 未设置 / 查看器无效 / 启动失败 -> 回退系统默认。
+    _open_path(path)
+
+
+# ---------------------------------------------------------------------------
+# 全局界面字体缩放
+# ---------------------------------------------------------------------------
+# run_app 启动时记录系统默认字号，用于"恢复默认"/Ctrl+0 复位。
+_default_app_font_point: int = 0
+
+
+def apply_app_font_size(size: int) -> None:
+    """按绝对 pt 设置全局 app 字体；size<=0 时恢复系统默认字号。
+
+    通过 QApplication.setFont 影响所有未显式 setFont/无 stylesheet font-size 的控件。
+    """
+    app = QApplication.instance()
+    if app is None:
+        return
+    font = app.font()
+    target = size if size and size > 0 else (_default_app_font_point or font.pointSize())
+    if target and target > 0:
+        font.setPointSize(target)
+    app.setFont(font)
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +430,8 @@ class UpdateDownloadWorker(QThread):
 class PhotoGraphicsView(QGraphicsView):
     photo_dropped = pyqtSignal(list)  # list of str paths
     zoom_changed = pyqtSignal(float)  # zoom level (1.0 = 100%)
+    return_requested = pyqtSignal()  # 由宫格双击展开的单张视图里，图上再双击 -> 请求返回宫格
+    context_requested = pyqtSignal(object)  # 右键单张预览 -> 携带 globalPos，由主窗口出菜单
 
     _ZOOM_MIN = 0.05
     _ZOOM_MAX = 20.0
@@ -397,6 +444,9 @@ class PhotoGraphicsView(QGraphicsView):
         self._pixmap_item: QGraphicsPixmapItem | None = None
         self._zoom_level = 1.0
         self._is_fit_mode = True
+        # True 时（从宫格双击展开的单张状态）双击图片 -> 发 return_requested 返回宫格，
+        # 而不是做 适配↔100% 切换。由 SpecimenWindow 在展开/返回宫格/切模式时设置。
+        self._double_click_returns = False
         self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
@@ -457,9 +507,23 @@ class PhotoGraphicsView(QGraphicsView):
             self.zoom_changed.emit(self._zoom_level)
         event.accept()
 
+    def set_double_click_returns(self, enabled: bool) -> None:
+        self._double_click_returns = bool(enabled)
+
+    def contextMenuEvent(self, event) -> None:
+        # 单张预览原本没有右键菜单；改为发信号让主窗口出照片管理菜单。
+        self.context_requested.emit(event.globalPos())
+        event.accept()
+
     def mouseDoubleClickEvent(self, event) -> None:
         if event.button() != Qt.LeftButton or not self._pixmap_item:
             return super().mouseDoubleClickEvent(event)
+        # 从宫格双击展开的单张状态：图上双击 -> 返回宫格（不用找「返回网格」按钮）。
+        if self._double_click_returns:
+            self.return_requested.emit()
+            event.accept()
+            return
+        # 旧逻辑（保留）：普通单张状态双击在 适配↔100% 间切换。
         if self._is_fit_mode:
             self.resetTransform()
             self._zoom_level = 1.0
@@ -701,7 +765,17 @@ class GridPhotoCell(QFrame):
 # Main window
 # ---------------------------------------------------------------------------
 
+# 哨兵：表示启动时没有可自动解析的工作区，窗口应以"未绑定"状态先构建并显示，
+# 工作区选择推迟到 show() 之后由 _prompt_initial_workspace 驱动。
+_DEFERRED_WORKSPACE = object()
+
+
 class SpecimenWindow(QMainWindow):
+    # voucher_table 列宽/字体基准值（系统默认字号下的原始值）。
+    # 全局字体缩放时按 (当前字号 - 默认字号) 的差值同比放大，避免文字被覆盖。
+    _VOUCHER_COL_BASE_WIDTHS = (85, 36, 36, 36, 52, 42)
+    _VOUCHER_TABLE_BASE_PT = 10
+
     def __init__(self, workspace_root: Path | str | None, manager: "WindowManager | None" = None):
         super().__init__()
         self.manager = manager
@@ -714,34 +788,43 @@ class SpecimenWindow(QMainWindow):
         if prepared is None:
             self.close()
             raise SystemExit
-        self.workspace_root, create_workspace_files = prepared
-        if self.manager is not None and self.manager.focus_workspace(self.workspace_root):
-            self.close()
-            raise SystemExit
+        if prepared is _DEFERRED_WORKSPACE:
+            # 首次启动、没有可自动解析的工作区：以"未绑定"状态构建窗口。
+            # 旧逻辑：_prepare_start_workspace 在窗口构建前阻塞弹 QFileDialog（背后无窗口）。
+            # 现改为 show() 之后由 _prompt_initial_workspace 驱动选择器。
+            self.workspace_root = None
+            self.store = None
+            self.matcher = None
+        else:
+            self.workspace_root, create_workspace_files = prepared
+            if self.manager is not None and self.manager.focus_workspace(self.workspace_root):
+                self.close()
+                raise SystemExit
 
-        try:
-            self.store = ExcelStore(self.workspace_root, lock=True, create_if_missing=create_workspace_files)
-        except WorkspaceLockedError as exc:
-            lock_path = self.workspace_root / "数据" / ".workspace.lock"
-            msg = f'{exc}\n\n如果软件已退出但仍然被占用，可以点击"强制解锁"。'
-            btn = QMessageBox.critical(self, "工作区被占用", msg, QMessageBox.Abort | QMessageBox.Retry)
-            if btn == QMessageBox.Retry and lock_path.exists():
-                try:
-                    lock_path.unlink()
-                    self.store = ExcelStore(self.workspace_root, lock=True, create_if_missing=create_workspace_files)
-                except Exception:
+            try:
+                self.store = ExcelStore(self.workspace_root, lock=True, create_if_missing=create_workspace_files)
+            except WorkspaceLockedError as exc:
+                lock_path = self.workspace_root / "数据" / ".workspace.lock"
+                msg = f'{exc}\n\n如果软件已退出但仍然被占用，可以点击"强制解锁"。'
+                btn = QMessageBox.critical(self, "工作区被占用", msg, QMessageBox.Abort | QMessageBox.Retry)
+                if btn == QMessageBox.Retry and lock_path.exists():
+                    try:
+                        lock_path.unlink()
+                        self.store = ExcelStore(self.workspace_root, lock=True, create_if_missing=create_workspace_files)
+                    except Exception:
+                        self.close()
+                        raise SystemExit
+                else:
                     self.close()
-                    raise SystemExit
-            else:
+                    raise SystemExit from exc
+            except WorkspaceNotInitializedError as exc:
+                QMessageBox.critical(self, "工作区未初始化", str(exc))
                 self.close()
                 raise SystemExit from exc
-        except WorkspaceNotInitializedError as exc:
-            QMessageBox.critical(self, "工作区未初始化", str(exc))
-            self.close()
-            raise SystemExit from exc
 
-        _startup_mark("SpecimenWindow: ExcelStore ready")
-        self.matcher = SpeciesMatcher(self.workspace_root / "字段模版" / "表格信息预设字段.xlsx")
+            _startup_mark("SpecimenWindow: ExcelStore ready")
+            self.matcher = SpeciesMatcher(self.workspace_root / "字段模版" / "表格信息预设字段.xlsx")
+
         self.current_voucher: str | None = None
         self.current_photos: list[dict[str, str]] = []
         self.current_photo_index = 0
@@ -756,12 +839,19 @@ class SpecimenWindow(QMainWindow):
         self._photo_view_states: dict[str, tuple[float, int, int]] = {}
         self._show_grid_filenames = load_settings().show_grid_filenames
 
-        self.thumbnail_cache = ThumbnailCache(self.workspace_root)
+        # thumbnail_cache / _thumb_worker 依赖工作区路径。
+        # 旧逻辑：在 __init__ 中无条件创建。现在首次启动可能没有工作区，
+        # 改为有工作区时才创建；未绑定时由 _load_workspace_into_window 首次载入时创建。
         self.search_index: ImageSearchIndex | None = None
         self._index_build_worker: IndexBuildWorker | None = None
-        self._thumb_worker = ThumbnailWorker(self.thumbnail_cache, self)
-        self._thumb_worker.result_ready.connect(self._on_thumbnail_ready)
-        self._thumb_worker.start()
+        if self.workspace_root is not None:
+            self.thumbnail_cache = ThumbnailCache(self.workspace_root)
+            self._thumb_worker = ThumbnailWorker(self.thumbnail_cache, self)
+            self._thumb_worker.result_ready.connect(self._on_thumbnail_ready)
+            self._thumb_worker.start()
+        else:
+            self.thumbnail_cache = None
+            self._thumb_worker = None
 
         self.specimen_widgets: dict[str, QLineEdit | QComboBox] = {}
         self.class_widgets: dict[str, QLineEdit] = {}
@@ -777,7 +867,10 @@ class SpecimenWindow(QMainWindow):
         self._current_qpixmap: QPixmap | None = None
         self._grid_labels: list[GridPhotoCell] = []
         self._grid_requests: dict[int, int] = {}  # token -> slot index
+        self._grid_selected_indices: set[int] = set()  # 宫格多选（Ctrl/Shift），photo 索引集合
         self._photo_filename_fill_action: QAction | None = None
+        # 入库汇总窗口：非模态、单实例。open_ingest_summary 据此判断是新建还是聚焦刷新。
+        self._ingest_summary_dialog: "IngestSummaryDialog | None" = None
 
         # 搜索数据容器：必须在 _build_ui() 之前初始化，因为 UI 构造期间
         # QComboBox.currentIndexChanged 信号可能提前触发 _apply_voucher_filter。
@@ -788,12 +881,19 @@ class SpecimenWindow(QMainWindow):
         self._build_ui()
         _startup_mark("SpecimenWindow._build_ui")
 
-        remember_workspace(self.workspace_root)
-        self.statusBar().showMessage("正在加载工作区数据...")
-        QTimer.singleShot(0, self._finish_initial_load)
+        if self.workspace_root is not None:
+            remember_workspace(self.workspace_root)
+            self.statusBar().showMessage("正在加载工作区数据...")
+            QTimer.singleShot(0, self._finish_initial_load)
+        else:
+            # 未绑定：窗口已构建，show() 之后再驱动工作区选择器。
+            self.statusBar().showMessage("请选择或新建工作区")
+            QTimer.singleShot(0, self._prompt_initial_workspace)
 
     def _finish_initial_load(self) -> None:
         if self._is_closing:
+            return
+        if self.store is None:
             return
         self.refresh_list()
         _startup_mark("_finish_initial_load: refresh_list")
@@ -805,20 +905,28 @@ class SpecimenWindow(QMainWindow):
         QTimer.singleShot(1200, self._build_search_index_background)
         QTimer.singleShot(2500, self._maybe_check_updates_on_startup)
 
+    def _prompt_initial_workspace(self) -> None:
+        if self._is_closing:
+            return
+        # 旧逻辑：__init__ 在窗口构建前阻塞弹 QFileDialog（背后无窗口）。
+        # 现改为窗口已 show() 之后再驱动同一选择/校验/初始化/载入链路（switch_workspace）。
+        self.switch_workspace()
+        if self.store is None:
+            # 用户取消了首次工作区选择：保留空窗口，工具栏"切换工作区"按钮仍可用。
+            self.statusBar().showMessage("尚未选择工作区，可点击工具栏“切换工作区”随时打开", 0)
+
     # ---- workspace preparation ----
 
-    def _prepare_start_workspace(self, workspace_root: Path | str | None) -> tuple[Path, bool] | None:
+    def _prepare_start_workspace(self, workspace_root: Path | str | None) -> "tuple[Path, bool] | object | None":
         candidate = Path(workspace_root).resolve() if workspace_root else None
-        while True:
-            if candidate is None:
-                selected = QFileDialog.getExistingDirectory(self, "选择工作区目录")
-                if not selected:
-                    return None
-                candidate = Path(selected).resolve()
-            prepared = self._prepare_workspace_candidate(candidate)
-            if prepared is not None:
-                return prepared
-            candidate = None
+        # 旧逻辑：candidate 为 None 时在 while 循环里阻塞弹 QFileDialog 选目录。
+        # 现改为：没有可自动解析的工作区时直接返回 _DEFERRED_WORKSPACE，
+        # 由窗口 show() 之后的 _prompt_initial_workspace 驱动选择器（此时窗口可见）。
+        if candidate is None:
+            return _DEFERRED_WORKSPACE
+        # 传入了明确的工作区（--workspace 或自动解析到的上次工作区）：仍按原逻辑校验，
+        # 无效则返回 None -> __init__ 抛 SystemExit。
+        return self._prepare_workspace_candidate(candidate)
 
     def _prepare_workspace_candidate(self, path: Path) -> tuple[Path, bool] | None:
         if is_generated_workspace_path(path):
@@ -922,23 +1030,27 @@ class SpecimenWindow(QMainWindow):
         toolbar.setObjectName("main_toolbar")
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
-        for label, slot in [
-            ("＋新增标本", self.new_specimen),
-        ]:
-            action = QAction(label, self)
-            action.triggered.connect(slot)
-            toolbar.addAction(action)
+        # 旧逻辑：工具栏首项是「＋新增标本」按钮。
+        # 现按需求改名为「＋新增入库编号」并移到左侧入库编号面板顶部（见 _build_ui 中 voucher_layout）。
+        # for label, slot in [
+        #     ("＋新增标本", self.new_specimen),
+        # ]:
+        #     action = QAction(label, self)
+        #     action.triggered.connect(slot)
+        #     toolbar.addAction(action)
 
-        # 录入加速：可勾选的"沿用上条信息"开关。勾选时新增标本会带上一条的标本信息字段。
-        # 状态静默持久化到 settings.json（控件留在工具栏，不进设置对话框）。
-        self._carry_over_action = QAction("沿用上条信息", self)
-        self._carry_over_action.setCheckable(True)
-        self._carry_over_action.setChecked(load_settings().carry_over_specimen_fields)
-        self._carry_over_action.setToolTip(
-            "新增标本时自动沿用上一条记录的：" + "、".join(CARRY_OVER_SPECIMEN_FIELDS)
-        )
-        self._carry_over_action.toggled.connect(self._on_carry_over_toggled)
-        toolbar.addAction(self._carry_over_action)
+        # 旧逻辑：工具栏上有可勾选的"沿用上条信息"开关，状态持久化到 settings.json。
+        # 现按需求移除该开关 —— 沿用上一条标本信息是本工作模式的固定规则，不该是可选项；
+        # 沿用行为改为在 new_specimen() 中永远生效。settings 字段 carry_over_specimen_fields
+        # 保留不动以兼容旧 settings.json，但不再有 UI 控制。
+        # self._carry_over_action = QAction("沿用上条信息", self)
+        # self._carry_over_action.setCheckable(True)
+        # self._carry_over_action.setChecked(load_settings().carry_over_specimen_fields)
+        # self._carry_over_action.setToolTip(
+        #     "新增标本时自动沿用上一条记录的：" + "、".join(CARRY_OVER_SPECIMEN_FIELDS)
+        # )
+        # self._carry_over_action.toggled.connect(self._on_carry_over_toggled)
+        # toolbar.addAction(self._carry_over_action)
 
         for label, slot in [
             ("导入工作区", self.import_workspace),
@@ -959,7 +1071,10 @@ class SpecimenWindow(QMainWindow):
 
         # Workspace bar
         ws_bar = QHBoxLayout()
-        ws_label = QLabel(f"当前工作目录：{self.workspace_root}")
+        if self.workspace_root is not None:
+            ws_label = QLabel(f"当前工作目录：{self.workspace_root}")
+        else:
+            ws_label = QLabel("当前工作目录：（未选择，请点击工具栏“切换工作区”）")
         ws_label.setContentsMargins(8, 4, 8, 4)
         self.workspace_label = ws_label
         ws_bar.addWidget(ws_label)
@@ -987,6 +1102,10 @@ class SpecimenWindow(QMainWindow):
         self.photo_view = PhotoGraphicsView()
         self.photo_view.photo_dropped.connect(self.add_photo_paths_async)
         self.photo_view.zoom_changed.connect(self._on_zoom_changed)
+        # 由宫格双击展开的单张视图里，图上再双击 -> 返回原宫格。
+        self.photo_view.return_requested.connect(self.return_to_grid)
+        # 单张预览右键 -> 照片管理菜单。
+        self.photo_view.context_requested.connect(self._show_single_preview_context_menu)
         photo_stack.addWidget(self.photo_view)
 
         self.grid_frame = QFrame()
@@ -1017,7 +1136,11 @@ class SpecimenWindow(QMainWindow):
         for label, slot in [
             ("添加照片", self.add_photo),
             ("检索图片", self.open_image_search),
-            ("删除照片", self.delete_photo),
+            # 「替换照片」原本只在照片表右键菜单，按需求补成与添加/检索并列的可见按钮。
+            ("替换照片", self._replace_current_photo),
+            # 旧标签「删除照片」——实际只取消该照片与入库编号的关联（删记录行 +
+            # 无引用的工作区归档副本），原始照片不动，按需求改名「取消关联」。
+            ("取消关联", self.delete_photo),
             ("分配入库编号", self._assign_voucher_to_selected),
             ("上一张", lambda: self.shift_photo(-1)),
             ("下一张", lambda: self.shift_photo(1)),
@@ -1070,6 +1193,11 @@ class SpecimenWindow(QMainWindow):
         voucher_layout = QVBoxLayout(voucher_content)
         voucher_layout.setContentsMargins(0, 0, 0, 0)
         voucher_layout.setSpacing(2)
+        # 「＋新增入库编号」按钮：原本在顶部工具栏（标签「＋新增标本」），
+        # 按需求改名并移到左侧入库编号面板顶部，更贴近编号列表。
+        self._new_voucher_btn = QPushButton("＋新增入库编号")
+        self._new_voucher_btn.clicked.connect(self.new_specimen)
+        voucher_layout.addWidget(self._new_voucher_btn)
         # Search + quick filter
         filter_row = QHBoxLayout()
         self._voucher_search = QLineEdit()
@@ -1079,7 +1207,11 @@ class SpecimenWindow(QMainWindow):
         filter_row.addWidget(self._voucher_search)
         self._search_scope = QComboBox()
         self._search_scope.addItems(["全部", "入库编号", "管内编号", "照片名"])
-        self._search_scope.setFixedWidth(80)
+        # 旧逻辑：setFixedWidth(80) 硬固定宽度，面板拖窄时筛选行控件挤压重叠。
+        # 改为允许在 56–96px 间伸缩，面板可自由拖窄而不重叠。
+        # self._search_scope.setFixedWidth(80)
+        self._search_scope.setMinimumWidth(56)
+        self._search_scope.setMaximumWidth(96)
         self._search_scope.currentIndexChanged.connect(self._apply_voucher_filter)
         filter_row.addWidget(self._search_scope)
         # 复选框：显示/隐藏关联照片列
@@ -1111,24 +1243,34 @@ class SpecimenWindow(QMainWindow):
         self.voucher_table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.voucher_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.voucher_table.verticalHeader().setVisible(False)
-        self.voucher_table.setColumnWidth(0, 85)
-        self.voucher_table.setColumnWidth(1, 36)
-        self.voucher_table.setColumnWidth(2, 36)
-        self.voucher_table.setColumnWidth(3, 36)
-        self.voucher_table.setColumnWidth(4, 52)
-        self.voucher_table.setColumnWidth(5, 42)
+        # 旧逻辑：列宽硬编码 85/36/36/36/52/42，表格字体固定 QFont("Consolas", 10)。
+        # 字体放大时列宽装不下、文字被覆盖。现改为按全局字号缩放（见 _refresh_scaled_fonts）；
+        # 列宽基准值集中到类常量 _VOUCHER_COL_BASE_WIDTHS。
+        # self.voucher_table.setColumnWidth(0, 85)
+        # self.voucher_table.setColumnWidth(1, 36)
+        # self.voucher_table.setColumnWidth(2, 36)
+        # self.voucher_table.setColumnWidth(3, 36)
+        # self.voucher_table.setColumnWidth(4, 52)
+        # self.voucher_table.setColumnWidth(5, 42)
         self.voucher_table.setColumnWidth(6, 0)  # 关联照片列：默认隐藏，通过复选框切换
         self.voucher_table.horizontalHeader().setStretchLastSection(True)
-        self.voucher_table.setFont(QFont("Consolas", 10))
+        # self.voucher_table.setFont(QFont("Consolas", 10))  # 改为 _refresh_scaled_fonts() 统一设置
         self.voucher_table.itemSelectionChanged.connect(self._on_voucher_table_selected)
         self.voucher_table.horizontalHeader().sectionClicked.connect(self._on_voucher_header_clicked)
         self.voucher_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.voucher_table.customContextMenuRequested.connect(self._voucher_context_menu)
         # Ctrl+A 全选快捷键（Windows 操作习惯）
         _ = QShortcut(QKeySequence("Ctrl+A"), self.voucher_table, self._select_all_vouchers)
+        # 全局字体缩放快捷键：Ctrl+加 放大、Ctrl+减 缩小、Ctrl+0 复位（类似浏览器）。
+        _ = QShortcut(QKeySequence("Ctrl+="), self, lambda: self._zoom_font(1))
+        _ = QShortcut(QKeySequence("Ctrl++"), self, lambda: self._zoom_font(1))
+        _ = QShortcut(QKeySequence("Ctrl+-"), self, lambda: self._zoom_font(-1))
+        _ = QShortcut(QKeySequence("Ctrl+0"), self, self._zoom_font_reset)
         self._col_filters: dict[int, str] = {}  # col_index -> filter value
         self._col_header_labels = ["入库编号","标本","照片","分类","认领","照片数","关联照片"]
         self._show_photo_names = False
+        # 按当前全局字号设置表格字体与列宽（默认字号时与旧版完全一致）。
+        self._refresh_scaled_fonts()
         voucher_layout.addWidget(self.voucher_table, stretch=1)
         # Pagination
         page_row = QHBoxLayout()
@@ -1147,7 +1289,12 @@ class SpecimenWindow(QMainWindow):
         self._voucher_page = 0
         self._voucher_page_size = 200
         self.voucher_panel = self._create_panel("入库编号", voucher_content, collapsible=False)
-        self.voucher_panel.setMinimumWidth(290)
+        # 旧逻辑：setMinimumWidth(290) 硬下限，拖到 290px 卡住；后降到 150。
+        # 现配合 main_splitter.setChildrenCollapsible(True) 再降到 60，可拖到极窄甚至折叠，
+        # 把空间让给中央图片显示区。
+        # self.voucher_panel.setMinimumWidth(290)
+        # self.voucher_panel.setMinimumWidth(150)
+        self.voucher_panel.setMinimumWidth(60)
 
         # Right: specimen info panel
         specimen_content = QWidget()
@@ -1246,6 +1393,8 @@ class SpecimenWindow(QMainWindow):
         self.right_splitter.addWidget(self.photo_panel)
         self.right_splitter.addWidget(self.class_panel)
         self.right_splitter.setSizes([260, 280, 200])
+        # 右侧 标本/照片/分类 三块允许各自折叠，方便把空间让给图片区。
+        self.right_splitter.setChildrenCollapsible(True)
 
         # Right side container with save-all button at top
         right_container = QWidget()
@@ -1264,7 +1413,9 @@ class SpecimenWindow(QMainWindow):
         self.main_splitter.addWidget(central)
         self.main_splitter.addWidget(right_container)
         self.main_splitter.setSizes([220, 580, 480])
-        self.main_splitter.setChildrenCollapsible(False)
+        # 旧逻辑：setChildrenCollapsible(False) —— 左侧入库编号栏 / 右侧面板拖不窄、不能折叠，
+        # 中央图片区无法占满。改为 True：侧边栏可拖到极窄甚至折叠，把空间让给图片显示区。
+        self.main_splitter.setChildrenCollapsible(True)
         self.setCentralWidget(self.main_splitter)
 
         # Restore saved splitter sizes
@@ -1282,6 +1433,8 @@ class SpecimenWindow(QMainWindow):
         tools_menu = self.menuBar().addMenu("工具")
         tools_menu.addAction("入库汇总", self.open_ingest_summary)
         tools_menu.addAction("操作记录", self._open_action_log)
+        # 新增：用 Excel 直接打开数据目录里的 xlsx（密码门，复用管理密码）。
+        tools_menu.addAction("用 Excel 打开数据文件…", self._open_data_in_excel)
 
         view_menu = self.menuBar().addMenu("视图")
         for panel_name, panel_ref in [
@@ -1357,6 +1510,9 @@ class SpecimenWindow(QMainWindow):
         candidates: list[tuple[str, SpeciesMatch | FamilyMatch]] = []
         self._taxonomy_candidate_rows[field] = candidates
         if self._loading or not text.strip():
+            return
+        # 未绑定工作区的窗口没有物种预设匹配器，跳过候选计算。
+        if self.matcher is None:
             return
 
         if field in SPECIES_LOOKUP_INPUT_COLUMNS:
@@ -1475,6 +1631,8 @@ class SpecimenWindow(QMainWindow):
         self._list_refresh_timer.start(300)
 
     def refresh_list(self) -> None:
+        if self.store is None:
+            return
         current = self.current_voucher
         overview = self.store.workspace_overview()
         self._all_vouchers = list(overview["vouchers"])
@@ -1623,6 +1781,32 @@ class SpecimenWindow(QMainWindow):
                 self.voucher_table.selectRow(row)
                 return
 
+    def reveal_voucher(self, voucher: str) -> None:
+        """从入库汇总等处跳转过来：必要时清搜索/筛选、翻到目标页、选中并滚动到该行。
+
+        旧问题：调用方只调 select_voucher，只填表单、不动主列表 —— 排序后目标行在别页/被
+        筛选掉时看不出跳转。这里把列表也同步过去：selectRow 会触发
+        _on_voucher_table_selected -> select_voucher，复用既有加载链路。
+        """
+        if voucher not in self._all_vouchers:
+            return
+        filtered = getattr(self, "_filtered_vouchers", self._all_vouchers)
+        if voucher not in filtered:
+            # 被搜索/快速筛选/列筛选挡住 —— 清掉让目标行可见。
+            self._voucher_search.blockSignals(True)
+            self._voucher_search.clear()
+            self._voucher_search.blockSignals(False)
+            self._set_voucher_filter("all")  # 重置快速+列筛选，内部已 _apply_voucher_filter
+        if voucher in self._filtered_vouchers:
+            self._voucher_page = self._filtered_vouchers.index(voucher) // self._voucher_page_size
+            self._apply_voucher_filter()
+        for row in range(self.voucher_table.rowCount()):
+            item = self.voucher_table.item(row, 0)
+            if item and item.text() == voucher:
+                self.voucher_table.selectRow(row)
+                self.voucher_table.scrollToItem(item)
+                return
+
     def _select_all_vouchers(self) -> None:
         """Ctrl+A 全选凭证列表中当前可见的所有行。"""
         self.voucher_table.selectAll()
@@ -1635,6 +1819,8 @@ class SpecimenWindow(QMainWindow):
         self._dashboard_timer.start(1000)  # debounce 1s
 
     def _compute_dashboard(self) -> None:
+        if self.store is None:
+            return
         all_v = self.store.list_vouchers()
         photo_counts = self.store.voucher_photo_counts()
         total_photos = sum(photo_counts.values())
@@ -1780,26 +1966,31 @@ class SpecimenWindow(QMainWindow):
 
     # ---- Specimen CRUD ----
 
-    def _on_carry_over_toggled(self, checked: bool) -> None:
-        """工具栏"沿用上条信息"开关变化时，静默持久化到 settings.json。"""
-        try:
-            settings = load_settings()
-            settings.carry_over_specimen_fields = bool(checked)
-            save_settings(settings)
-        except Exception:
-            pass  # 持久化失败不影响本次会话内的开关状态
+    # 旧逻辑：工具栏"沿用上条信息"开关变化时静默持久化到 settings.json。
+    # 该开关已移除（沿用是固定模式规则），此槽函数不再被任何信号连接，注释保留备查。
+    # def _on_carry_over_toggled(self, checked: bool) -> None:
+    #     """工具栏"沿用上条信息"开关变化时，静默持久化到 settings.json。"""
+    #     try:
+    #         settings = load_settings()
+    #         settings.carry_over_specimen_fields = bool(checked)
+    #         save_settings(settings)
+    #     except Exception:
+    #         pass  # 持久化失败不影响本次会话内的开关状态
 
     def new_specimen(self) -> None:
         # 原逻辑：create_specimen() -> refresh_list() -> select_voucher()，新记录字段全空。
-        # 现在：若"沿用上条信息"开关打开且已有当前标本，则把上一条的标本信息字段
-        # （CARRY_OVER_SPECIMEN_FIELDS）带入新记录，减少重复录入。
+        # 现在：新增入库编号时把上一条的标本信息字段（CARRY_OVER_SPECIMEN_FIELDS）
+        # 带入新记录，减少重复录入。沿用是本工作模式的固定规则。
         try:
             carry: dict[str, str] = {}
-            if (
-                getattr(self, "_carry_over_action", None) is not None
-                and self._carry_over_action.isChecked()
-                and self.current_voucher
-            ):
+            # 旧逻辑：仅当工具栏「沿用上条信息」开关勾选时才沿用。
+            # 现在：开关已移除，沿用是固定模式规则，只要存在当前标本就沿用。
+            # if (
+            #     getattr(self, "_carry_over_action", None) is not None
+            #     and self._carry_over_action.isChecked()
+            #     and self.current_voucher
+            # ):
+            if self.current_voucher:
                 prev = self.store.get_specimen(self.current_voucher) or {}
                 carry = {
                     field: str(prev.get(field, ""))
@@ -1911,6 +2102,59 @@ class SpecimenWindow(QMainWindow):
         self._refresh_image_index_after_photo_change()
         self.reload_current()
 
+    def _open_data_in_excel(self) -> None:
+        """用 Excel 打开数据目录里的 xlsx（密码门 + 风险提示 + 可选快照）。
+
+        本程序不监控外部改动，且保存时整文件重写会覆盖外部修改 —— 故先输管理密码，
+        再明确警告风险、可选建数据快照，最后只打开「数据」目录让用户自己挑文件。
+        """
+        store = getattr(self, "store", None)
+        if store is None:
+            QMessageBox.information(self, "未选择工作区", "请先选择工作区再使用此功能。")
+            return
+        password, ok = QInputDialog.getText(
+            self, "用 Excel 打开数据文件",
+            "用 Excel 直接编辑数据文件有风险，需管理员操作。\n\n请输入管理密码：",
+            QLineEdit.Password,
+        )
+        if not ok or not password:
+            return
+        if password != ADMIN_PASSWORD:
+            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
+            return
+        answer = QMessageBox.warning(
+            self, "风险提示",
+            "直接用 Excel 修改数据文件存在风险：\n"
+            "· 本程序不会自动检测外部改动；\n"
+            "· 程序内保存时会整文件重写，可能覆盖你在 Excel 里的修改；\n"
+            "· 改动字段名 / 表头 / 编号可能破坏数据兼容性。\n\n"
+            "建议：编辑期间不要在本程序内改同一数据；改完后「重新打开工作区」或重启程序。\n\n"
+            "是否先创建一个数据快照以便回退？",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Cancel:
+            return
+        if answer == QMessageBox.Yes:
+            try:
+                snapshot = store.create_data_snapshot(
+                    "Excel 外部编辑前快照", "用户用 Excel 打开数据文件前自动快照"
+                )
+                self.statusBar().showMessage(f"已创建数据快照：{snapshot.name}", 5000)
+            except Exception as exc:
+                if QMessageBox.warning(
+                    self, "快照失败",
+                    f"创建数据快照失败：{exc}\n\n仍要继续打开数据目录吗？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                ) != QMessageBox.Yes:
+                    return
+        _open_path(store.data_dir)
+        QMessageBox.information(
+            self, "已打开数据目录",
+            "已打开「数据」目录，请用 Excel 打开其中的 .xlsx 文件编辑。\n\n"
+            "编辑保存后，务必在本程序「重新打开工作区」或重启程序，才能加载最新数据。",
+        )
+
     def _context_delete_voucher(self, voucher: str) -> None:
         password, ok = QInputDialog.getText(
             self, "删除入库编号",
@@ -1919,7 +2163,7 @@ class SpecimenWindow(QMainWindow):
         )
         if not ok or not password:
             return
-        if password != "123":
+        if password != ADMIN_PASSWORD:  # 旧：password != "123"，改引用常量，值不变
             QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
             return
         answer = QMessageBox.warning(
@@ -1953,7 +2197,7 @@ class SpecimenWindow(QMainWindow):
         )
         if not ok or not password:
             return
-        if password != "123":
+        if password != ADMIN_PASSWORD:  # 旧：password != "123"，改引用常量，值不变
             QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
             return
         # 二次确认
@@ -2216,6 +2460,16 @@ class SpecimenWindow(QMainWindow):
     def delete_photo_at(self, photo_index: int) -> None:
         if not self.current_voucher or not self.current_photos:
             return
+        if not (0 <= photo_index < len(self.current_photos)):
+            return
+        # 旧逻辑：单张取消关联点了立即生效、无确认。按需求加确认弹窗，
+        # 文案说明只取消关联、不删原始照片（所有单张路径都经此方法，统一一处）。
+        if QMessageBox.question(
+            self, "取消关联",
+            "确定取消关联这张照片吗？\n\n仅取消该照片与本入库编号的关联，不会删除原始照片。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
         self.store.delete_photo(self.current_voucher, photo_index)
         self.current_photos = self.store.get_photos(self.current_voucher)
         self.current_photo_index = min(photo_index, max(0, len(self.current_photos) - 1))
@@ -2382,9 +2636,14 @@ class SpecimenWindow(QMainWindow):
             menu.addAction("打开原图", lambda: self.open_current_photo_external(real_rows[0]))
             menu.addAction("打开原图所在位置", lambda: self.open_photo_location(real_rows[0]))
             menu.addAction("替换此照片", self._replace_current_photo)
-            menu.addAction("删除此照片", self.delete_photo)
+            # 旧标签「删除此照片」/「删除选中的 N 张照片」——实为取消关联，原始照片不动。
+            menu.addAction("取消关联此照片", self.delete_photo)
         else:
-            menu.addAction(f"删除选中的 {len(rows)} 张照片", self._delete_selected_photos)
+            menu.addAction(f"取消关联选中的 {len(rows)} 张照片", self._delete_selected_photos)
+        # 「移动到其他编号」：原本只有工具栏「分配入库编号」入口，入库汇总精简后
+        # 把照片「移动到」能力补进右键菜单（复用已存在的 _assign_voucher_to_selected）。
+        menu.addSeparator()
+        menu.addAction("移动到其他编号", self._assign_voucher_to_selected)
         menu.exec_(self.photo_table.viewport().mapToGlobal(pos))
 
     def _copy_photo_filename(self, real_idx: int) -> None:
@@ -2481,15 +2740,22 @@ class SpecimenWindow(QMainWindow):
     def _delete_selected_photos(self) -> None:
         if not self.current_voucher or not self.current_photos:
             return
-        rows = sorted(set(idx.row() for idx in self.photo_table.selectedItems()), reverse=True)
-        if not rows:
-            return
-        real_indices = [self._photo_page * self._photo_page_size + r for r in rows]
-        real_indices = [i for i in real_indices if 0 <= i < len(self.current_photos)]
+        # 宫格模式：用宫格多选集合；列表模式：用 photo_table 选中行（旧逻辑）。
+        if self._is_grid_mode():
+            real_indices = [i for i in sorted(self._grid_selected_indices) if 0 <= i < len(self.current_photos)]
+        else:
+            rows = sorted(set(idx.row() for idx in self.photo_table.selectedItems()), reverse=True)
+            if not rows:
+                return
+            real_indices = [self._photo_page * self._photo_page_size + r for r in rows]
+            real_indices = [i for i in real_indices if 0 <= i < len(self.current_photos)]
         if not real_indices:
             return
+        # 旧文案：标题「批量删除」/「确定删除选中的 N 张照片？」——措辞像删文件。
+        # 实为取消关联（原始照片不动），改名澄清。
         answer = QMessageBox.question(
-            self, "批量删除", f"确定删除选中的 {len(real_indices)} 张照片？",
+            self, "批量取消关联",
+            f"确定取消关联选中的 {len(real_indices)} 张照片吗？\n\n仅取消关联，不会删除原始照片。",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if answer != QMessageBox.Yes:
@@ -2523,6 +2789,8 @@ class SpecimenWindow(QMainWindow):
     def _on_view_mode_changed(self, text: str) -> None:
         self._grid_mode_before_expand = ""
         self._return_grid_btn.hide()
+        # 手动切模式后，单张视图双击恢复为 适配↔100%（不再返回宫格）。
+        self.photo_view.set_double_click_returns(False)
         self._view_mode = text
         self._save_current_photo_view_state()
         self.load_current_photo()
@@ -2651,6 +2919,9 @@ class SpecimenWindow(QMainWindow):
         # 改为基于实际照片数自适应：1→1×1, 2→2×1, 3-4→2×2, 5-6→3×2, 7-8→4×2
         cols, rows = grid_shape(len(page_indices))
 
+        # 重新渲染宫格时，多选状态重置为当前张（翻页/切 voucher/切宫格数后无残留）。
+        self._grid_selected_indices = {self.current_photo_index}
+
         self.photo_view.hide()
         self._placeholder_label.hide()
         self.grid_frame.show()
@@ -2664,7 +2935,9 @@ class SpecimenWindow(QMainWindow):
             label.double_clicked.connect(self._on_grid_cell_double_clicked)
             label.right_clicked.connect(self._show_grid_context_menu)
             label.zoom_changed.connect(self._on_grid_cell_zoom_changed)
-            label.set_selected(photo_index == self.current_photo_index)
+            # 旧逻辑：label.set_selected(photo_index == self.current_photo_index)
+            # 现支持多选，按集合判断高亮。
+            label.set_selected(photo_index in self._grid_selected_indices)
             path = self.store.resolve_photo_path(photo)
             filename = str(photo.get("文件名", ""))
             label.set_filename(filename)
@@ -2703,6 +2976,24 @@ class SpecimenWindow(QMainWindow):
         if photo_index < 0 or photo_index >= len(self.current_photos):
             return
         self._flush_pending_saves()
+        # 宫格多选：Ctrl 切换单格、Shift 范围选（限当前宫格页）、无修饰键单选。
+        mods = QApplication.keyboardModifiers()
+        count = self._grid_count()
+        page_start = (self.current_photo_index // count) * count
+        page_end = min(page_start + count, len(self.current_photos))
+        page_range = set(range(page_start, page_end))
+        if mods & Qt.ControlModifier:
+            if photo_index in self._grid_selected_indices:
+                self._grid_selected_indices.discard(photo_index)
+            else:
+                self._grid_selected_indices.add(photo_index)
+            if not self._grid_selected_indices:  # 不允许空集
+                self._grid_selected_indices.add(photo_index)
+        elif mods & Qt.ShiftModifier:
+            lo, hi = sorted((self.current_photo_index, photo_index))
+            self._grid_selected_indices |= (set(range(lo, hi + 1)) & page_range)
+        else:
+            self._grid_selected_indices = {photo_index}
         self.current_photo_index = photo_index
         self._select_photo_table_row()
         self._populate_photo_fields(self.current_photos[photo_index])
@@ -2723,8 +3014,9 @@ class SpecimenWindow(QMainWindow):
             widget.blockSignals(False)
 
     def _refresh_grid_selection(self) -> None:
+        # 旧逻辑：仅高亮 current_photo_index 一格；现按多选集合高亮。
         for cell in self._grid_labels:
-            cell.set_selected(cell.photo_index == self.current_photo_index)
+            cell.set_selected(cell.photo_index in self._grid_selected_indices)
 
     def _current_grid_cell(self) -> GridPhotoCell | None:
         for cell in self._grid_labels:
@@ -2733,30 +3025,68 @@ class SpecimenWindow(QMainWindow):
         return None
 
     def _show_grid_context_menu(self, photo_index: int, event) -> None:
+        # 右键未选中的格：仿 photo_table，先把它设为唯一选中再出菜单。
+        if photo_index not in self._grid_selected_indices:
+            self._grid_selected_indices = {photo_index}
+            self.current_photo_index = photo_index
+            self._refresh_grid_selection()
+        indices = sorted(self._grid_selected_indices)
         menu = QMenu(self)
-        menu.addAction("放大显示", lambda: self.enlarge_photo_from_grid(photo_index))
-        menu.addAction("打开原图", lambda: self.open_current_photo_external(photo_index))
-        menu.addAction("打开原图所在位置", lambda: self.open_photo_location(photo_index))
-        menu.addAction("分配入库编号", self._assign_voucher_to_selected)
-        menu.addAction("删除照片", lambda: self.delete_photo_at(photo_index))
+        if len(indices) == 1:
+            idx = indices[0]
+            self.current_photo_index = idx  # 替换/放大依赖 current_photo_index
+            menu.addAction("放大显示", lambda: self.enlarge_photo_from_grid(idx))
+            menu.addAction("打开原图", lambda: self.open_current_photo_external(idx))
+            menu.addAction("打开原图所在位置", lambda: self.open_photo_location(idx))
+            menu.addAction("替换此照片", self._replace_current_photo)
+            # 旧标签「删除此照片」——实为取消关联（原始照片不动）。
+            menu.addAction("取消关联此照片", lambda: self.delete_photo_at(idx))
+            menu.addAction("移动到其他编号", self._assign_voucher_to_selected)
+            menu.addSeparator()
+            fill_action = menu.addAction("从照片文件名填充标本信息", lambda: self.fill_photo_from_filename(idx))
+            if self._photo_filename_fill_action is not None:
+                fill_action.setShortcut(self._photo_filename_fill_action.shortcut())
+            menu.addAction("复制相对路径", lambda: self.copy_photo_relative_path(idx))
+            menu.addAction("复制绝对路径", lambda: self.copy_photo_absolute_path(idx))
+        else:
+            menu.addAction("打开原图", lambda: self.open_current_photo_external(indices[0]))
+            menu.addAction(f"取消关联选中的 {len(indices)} 张照片", self._delete_selected_photos)
+            menu.addAction("移动到其他编号", self._assign_voucher_to_selected)
+        menu.exec_(event.globalPos())
+
+    def _show_single_preview_context_menu(self, global_pos) -> None:
+        """单张预览右键菜单：对 current_photo_index 出照片管理菜单。"""
+        if not self.current_photos:
+            return
+        idx = self.current_photo_index
+        if idx < 0 or idx >= len(self.current_photos):
+            return
+        menu = QMenu(self)
+        menu.addAction("打开原图", lambda: self.open_current_photo_external(idx))
+        menu.addAction("打开原图所在位置", lambda: self.open_photo_location(idx))
+        menu.addAction("替换此照片", self._replace_current_photo)
+        # 旧标签「删除此照片」——实为取消关联（原始照片不动）。
+        menu.addAction("取消关联此照片", lambda: self.delete_photo_at(idx))
+        menu.addAction("移动到其他编号", self._assign_voucher_to_selected)
         menu.addSeparator()
-        fill_action = menu.addAction("从照片文件名填充标本信息", lambda: self.fill_photo_from_filename(photo_index))
+        fill_action = menu.addAction("从照片文件名填充标本信息", lambda: self.fill_photo_from_filename(idx))
         if self._photo_filename_fill_action is not None:
             fill_action.setShortcut(self._photo_filename_fill_action.shortcut())
-        menu.addAction("复制相对路径", lambda: self.copy_photo_relative_path(photo_index))
-        menu.addAction("复制绝对路径", lambda: self.copy_photo_absolute_path(photo_index))
-        menu.exec_(event.globalPos())
+        menu.addAction("复制相对路径", lambda: self.copy_photo_relative_path(idx))
+        menu.addAction("复制绝对路径", lambda: self.copy_photo_absolute_path(idx))
+        if self._grid_mode_before_expand:
+            menu.addSeparator()
+            menu.addAction("返回宫格", self.return_to_grid)
+        menu.exec_(global_pos)
 
     def _get_selected_photo_indices(self) -> list[int]:
         """Return list of currently selected photo indices across all views."""
         if not self.current_photos:
             return []
         if self._is_grid_mode():
-            # In grid mode, use the current_photo_index (grid shows one page)
-            count = self._grid_count()
-            start = (self.current_photo_index // count) * count
-            page_indices = list(range(start, min(start + count, len(self.current_photos))))
-            return [page_indices[self.current_photo_index % count]] if page_indices else []
+            # 旧逻辑：宫格单选，按 page 窗口取 current_photo_index 一个。
+            # 现宫格支持 Ctrl/Shift 多选，返回选中集合（空则回退当前张）。
+            return sorted(self._grid_selected_indices) or [self.current_photo_index]
         else:
             return [self.current_photo_index]
 
@@ -2909,7 +3239,9 @@ class SpecimenWindow(QMainWindow):
         if not is_supported_image(path):
             QMessageBox.critical(self, "安全限制", "仅支持打开图片文件。")
             return
-        _open_path(path)
+        # 旧逻辑：_open_path(path) 直接系统默认程序；现走 open_image_external —— 优先用
+        # 设置里的自定义图片查看器，未设/无效则回退系统默认。
+        open_image_external(path)
 
     def enlarge_photo_from_grid(self, photo_index: int) -> None:
         if photo_index < 0 or photo_index >= len(self.current_photos):
@@ -2920,6 +3252,8 @@ class SpecimenWindow(QMainWindow):
         self._view_mode = "单张"
         self._sync_view_buttons(1)
         self._return_grid_btn.show()
+        # 此状态下单张视图双击 -> 返回原宫格（见 PhotoGraphicsView.return_requested）。
+        self.photo_view.set_double_click_returns(True)
         self.refresh_photo_table()
         self.load_current_photo()
 
@@ -2936,6 +3270,8 @@ class SpecimenWindow(QMainWindow):
                 break
         self._sync_view_buttons(count)
         self._return_grid_btn.hide()
+        # 回到宫格，单张视图双击恢复为 适配↔100%。
+        self.photo_view.set_double_click_returns(False)
         self._save_current_photo_view_state()
         self.load_current_photo()
 
@@ -3101,7 +3437,8 @@ class SpecimenWindow(QMainWindow):
         if not target:
             return
         target_path = Path(target).resolve()
-        if target_path == self.workspace_root:
+        # self.store 为 None 时（未绑定的首次启动窗口）没有"当前工作区"，跳过相等判断。
+        if self.store is not None and target_path == self.workspace_root:
             return
         if self.manager is not None and self.manager.focus_workspace(target_path, exclude=self):
             self.statusBar().showMessage("该工作区已在其他窗口打开", 3000)
@@ -3110,6 +3447,16 @@ class SpecimenWindow(QMainWindow):
             QMessageBox.critical(
                 self, "不能使用软件目录",
                 f"不能把 build/dist/releases 等软件构建或版本目录作为工作区：\n{target_path}\n\n请选择实际保存数据和照片的工作目录。",
+            )
+            return
+        # 与 _prepare_workspace_candidate 对齐：拒绝文件系统根/盘符根/用户主目录。
+        # 旧逻辑：switch_workspace 缺此检查，仅 __init__ 的工作区准备路径有。
+        if is_unsafe_workspace_root(target_path):
+            QMessageBox.critical(
+                self, "目录范围过大",
+                f"不能把文件系统根目录、盘符根目录或用户主目录作为工作区：\n{target_path}\n\n"
+                "这类目录过大，软件的全工作区扫描（如图片索引）会遍历海量文件、可能拖垮电脑。\n"
+                "请选择实际保存数据和照片的子目录。",
             )
             return
         create_workspace_files = False
@@ -3122,22 +3469,55 @@ class SpecimenWindow(QMainWindow):
                 return
             initialize_workspace(target_path, self._template_source_for_initialization(target_path))
             create_workspace_files = True
+        self._load_workspace_into_window(target_path, create_workspace_files)
+
+    def _load_workspace_into_window(self, target_path: Path, create_files: bool) -> bool:
+        """把工作区载入当前窗口：构建 ExcelStore 并替换 self.store、刷新所有相关状态。
+
+        由 switch_workspace（切换工作区）和首次启动的 _prompt_initial_workspace 共用。
+        返回是否成功载入。
+        """
+        # ExcelStore 构建 + 锁处理。锁处理逻辑原本只在 __init__ 里，这里并入，
+        # 让首次启动的工作区选择也能处理"工作区被占用"。
         try:
-            new_store = ExcelStore(target_path, lock=True, create_if_missing=create_workspace_files)
+            new_store = ExcelStore(target_path, lock=True, create_if_missing=create_files)
+        except WorkspaceLockedError as exc:
+            lock_path = target_path / "数据" / ".workspace.lock"
+            msg = f'{exc}\n\n如果软件已退出但仍然被占用，可以点击"强制解锁"。'
+            btn = QMessageBox.critical(self, "工作区被占用", msg, QMessageBox.Abort | QMessageBox.Retry)
+            if btn == QMessageBox.Retry and lock_path.exists():
+                try:
+                    lock_path.unlink()
+                    new_store = ExcelStore(target_path, lock=True, create_if_missing=create_files)
+                except Exception as exc2:
+                    QMessageBox.critical(self, "切换失败", str(exc2))
+                    return False
+            else:
+                return False
+        except WorkspaceNotInitializedError as exc:
+            QMessageBox.critical(self, "工作区未初始化", str(exc))
+            return False
         except Exception as exc:
             QMessageBox.critical(self, "切换失败", str(exc))
-            return
-        if self.manager is not None:
-            self.manager.unregister(self)
-        self.store.close()
+            return False
+        # 未绑定窗口此前没有 store、也未注册过工作区，跳过 unregister/close。
+        if self.store is not None:
+            if self.manager is not None:
+                self.manager.unregister(self)
+            self.store.close()
         self.store = new_store
         self.workspace_root = target_path
         self.matcher = SpeciesMatcher(self.workspace_root / "字段模版" / "表格信息预设字段.xlsx")
-        self.thumbnail_cache.set_workspace(self.workspace_root)
+        # thumbnail_cache：未绑定启动时为 None，这里首次创建。
+        if self.thumbnail_cache is None:
+            self.thumbnail_cache = ThumbnailCache(self.workspace_root)
+        else:
+            self.thumbnail_cache.set_workspace(self.workspace_root)
         self.search_index = None
         clear_image_index()
         QTimer.singleShot(300, self._build_search_index_background)
-        self._thumb_worker.stop()
+        if self._thumb_worker is not None:
+            self._thumb_worker.stop()
         self._thumb_worker = ThumbnailWorker(self.thumbnail_cache, self)
         self._thumb_worker.result_ready.connect(self._on_thumbnail_ready)
         self._thumb_worker.start()
@@ -3164,6 +3544,7 @@ class SpecimenWindow(QMainWindow):
                 w.blockSignals(False)
             self._loading = False
             self.load_current_photo()
+        return True
 
     def open_new_window(self) -> None:
         if self.manager is not None:
@@ -3182,8 +3563,17 @@ class SpecimenWindow(QMainWindow):
         dlg.exec_()
 
     def open_ingest_summary(self) -> None:
+        # 旧逻辑：dlg = IngestSummaryDialog(self); dlg.exec_()（模态，每次新建）。
+        # 现改为非模态、单实例：已开着就刷新并聚焦，否则新建 show()。
+        dlg = getattr(self, "_ingest_summary_dialog", None)
+        if dlg is not None and dlg.isVisible():
+            dlg._refresh()
+            dlg.raise_()
+            dlg.activateWindow()
+            return
         dlg = IngestSummaryDialog(self)
-        dlg.exec_()
+        self._ingest_summary_dialog = dlg
+        dlg.show()
 
     def _open_action_log(self) -> None:
         dlg = ActionLogDialog(self)
@@ -3260,11 +3650,68 @@ class SpecimenWindow(QMainWindow):
             mode_key = dlg.photo_management_combo.currentData()
             current_settings.photo_management_mode = mode_key if mode_key in PHOTO_MANAGEMENT_OPTIONS else "copy_with_absolute"
             current_settings.photo_library_path = dlg.photo_library_edit.text().strip()
+            current_settings.image_viewer_path = dlg.image_viewer_path
             current_settings.photo_filename_fill_shortcut = dlg.photo_filename_fill_shortcut
             current_settings.check_updates_on_startup = dlg.check_updates_box.isChecked()
+            current_settings.ui_font_size = dlg.font_size
             save_settings(current_settings)
             self._cached_preview_quality = current_settings.preview_quality
             self._apply_photo_filename_fill_shortcut()
+            # 应用全局字体大小并刷新所有窗口的表格字体/列宽。
+            apply_app_font_size(current_settings.ui_font_size)
+            self._refresh_all_windows_fonts()
+
+    # ---- 全局字体缩放 ----
+
+    def _refresh_scaled_fonts(self) -> None:
+        """按当前全局字号设置 voucher_table 字体与列宽（默认字号时与旧版一致）。"""
+        table = getattr(self, "voucher_table", None)
+        if table is None:
+            return
+        app = QApplication.instance()
+        cur_pt = app.font().pointSize() if app is not None else self._VOUCHER_TABLE_BASE_PT
+        base_pt = _default_app_font_point or cur_pt
+        delta = cur_pt - base_pt
+        table_pt = max(6, self._VOUCHER_TABLE_BASE_PT + delta)
+        table.setFont(QFont("Consolas", table_pt))
+        scale = table_pt / self._VOUCHER_TABLE_BASE_PT
+        for col, base in enumerate(self._VOUCHER_COL_BASE_WIDTHS):
+            table.setColumnWidth(col, max(base, int(base * scale)))
+
+    def _refresh_all_windows_fonts(self) -> None:
+        """刷新所有打开窗口的缩放字体（app.setFont 已全局生效，这里补表格字体/列宽）。"""
+        windows = list(self.manager._windows.values()) if self.manager is not None else [self]
+        for win in windows:
+            try:
+                win._refresh_scaled_fonts()
+            except Exception:
+                pass
+
+    def _zoom_font(self, delta: int) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        new_size = max(7, min(24, app.font().pointSize() + delta))
+        apply_app_font_size(new_size)
+        try:
+            settings = load_settings()
+            settings.ui_font_size = new_size
+            save_settings(settings)
+        except Exception:
+            pass  # 持久化失败不影响本次会话
+        self._refresh_all_windows_fonts()
+        self.statusBar().showMessage(f"界面字体大小：{new_size} pt", 2000)
+
+    def _zoom_font_reset(self) -> None:
+        apply_app_font_size(0)  # 0 -> 恢复系统默认字号
+        try:
+            settings = load_settings()
+            settings.ui_font_size = 0
+            save_settings(settings)
+        except Exception:
+            pass
+        self._refresh_all_windows_fonts()
+        self.statusBar().showMessage("界面字体大小已恢复默认", 2000)
 
     # ---- Panel helpers ----
 
@@ -3943,10 +4390,22 @@ class PhotoBatchDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 class IngestSummaryDialog(QDialog):
-    """入库汇总预览 — paginated voucher-photo audit with password-protected edits."""
+    """入库汇总预览 — 非模态、单实例的只读宽表（Excel 式汇总视图）。
+
+    重构历史（详见 git）：原本左=可编辑宽表、右上=只读文字详情面板、右下=照片网格+
+    照片操作（替换/取消关联/移动/打开原图）+拖拽替换。按需求改为：
+    - 删除右上详情面板（与宽表冗余）；
+    - 删除右下照片网格及全部照片操作 —— 照片管理改由主窗口照片面板右键菜单负责；
+    - 宽表改只读，双击行 -> 跳主窗口编辑器（_on_voucher_double_clicked）；
+    - 改非模态、单实例（见 SpecimenWindow.open_ingest_summary）。
+    随之删除的方法：_populate_detail / _on_voucher_selected / _on_cell_changed /
+    _update_row_cells / _require_password / _render_photo_grid / _set_thumb_size /
+    _toggle_photo_selection / _on_overview_thumbnail / _open_selected_original /
+    _unlink_selected / _move_selected / _replace_selected_photo / _jump_to_specimen /
+    _overview_drag_* / _overview_drop。
+    """
 
     PAGE_SIZE = 100
-    DEFAULT_PASSWORD = "123"
 
     def __init__(self, app: SpecimenWindow):
         super().__init__(app)
@@ -3962,8 +4421,6 @@ class IngestSummaryDialog(QDialog):
         self._build_photo_counts()
 
         # 入库汇总宽表：把分散在多个 Excel 的字段 join 成一张表（纯内存视图）。
-        # 原代码逐编号 get_specimen/get_photos 构建搜索映射；现在统一从 summary_records() 取，
-        # 既支撑宽表展示/编辑/导出，也提供搜索所需的 管内编号 / 照片文件名。
         self._summary_records: list[dict] = self.store.summary_records()
         self._record_by_voucher: dict[str, dict] = {
             r["入库编号*"]: r for r in self._summary_records
@@ -3971,20 +4428,11 @@ class IngestSummaryDialog(QDialog):
         # 按列筛选条件：column -> 允许的显示值集合；与顶部全局搜索叠加。
         self._summary_filters: dict[str, set[str]] = {}
         self._search_text = ""
-        self._loading = False  # 抑制 itemChanged 在程序填表时误触发回写
+        # 导入的入库编号列表筛选：None=未启用；非 None=只显示集合内编号。
+        self._voucher_list_filter: set[str] | None = None
 
         self.filtered_vouchers: list[str] = list(self.all_vouchers)
         self.current_page = 0
-        self.selected_voucher: str | None = None
-        self._selected_photos: list[dict[str, str]] = []
-        self._selected_photo_indices: set[int] = set()
-        self._password_verified = False
-
-        self._thumb_worker = ThumbnailWorker(app.thumbnail_cache, self)
-        self._thumb_worker.result_ready.connect(self._on_overview_thumbnail)
-        self._thumb_worker.start()
-        self._card_labels: dict[int, QLabel] = {}
-        self._overview_cards: list[QFrame] = []
 
         self._build_ui()
         self._load_page(0)
@@ -4006,7 +4454,11 @@ class IngestSummaryDialog(QDialog):
     # ---- UI build ----
 
     def _build_ui(self) -> None:
+        self.setObjectName("ingestSummaryDialog")
         layout = QVBoxLayout(self)
+        # 旧布局：默认边距/间距，搜索导航全挤一行。现统一边距 + 拆行（见下），更清爽。
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
 
         # Stats bar
         stats = QHBoxLayout()
@@ -4015,123 +4467,78 @@ class IngestSummaryDialog(QDialog):
         stats.addStretch()
         layout.addLayout(stats)
 
-        # Search + page nav
-        nav = QHBoxLayout()
-        nav.addWidget(QLabel("搜索"))
+        # 旧布局：搜索框/范围/导入/页码/上下页/列设置全挤一行。现拆两行更清爽：
+        # 第 1 行 = 搜索区，第 2 行 = 分页 + 列设置。控件、信号全部不变。
+        search_row = QHBoxLayout()
+        search_row.setSpacing(6)
+        search_row.addWidget(QLabel("搜索"))
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("输入关键词筛选...")
         self.search_edit.textChanged.connect(self._on_search_changed)
-        nav.addWidget(self.search_edit, stretch=1)
+        search_row.addWidget(self.search_edit, stretch=1)
         # 搜索范围选择器：与主凭证列表一致的 4 个选项
         self._search_scope = QComboBox()
         self._search_scope.addItems(["全部", "入库编号", "管内编号", "照片名"])
         self._search_scope.setFixedWidth(80)
         self._search_scope.currentIndexChanged.connect(lambda: self._on_search_changed(self.search_edit.text()))
-        nav.addWidget(self._search_scope)
+        search_row.addWidget(self._search_scope)
+        # 「导入编号列表」：粘贴 / 从 txt·csv·xlsx 载入一份入库编号，汇总表只显示列表内编号。
+        self._make_btn("导入编号列表", self._open_voucher_list_filter, search_row)
+        layout.addLayout(search_row)
+
+        nav = QHBoxLayout()
+        nav.setSpacing(6)
+        self._make_btn("上一页", self._prev_page, nav)
         self.page_label = QLabel()
         nav.addWidget(self.page_label)
-        self._make_btn("上一页", self._prev_page, nav)
         self._make_btn("下一页", self._next_page, nav)
+        nav.addStretch()
+        # 「列设置」：开关右侧列选择面板（默认隐藏，可关闭）。
+        self._make_btn("列设置", self._toggle_column_panel, nav)
         layout.addLayout(nav)
 
-        # Main splitter: voucher wide table | (detail panel + photo grid)
-        splitter = QSplitter(Qt.Horizontal)
-
-        # Left: voucher wide table（汇总宽表）
-        # 原代码是固定 3 列、不可编辑的列表；现在改为 SUMMARY_COLUMNS 全字段宽表，
-        # 列可显隐、可排序、可按列筛选，可编辑列直接改单元格回写（密码门控）。
+        # 汇总宽表：SUMMARY_COLUMNS 全字段，占满窗口。
+        # 旧布局：左=可编辑宽表 + 右侧详情面板/照片网格的 QSplitter；
+        # 现改为只读宽表占满（详情冗余、照片管理移至主窗口）。
+        # 旧 edit triggers：DoubleClicked | EditKeyPressed（内联编辑）；现 NoEditTriggers（只读）。
         self.voucher_table = QTableWidget(0, len(SUMMARY_COLUMNS))
         self.voucher_table.setHorizontalHeaderLabels(SUMMARY_COLUMNS)
         self.voucher_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.voucher_table.setSelectionMode(QTableWidget.SingleSelection)
-        # 可编辑性由各单元格 flags 控制（只读列不带 ItemIsEditable）。
-        self.voucher_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
+        # 旧：SingleSelection（只读宽表只单选）。按需求改 ExtendedSelection，与 Windows
+        # 资源管理器一致：Ctrl 点选加选、Shift 范围选、拖选范围；双击跳主窗口行为不变。
+        self.voucher_table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.voucher_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.voucher_table.setSortingEnabled(True)
-        self.voucher_table.itemSelectionChanged.connect(self._on_voucher_selected)
-        self.voucher_table.itemChanged.connect(self._on_cell_changed)
+        # 旧：itemSelectionChanged -> 详情面板/照片网格；itemChanged -> 内联回写。
+        # 现：双击行 -> 跳主窗口编辑器。
+        self.voucher_table.cellDoubleClicked.connect(self._on_voucher_double_clicked)
         _header = self.voucher_table.horizontalHeader()
         _header.setContextMenuPolicy(Qt.CustomContextMenu)
-        _header.customContextMenuRequested.connect(self._header_context_menu)
+        # 旧逻辑：只有表头能右键出菜单。现表头 + 表体都接到统一的 _voucher_column_menu。
+        _header.customContextMenuRequested.connect(
+            lambda pos: self._voucher_column_menu(pos, from_header=True)
+        )
+        self.voucher_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.voucher_table.customContextMenuRequested.connect(
+            lambda pos: self._voucher_column_menu(pos, from_header=False)
+        )
         self._apply_visible_columns()
-        splitter.addWidget(self.voucher_table)
 
-        # Right: 上=详情面板，下=照片网格（竖向 splitter）
-        right_splitter = QSplitter(Qt.Vertical)
+        # 表格 + 右侧列选择面板（面板默认隐藏，「列设置」按钮开关）。
+        table_row = QHBoxLayout()
+        table_row.addWidget(self.voucher_table, stretch=1)
+        table_row.addWidget(self._build_column_panel())
+        layout.addLayout(table_row, stretch=1)
 
-        # 详情面板：只读展示选中入库编号的全部汇总字段
-        self.detail_scroll = QScrollArea()
-        self.detail_scroll.setWidgetResizable(True)
-        _detail_container = QWidget()
-        self.detail_form = QFormLayout(_detail_container)
-        self._detail_labels: dict[str, QLabel] = {}
-        for _col in SUMMARY_COLUMNS:
-            _lbl = QLabel("")
-            _lbl.setWordWrap(True)
-            _lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            self._detail_labels[_col] = _lbl
-            self.detail_form.addRow(f"{_col}：", _lbl)
-        self._detail_photos_label = QLabel("")
-        self._detail_photos_label.setWordWrap(True)
-        self._detail_photos_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.detail_form.addRow("照片文件名：", self._detail_photos_label)
-        self.detail_scroll.setWidget(_detail_container)
-        right_splitter.addWidget(self.detail_scroll)
-
-        # Right-bottom: photo grid
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        self.photo_count_label = QLabel("选择左侧编号查看照片")
-        size_row = QHBoxLayout()
-        size_row.addWidget(self.photo_count_label, stretch=1)
-        size_row.addWidget(QLabel("缩略图"))
-        self._thumb_sizes = {"小": (120, 90), "中": (180, 135), "大": (240, 180)}
-        self._thumb_size_key = "中"
-        for key in ("小", "中", "大"):
-            btn = QPushButton(key)
-            btn.setFixedWidth(32)
-            btn.setCheckable(True)
-            btn.setChecked(key == self._thumb_size_key)
-            btn.clicked.connect(lambda checked, k=key: self._set_thumb_size(k))
-            size_row.addWidget(btn)
-        right_layout.addLayout(size_row)
-        self.overview_scroll = QScrollArea()
-        self.overview_scroll.setWidgetResizable(True)
-        self.overview_container = QWidget()
-        self.overview_grid = QGridLayout(self.overview_container)
-        self.overview_grid.setSpacing(4)
-        self.overview_scroll.setWidget(self.overview_container)
-        right_layout.addWidget(self.overview_scroll, stretch=1)
-
-        # Actions
-        actions = QHBoxLayout()
-        self._make_btn("打开原图", self._open_selected_original, actions)
-        self._make_btn("替换照片", self._replace_selected_photo, actions)
-        self._make_btn("取消关联", self._unlink_selected, actions)
-        self._make_btn("移动到...", self._move_selected, actions)
-        self._make_btn("跳转到标本", self._jump_to_specimen, actions)
-        right_layout.addLayout(actions)
-        # Drag-drop support for photo replacement
-        self.overview_scroll.setAcceptDrops(True)
-        self.overview_scroll.dragEnterEvent = self._overview_drag_enter
-        self.overview_scroll.dragMoveEvent = self._overview_drag_move
-        self.overview_scroll.dragLeaveEvent = self._overview_drag_leave
-        self.overview_scroll.dropEvent = self._overview_drop
-        right_splitter.addWidget(right)
-        right_splitter.setSizes([240, 420])
-        splitter.addWidget(right_splitter)
-
-        splitter.setSizes([520, 540])
-        layout.addWidget(splitter, stretch=1)
-
-        # Bottom：状态提示 + 导出 + 关闭
-        # 原代码只有"关闭"按钮，且照片操作里引用了未创建的 self.status_label（隐性 bug）；
-        # 这里补上 status_label，并新增导出 Excel / CSV。
+        # Bottom：状态提示靠左；操作簇（刷新/导出）与「关闭」用 addSpacing 拉开分区。
         bottom = QHBoxLayout()
-        self.status_label = QLabel("")
+        bottom.setSpacing(6)
+        self.status_label = QLabel("双击某行可跳转到主窗口编辑该入库编号")
         bottom.addWidget(self.status_label, stretch=1)
+        self._make_btn("刷新", self._refresh, bottom)
         self._make_btn("导出 Excel", self._export_excel, bottom)
         self._make_btn("导出 CSV", self._export_csv, bottom)
+        bottom.addSpacing(16)
         self._make_btn("关闭", self.close, bottom)
         layout.addLayout(bottom)
 
@@ -4151,9 +4558,19 @@ class IngestSummaryDialog(QDialog):
             f"入库编号：{len(self.all_vouchers)} 个  |  已入库照片：{self._total_photos} 张"
         )
 
+    @staticmethod
+    def _summary_cell_text(value) -> str:
+        """统一把记录值转成显示字符串：照片聚合列是 list -> "; " 拼接，其余 str()。"""
+        if isinstance(value, list):
+            return "; ".join(str(v) for v in value)
+        return str(value)
+
     def _make_cell(self, col: str, record: dict) -> QTableWidgetItem:
-        """构造一个汇总宽表单元格；只读列去掉 ItemIsEditable，照片数列用数值排序。"""
-        category, _ = SUMMARY_COLUMN_SOURCE[col]
+        """构造一个汇总宽表单元格；宽表已改全只读，照片数列用数值排序。
+
+        旧逻辑：按 SUMMARY_COLUMN_SOURCE 的 category 决定单元格是否带 ItemIsEditable；
+        现在宽表整体只读（编辑改到主窗口），所有单元格统一去掉 ItemIsEditable。
+        """
         value = record.get(col, "")
         item = QTableWidgetItem()
         if col == PHOTO_COUNT_COLUMN:
@@ -4162,11 +4579,11 @@ class IngestSummaryDialog(QDialog):
             except (TypeError, ValueError):
                 item.setText(str(value))
         else:
-            item.setText(str(value))
-        if category == "readonly":
-            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-        else:
-            item.setFlags(item.flags() | Qt.ItemIsEditable)
+            # 照片聚合列是 list -> 拼接显示，并用 tooltip 逐行展示全量。
+            item.setText(self._summary_cell_text(value))
+            if isinstance(value, list) and value:
+                item.setToolTip("\n".join(str(v) for v in value))
+        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
         return item
 
     def _load_page(self, page: int) -> None:
@@ -4175,8 +4592,8 @@ class IngestSummaryDialog(QDialog):
         end = start + self.PAGE_SIZE
         page_vouchers = self.filtered_vouchers[start:end]
 
-        # 填表期间关排序 + 置 _loading，避免 itemChanged / 排序错乱。
-        self._loading = True
+        # 填表期间关排序，避免排序错乱。（旧代码另置 _loading 抑制 itemChanged 回写，
+        # 宽表已改只读、无 itemChanged 连接，_loading 不再需要。）
         self.voucher_table.setSortingEnabled(False)
         self.voucher_table.setRowCount(0)
         self.voucher_table.setRowCount(len(page_vouchers))
@@ -4185,7 +4602,6 @@ class IngestSummaryDialog(QDialog):
             for col_idx, col in enumerate(SUMMARY_COLUMNS):
                 self.voucher_table.setItem(i, col_idx, self._make_cell(col, record))
         self.voucher_table.setSortingEnabled(True)
-        self._loading = False
 
         self.voucher_table.resizeColumnsToContents()
         self.page_label.setText(
@@ -4217,6 +4633,9 @@ class IngestSummaryDialog(QDialog):
         result: list[str] = []
         for record in self._summary_records:
             voucher = record["入库编号*"]
+            # 导入的编号列表筛选：与全局搜索、列筛选叠加；None=未启用。
+            if self._voucher_list_filter is not None and voucher not in self._voucher_list_filter:
+                continue
             if query:
                 tube = record.get("管内编号*", "").lower()
                 names = [str(n).lower() for n in record.get("照片文件名", [])]
@@ -4236,102 +4655,193 @@ class IngestSummaryDialog(QDialog):
                     continue
             # 按列筛选：每个被筛选列的显示值必须落在允许集合内
             if not all(
-                str(record.get(col, "")) in allowed
+                self._summary_cell_text(record.get(col, "")) in allowed
                 for col, allowed in self._summary_filters.items()
             ):
                 continue
             result.append(voucher)
         self.filtered_vouchers = result
-        self.selected_voucher = None
         self._load_page(0)
 
     def _reload_summary(self) -> None:
-        """数据被修改（编辑单元格 / 照片增删移）后重建汇总记录缓存。"""
+        """重建汇总记录缓存（主窗口改过数据后由 _refresh 调用）。"""
         self._summary_records = self.store.summary_records()
         self._record_by_voucher = {r["入库编号*"]: r for r in self._summary_records}
 
-    # ---- Voucher selection & photo grid ----
+    def _refresh(self) -> None:
+        """重新从 store 拉取最新数据并重算筛选/分页/统计。
 
-    def _on_voucher_selected(self) -> None:
-        rows = self.voucher_table.selectionModel().selectedRows()
-        if not rows:
-            return
-        # 入库编号* 始终是第 0 列；排序后用可视行号取 item 仍正确。
-        voucher_item = self.voucher_table.item(rows[0].row(), 0)
-        if voucher_item is None:
-            return
-        voucher = voucher_item.text()
-        self.selected_voucher = voucher
-        self._populate_detail(voucher)
-        self._selected_photos = self.store.get_photos(voucher)
-        self._render_photo_grid()
-
-    def _populate_detail(self, voucher: str) -> None:
-        """右侧详情面板：只读展示选中入库编号的全部汇总字段 + 照片文件名。"""
-        record = self._record_by_voucher.get(voucher, {})
-        for col, label in self._detail_labels.items():
-            label.setText(str(record.get(col, "")))
-        names = [str(n) for n in record.get("照片文件名", [])]
-        self._detail_photos_label.setText("\n".join(names) if names else "（无）")
-
-    # ---- Cell editing ----
-
-    def _on_cell_changed(self, item: QTableWidgetItem) -> None:
-        """可编辑单元格回写：密码门控 -> store.set_fields（可撤销）-> 刷新行/详情。"""
-        if self._loading:
-            return
-        col = SUMMARY_COLUMNS[item.column()]
-        category, excel_field = SUMMARY_COLUMN_SOURCE[col]
-        if category == "readonly":
-            return
-        voucher_item = self.voucher_table.item(item.row(), 0)
-        if voucher_item is None:
-            return
-        voucher = voucher_item.text()
-        new_value = item.text()
-        old_value = str(self._record_by_voucher.get(voucher, {}).get(col, ""))
-        if new_value == old_value:
-            return
-        if not self._require_password():
-            self._loading = True
-            item.setText(old_value)
-            self._loading = False
-            return
-        try:
-            # classification 的"分类备注"映射回真实列名"备注"已在 SUMMARY_COLUMN_SOURCE 里完成。
-            self.store.set_fields(category, voucher, {excel_field: new_value})
-        except Exception as exc:
-            QMessageBox.critical(self, "保存失败", str(exc))
-            self._loading = True
-            item.setText(old_value)
-            self._loading = False
-            return
-        # 管内编号改动会联动 采集日期/保存方式/采集地点 —— 重建记录后整行刷新。
+        非模态后主窗口可随时改数据，靠「刷新」按钮 / 重新打开工具栏入口同步。
+        """
+        self.all_vouchers = self.store.list_vouchers()
+        self._build_photo_counts()
         self._reload_summary()
-        self._loading = True
-        self._update_row_cells(item.row(), voucher)
-        self._loading = False
-        if self.selected_voucher == voucher:
-            self._populate_detail(voucher)
-        self.status_label.setText(f"已保存：{voucher} · {col} = {new_value}")
-        self.app.refresh_list()
-        self.app._update_dashboard()
+        self._apply_filters()  # 重算 filtered_vouchers 并 _load_page(0)
+        self._update_stats()
+        self.status_label.setText("已刷新")
 
-    def _update_row_cells(self, row: int, voucher: str) -> None:
-        """用最新汇总记录刷新某一行所有单元格（调用方需自行包 _loading 防递归）。"""
-        record = self._record_by_voucher.get(voucher, {})
-        for col_idx, col in enumerate(SUMMARY_COLUMNS):
-            item = self.voucher_table.item(row, col_idx)
+    # ---- Voucher double-click -> jump to main window ----
+
+    def _on_voucher_double_clicked(self, row: int, col: int) -> None:
+        """双击行 -> 主窗口选中该入库编号并聚焦主窗口编辑器（汇总窗口保持打开）。"""
+        item = self.voucher_table.item(row, 0)  # 入库编号* 始终第 0 列
+        if item is None:
+            return
+        voucher = item.text()
+        # 旧逻辑：self.app.select_voucher(voucher) —— 只填表单，不动主列表；
+        # 排序后目标行在别页/被筛选时看不出跳转。改用 reveal_voucher：
+        # 清主窗口搜索/筛选 + 翻到目标页 + 选中并滚动到该行。
+        self.app.reveal_voucher(voucher)
+        self.app.raise_()
+        self.app.activateWindow()
+        self.status_label.setText(f"已在主窗口选中：{voucher}")
+
+    # ---- 行多选 -> 导出选中入库编号关联的照片 ----
+
+    def _selected_vouchers(self) -> list[str]:
+        """汇总表当前选中行对应的入库编号，去重保序（第 0 列始终是 入库编号*）。"""
+        result: list[str] = []
+        seen: set[str] = set()
+        for index in self.voucher_table.selectionModel().selectedRows(0):
+            item = self.voucher_table.item(index.row(), 0)
             if item is None:
                 continue
-            value = record.get(col, "")
-            if col == PHOTO_COUNT_COLUMN:
-                try:
-                    item.setData(Qt.DisplayRole, int(value or 0))
-                except (TypeError, ValueError):
-                    item.setText(str(value))
-            else:
-                item.setText(str(value))
+            voucher = item.text().strip()
+            if voucher and voucher not in seen:
+                seen.add(voucher)
+                result.append(voucher)
+        return result
+
+    def _export_selected_photos(self, vouchers: list[str]) -> None:
+        """选中入库编号 -> 复用 BatchExportDialog（photo_focus 模式）导出其关联照片。"""
+        if not vouchers:
+            return
+        dlg = BatchExportDialog(
+            self.store, preselected=vouchers, parent=self, photo_focus=True
+        )
+        dlg.exec_()
+
+    # ---- 导入入库编号列表筛选 ----
+
+    def _open_voucher_list_filter(self) -> None:
+        """导入一份入库编号列表（粘贴文本 + 从 txt·csv·xlsx 载入），汇总表只显示列表内编号。"""
+        from .batch_export import _parse_voucher_numbers
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("按入库编号列表筛选")
+        dlg.resize(420, 420)
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel("粘贴入库编号（支持换行 / 逗号 / 空格 / 分号分隔）："))
+        text_edit = QTextEdit()
+        text_edit.setPlaceholderText("例如：\nYZZ000001\nYZZ000042")
+        # 已有列表筛选时回填，方便在原基础上增删。
+        if self._voucher_list_filter:
+            text_edit.setPlainText("\n".join(sorted(self._voucher_list_filter)))
+        v.addWidget(text_edit, stretch=1)
+
+        def _load_from_file() -> None:
+            path, _ = QFileDialog.getOpenFileName(
+                dlg, "从文件载入入库编号", "",
+                "编号列表 (*.txt *.csv *.xlsx);;所有文件 (*)",
+            )
+            if not path:
+                return
+            try:
+                if path.lower().endswith(".xlsx"):
+                    # xlsx：取首列所有非空单元格（兼容带/不带表头，_parse 再去重）。
+                    from openpyxl import load_workbook
+                    wb = load_workbook(path, read_only=True, data_only=True)
+                    ws = wb.active
+                    cells = [
+                        str(row[0])
+                        for row in ws.iter_rows(values_only=True)
+                        if row and row[0] not in (None, "")
+                    ]
+                    wb.close()
+                    loaded = "\n".join(cells)
+                else:
+                    loaded = Path(path).read_text(encoding="utf-8-sig")
+            except Exception as exc:
+                QMessageBox.critical(dlg, "载入失败", f"读取文件失败：{exc}")
+                return
+            existing = text_edit.toPlainText()
+            text_edit.setPlainText(
+                (existing + "\n" + loaded) if existing.strip() else loaded
+            )
+
+        btn_row = QHBoxLayout()
+        self._make_btn("从文件载入…", _load_from_file, btn_row)
+
+        def _clear() -> None:
+            # 清除筛选：直接生效并关窗（reject -> 下方不再走解析分支）。
+            self._voucher_list_filter = None
+            self._apply_filters()
+            self.status_label.setText("已清除入库编号列表筛选")
+            dlg.reject()
+
+        self._make_btn("清除筛选", _clear, btn_row)
+        btn_row.addStretch()
+        v.addLayout(btn_row)
+        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        box.accepted.connect(dlg.accept)
+        box.rejected.connect(dlg.reject)
+        v.addWidget(box)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        vouchers = _parse_voucher_numbers(text_edit.toPlainText())
+        if not vouchers:
+            self._voucher_list_filter = None
+            self.status_label.setText("编号列表为空，已不按列表筛选")
+        else:
+            self._voucher_list_filter = set(vouchers)
+            self.status_label.setText(f"已按编号列表筛选：{len(vouchers)} 个入库编号")
+        self._apply_filters()
+
+    # ---- 列选择面板（默认隐藏、可关闭、多选） ----
+
+    def _build_column_panel(self) -> QWidget:
+        """右侧列选择面板：每列一个 QCheckBox，可连续多选、即时显隐、持久化。
+
+        旧逻辑：列显隐靠右键「显示列」可勾选子菜单 —— 勾一列菜单就关，要重复打开。
+        现改为可关闭的常驻面板（默认隐藏，「列设置」按钮开关）。
+        """
+        panel = QWidget()
+        pv = QVBoxLayout(panel)
+        pv.setContentsMargins(4, 4, 4, 4)
+        header_row = QHBoxLayout()
+        header_row.addWidget(QLabel("选择显示列"))
+        header_row.addStretch()
+        close_btn = QPushButton("关闭")
+        close_btn.setFixedWidth(48)
+        close_btn.clicked.connect(lambda: self._column_panel.setVisible(False))
+        header_row.addWidget(close_btn)
+        pv.addLayout(header_row)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        iv = QVBoxLayout(inner)
+        iv.setContentsMargins(2, 2, 2, 2)
+        self._column_checkboxes: list[QCheckBox] = []
+        for idx, col in enumerate(SUMMARY_COLUMNS):
+            cb = QCheckBox(col)
+            cb.setChecked(not self.voucher_table.isColumnHidden(idx))
+            if idx == 0:
+                cb.setEnabled(False)  # 入库编号* 锁定可见
+            cb.stateChanged.connect(
+                lambda state, i=idx: self._toggle_column(i, state == Qt.Checked)
+            )
+            iv.addWidget(cb)
+            self._column_checkboxes.append(cb)
+        iv.addStretch()
+        scroll.setWidget(inner)
+        pv.addWidget(scroll, stretch=1)
+        panel.setFixedWidth(180)
+        panel.setVisible(False)  # 默认隐藏
+        self._column_panel = panel
+        return panel
+
+    def _toggle_column_panel(self) -> None:
+        self._column_panel.setVisible(not self._column_panel.isVisible())
 
     # ---- Column show/hide & per-column filter ----
 
@@ -4359,26 +4869,41 @@ class IngestSummaryDialog(QDialog):
         self.voucher_table.setColumnHidden(col_idx, not visible)
         self._save_visible_columns()
 
-    def _header_context_menu(self, pos: QPoint) -> None:
-        header = self.voucher_table.horizontalHeader()
-        col_idx = header.logicalIndexAt(pos)
+    def _voucher_column_menu(self, pos: QPoint, from_header: bool) -> None:
+        """表头 / 表体右键统一菜单：按列筛选 + 清除筛选 + 列设置。
+
+        旧逻辑：只有 _header_context_menu（仅表头），且「显示列」是可勾选子菜单。
+        现：表头和表体右键都可出菜单；列显隐改由「列设置」面板负责，菜单只留入口。
+        """
+        if from_header:
+            header = self.voucher_table.horizontalHeader()
+            col_idx = header.logicalIndexAt(pos)
+            global_pos = header.mapToGlobal(pos)
+        else:
+            col_idx = self.voucher_table.columnAt(pos.x())
+            global_pos = self.voucher_table.viewport().mapToGlobal(pos)
         menu = QMenu(self)
-        if col_idx >= 0:
+        # 表体右键且有选中行：顶部加行操作 —— 导出选中入库编号所关联的照片。
+        # （原菜单只有列筛选项；列筛选项保留在下方，逻辑不变。）
+        if not from_header:
+            sel_vouchers = self._selected_vouchers()
+            if sel_vouchers:
+                menu.addAction(
+                    f"导出选中照片 ({len(sel_vouchers)}个)…",
+                    lambda: self._export_selected_photos(sel_vouchers),
+                )
+                menu.addSeparator()
+        if 0 <= col_idx < len(SUMMARY_COLUMNS):
             col = SUMMARY_COLUMNS[col_idx]
             menu.addAction(f"按「{col}」筛选…", lambda: self._open_column_filter(col))
             if col in self._summary_filters:
                 menu.addAction(f"清除「{col}」筛选", lambda: self._clear_column_filter(col))
-        if self._summary_filters:
+        # 旧条件：仅 self._summary_filters；现导入的编号列表筛选也算「有筛选」。
+        if self._summary_filters or self._voucher_list_filter is not None:
             menu.addAction("清除所有筛选", self._clear_all_filters)
         menu.addSeparator()
-        columns_menu = menu.addMenu("显示列")
-        for idx, col in enumerate(SUMMARY_COLUMNS):
-            act = columns_menu.addAction(col)
-            act.setCheckable(True)
-            act.setChecked(not self.voucher_table.isColumnHidden(idx))
-            act.setEnabled(idx != 0)  # 入库编号* 锁定可见
-            act.toggled.connect(lambda checked, i=idx: self._toggle_column(i, checked))
-        menu.exec_(header.mapToGlobal(pos))
+        menu.addAction("列设置…", lambda: self._column_panel.setVisible(True))
+        menu.exec_(global_pos)
 
     def _clear_column_filter(self, col: str) -> None:
         self._summary_filters.pop(col, None)
@@ -4386,11 +4911,13 @@ class IngestSummaryDialog(QDialog):
 
     def _clear_all_filters(self) -> None:
         self._summary_filters.clear()
+        # 旧逻辑只清列筛选；现「清除所有筛选」连导入的编号列表筛选一并清掉。
+        self._voucher_list_filter = None
         self._apply_filters()
 
     def _open_column_filter(self, col: str) -> None:
         """弹出该列去重值多选 + 文本包含框；全选 = 无筛选。"""
-        values = sorted({str(r.get(col, "")) for r in self._summary_records})
+        values = sorted({self._summary_cell_text(r.get(col, "")) for r in self._summary_records})
         dlg = QDialog(self)
         dlg.setWindowTitle(f"筛选「{col}」")
         dlg.resize(320, 440)
@@ -4456,7 +4983,7 @@ class IngestSummaryDialog(QDialog):
         rows: list[dict] = []
         for voucher in self.filtered_vouchers:
             record = self._record_by_voucher.get(voucher, {})
-            rows.append({col: str(record.get(col, "")) for col in columns})
+            rows.append({col: self._summary_cell_text(record.get(col, "")) for col in columns})
         return columns, rows
 
     def _export_excel(self) -> None:
@@ -4506,355 +5033,11 @@ class IngestSummaryDialog(QDialog):
             return
         self.status_label.setText(f"已导出 {len(rows)} 条到 {path}")
 
-    def _set_thumb_size(self, key: str) -> None:
-        self._thumb_size_key = key
-        if hasattr(self, "_overview_cards") and self._overview_cards:
-            self._render_photo_grid()
-
-    def _render_photo_grid(self) -> None:
-        self._thumb_worker.clear_pending()
-        for child in self.overview_container.children():
-            if isinstance(child, QWidget):
-                self.overview_grid.removeWidget(child)
-                child.deleteLater()
-        self._card_labels.clear()
-        self._overview_cards = []
-        self._selected_photo_indices.clear()
-
-        photos = self._selected_photos
-        tw, th = self._thumb_sizes.get(self._thumb_size_key, (180, 135))
-        self.photo_count_label.setText(
-            f"{self.selected_voucher} — {len(photos)} 张照片"
-        )
-        if not photos:
-            return
-
-        columns = 4 if tw <= 120 else 3
-        for idx, photo in enumerate(photos):
-            r, c = idx // columns, idx % columns
-            card = QFrame()
-            card.setProperty("photo_index", idx)
-            card.mousePressEvent = lambda e, i=idx: self._toggle_photo_selection(i)
-            card.setStyleSheet("QFrame { background-color: #fff; border: 1px solid #ccc; padding: 4px; }")
-            cl = QVBoxLayout(card)
-            cl.setContentsMargins(4, 4, 4, 4)
-
-            img_label = QLabel("加载中")
-            img_label.setAlignment(Qt.AlignCenter)
-            img_label.setFixedSize(tw, th)
-            img_label.setStyleSheet("color: #59666b; background-color: #e8eaed;")
-            cl.addWidget(img_label)
-
-            name = str(photo.get("文件名", ""))
-            name_label = QLabel(name)
-            name_label.setWordWrap(True)
-            name_label.setMaximumHeight(36 if tw > 160 else 28)
-            name_label.setStyleSheet("font-size: 10px; color: #3f4b57; padding: 2px 0;")
-            name_label.setToolTip(name)  # 文件名过长时悬停看完整名
-            cl.addWidget(name_label)
-
-            path = self.store.resolve_photo_path(photo)
-            if path.exists():
-                token = idx + 1
-                self._thumb_worker.enqueue(path, (tw, th), token)
-                self._card_labels[token] = img_label
-
-            self.overview_grid.addWidget(card, r, c)
-            self._overview_cards.append(card)
-
-    def _toggle_photo_selection(self, idx: int) -> None:
-        if idx in self._selected_photo_indices:
-            self._selected_photo_indices.discard(idx)
-        else:
-            self._selected_photo_indices.add(idx)
-        for i, card in enumerate(self._overview_cards):
-            if i in self._selected_photo_indices:
-                card.setStyleSheet("QFrame { background-color: #d8ebff; border: 2px solid #2a6fbd; padding: 3px; }")
-            else:
-                card.setStyleSheet("QFrame { background-color: #fff; border: 1px solid #ccc; padding: 4px; }")
-
-    def _on_overview_thumbnail(self, token: int, qpixmap: QPixmap | None, exc: Exception | None) -> None:
-        if token < 0:
-            return
-        label = self._card_labels.get(token)
-        if not label or not qpixmap:
-            return
-        scaled = qpixmap.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        label.setPixmap(scaled)
-        label.setText("")
-
-    # ---- Password gate ----
-
-    def _require_password(self) -> bool:
-        if self._password_verified:
-            return True
-        pw, ok = QInputDialog.getText(
-            self, "验证密码", "请输入操作密码：", QLineEdit.Password, ""
-        )
-        if ok and pw == self.DEFAULT_PASSWORD:
-            self._password_verified = True
-            return True
-        if ok:
-            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
-        return False
-
-    # ---- Actions ----
-
-    def _open_selected_original(self) -> None:
-        indices = self._selected_photo_indices
-        if not indices:
-            for i in range(len(self._selected_photos)):
-                indices = {i}  # open first if none selected
-                break
-        for i in indices:
-            if i < len(self._selected_photos):
-                path = self.store.resolve_photo_path(self._selected_photos[i])
-                if path.exists():
-                    _open_path(path)
-
-    def _unlink_selected(self) -> None:
-        if not self.selected_voucher or not self._selected_photos:
-            return
-        indices = self._selected_photo_indices
-        if not indices:
-            QMessageBox.information(self, "提示", "请先在照片上点击选择要取消关联的照片。")
-            return
-        if not self._require_password():
-            return
-        count = len(indices)
-        reply = QMessageBox.question(
-            self, "取消关联",
-            f"确定要取消 {self.selected_voucher} 下选中的 {count} 张照片关联吗？\n\n"
-            "未被其他记录引用的工作区归档照片文件也会删除。",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
-            return
-        # Delete in reverse order so smaller indices stay valid
-        for photo_idx in sorted(indices, reverse=True):
-            self.store.delete_photo(self.selected_voucher, photo_idx)
-        self._selected_photos = self.store.get_photos(self.selected_voucher)
-        count_after = len(self._selected_photos)
-        self._photo_counts[self.selected_voucher] = count_after
-        self._total_photos = sum(self._photo_counts.values())
-        self._update_stats()
-        self._render_photo_grid()
-        self._reload_summary()  # 照片增删移后重建汇总记录，保持"照片数"列同步
-        self._load_page(self.current_page)
-        self.app._update_dashboard()
-        self.app.refresh_list()
-        self.app._refresh_image_index_after_photo_change()
-
-    def _move_selected(self) -> None:
-        if not self.selected_voucher or not self._selected_photos:
-            return
-        indices = self._selected_photo_indices
-        if not indices:
-            QMessageBox.information(self, "提示", "请先在照片上点击选择要移动的照片。")
-            return
-        if not self._require_password():
-            return
-        target, ok = QInputDialog.getText(
-            self, "移动到其他编号", "目标入库编号：", QLineEdit.Normal, ""
-        )
-        if not ok or not target.strip():
-            return
-        target = target.strip()
-        if target not in self.all_vouchers:
-            QMessageBox.warning(self, "编号不存在", f"入库编号 {target} 不存在。")
-            return
-        count = len(indices)
-        reply = QMessageBox.question(
-            self, "移动照片",
-            f"确定将选中的 {count} 张照片从 {self.selected_voucher} 移动到 {target} 吗？",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
-            return
-        # Check for conflicts with target before moving
-        paths_to_move = []
-        conflict_set = set()
-        for photo_idx in sorted(indices):
-            photo = self._selected_photos[photo_idx]
-            path = self.store.resolve_photo_path(photo)
-            if path.exists():
-                paths_to_move.append(path)
-        if paths_to_move:
-            conflicts = self.store.find_photo_conflicts(paths_to_move, target)
-            if conflicts:
-                conflict_names = ", ".join(Path(p).name for p in list(conflicts.keys())[:5])
-                extra = f" 等{len(conflicts)}张" if len(conflicts) > 5 else ""
-                reply = QMessageBox.question(
-                    self, "照片冲突",
-                    f"以下照片已存在于目标标本 {target} 中：\n{conflict_names}{extra}\n\n"
-                    "是否跳过这些照片，仅移动不冲突的照片？",
-                    QMessageBox.Yes | QMessageBox.No,
-                )
-                if reply != QMessageBox.Yes:
-                    return
-                conflict_set = {Path(p).resolve() for p in conflicts}
-                paths_to_move = [p for p in paths_to_move if p.resolve() not in conflict_set]
-        # 原代码逐张 add_photo/delete_photo，冲突跳过时仍可能删除源记录；现在只移动确认保留的索引。
-        indices_to_move = []
-        for photo_idx in sorted(indices):
-            photo = self._selected_photos[photo_idx]
-            path = self.store.resolve_photo_path(photo)
-            if path.exists() and path.resolve() in conflict_set:
-                continue
-            indices_to_move.append(photo_idx)
-        moved = self.store.move_photos(self.selected_voucher, target, indices_to_move)
-        self._selected_photos = self.store.get_photos(self.selected_voucher)
-        self._photo_counts[self.selected_voucher] = len(self._selected_photos)
-        target_count = len(self.store.get_photos(target))
-        self._photo_counts[target] = target_count
-        self._total_photos = sum(self._photo_counts.values())
-        self._update_stats()
-        self._render_photo_grid()
-        self._reload_summary()  # 照片增删移后重建汇总记录，保持"照片数"列同步
-        self._load_page(self.current_page)
-        self.app._update_dashboard()
-        self.app.refresh_list()
-
-    def _jump_to_specimen(self) -> None:
-        if not self.selected_voucher:
-            return
-        self.app.select_voucher(self.selected_voucher)
-        self.close()
-
-    # ---- Photo replacement ----
-
-    def _replace_selected_photo(self) -> None:
-        if not self.selected_voucher or not self._selected_photos:
-            return
-        indices = self._selected_photo_indices
-        if len(indices) != 1:
-            QMessageBox.information(self, "提示", "请选择一张照片进行替换（只能选一张）。")
-            return
-        if not self._require_password():
-            return
-        old_idx = next(iter(indices))
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "选择替换照片", "",
-            image_file_filter(),
-        )
-        if not paths:
-            return
-        new_path = Path(paths[0]).resolve()
-        if not is_supported_image(new_path):
-            QMessageBox.warning(self, "格式不支持", "仅支持图片文件。")
-            return
-        if not self.app._confirm_archive_name_conflicts([new_path]):
-            return
-        try:
-            # 原代码先 delete_photo 再 add_photo；新照片校验失败会丢失旧关联。
-            mode, library_path = self.app._photo_management_settings()
-            new_row = self.store.replace_photo(
-                self.selected_voucher,
-                old_idx,
-                new_path,
-                allow_outside=True,
-                photo_management_mode=mode,
-                photo_library_path=library_path,
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "替换失败", str(exc))
-            return
-        self._selected_photos = self.store.get_photos(self.selected_voucher)
-        self._photo_counts[self.selected_voucher] = len(self._selected_photos)
-        self._total_photos = sum(self._photo_counts.values())
-        self._update_stats()
-        self._render_photo_grid()
-        self._reload_summary()  # 照片增删移后重建汇总记录，保持"照片数"列同步
-        self._load_page(self.current_page)
-        self.app._update_dashboard()
-        self.app.refresh_list()
-        if new_row:
-            self.app._append_added_photos_to_image_index([new_row])
-        self.app._refresh_image_index_after_photo_change()
-        self.status_label.setText(f"已替换照片：{new_path.name}")
-
-    # ---- Drag-drop photo replacement ----
-
-    def _overview_drag_enter(self, event) -> None:
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-            self.overview_scroll.setStyleSheet(
-                "QScrollArea { background-color: #f4f6f8; border: 2px dashed #2a6fbd; }"
-            )
-
-    def _overview_drag_move(self, event) -> None:
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def _overview_drag_leave(self, event) -> None:
-        self.overview_scroll.setStyleSheet(
-            "QScrollArea { background-color: #f4f6f8; border: 1px solid #a9b3bd; }"
-        )
-
-    def _overview_drop(self, event) -> None:
-        self.overview_scroll.setStyleSheet(
-            "QScrollArea { background-color: #f4f6f8; border: 1px solid #a9b3bd; }"
-        )
-        if not self.selected_voucher or not self._selected_photos:
-            event.ignore()
-            return
-        indices = self._selected_photo_indices
-        if len(indices) != 1:
-            QMessageBox.information(self, "提示", "请先选择一张要替换的照片（只能选一张），再拖入新照片。")
-            event.ignore()
-            return
-        if not self._require_password():
-            event.ignore()
-            return
-        paths = []
-        for url in event.mimeData().urls():
-            if url.isLocalFile():
-                paths.append(url.toLocalFile())
-        if not paths:
-            event.ignore()
-            return
-        new_path = Path(paths[0]).resolve()
-        if not is_supported_image(new_path):
-            QMessageBox.warning(self, "格式不支持", "仅支持图片文件。")
-            event.ignore()
-            return
-        if not self.app._confirm_archive_name_conflicts([new_path]):
-            event.ignore()
-            return
-        old_idx = next(iter(indices))
-        try:
-            # 原代码先 delete_photo 再 add_photo；拖拽外部照片失败会丢失旧关联。
-            mode, library_path = self.app._photo_management_settings()
-            new_row = self.store.replace_photo(
-                self.selected_voucher,
-                old_idx,
-                new_path,
-                allow_outside=True,
-                photo_management_mode=mode,
-                photo_library_path=library_path,
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "替换失败", str(exc))
-            event.ignore()
-            return
-        self._selected_photos = self.store.get_photos(self.selected_voucher)
-        self._selected_photo_indices.clear()
-        self._photo_counts[self.selected_voucher] = len(self._selected_photos)
-        self._total_photos = sum(self._photo_counts.values())
-        self._update_stats()
-        self._render_photo_grid()
-        self._reload_summary()  # 照片增删移后重建汇总记录，保持"照片数"列同步
-        self._load_page(self.current_page)
-        self.app._update_dashboard()
-        self.app.refresh_list()
-        if new_row:
-            self.app._append_added_photos_to_image_index([new_row])
-        self.app._refresh_image_index_after_photo_change()
-        self.status_label.setText(f"已拖入替换照片：{new_path.name}")
-        event.acceptProposedAction()
-
     def closeEvent(self, event) -> None:
-        self._thumb_worker.stop()
+        # 非模态单实例：关闭时清掉主窗口持有的引用，让下次点工具栏能新建。
+        # 旧 closeEvent 还做 self._thumb_worker.stop() —— 照片网格已移除，无 thumb worker。
+        if getattr(self.app, "_ingest_summary_dialog", None) is self:
+            self.app._ingest_summary_dialog = None
         super().closeEvent(event)
 
 
@@ -5298,6 +5481,16 @@ class SettingsDialog(QDialog):
         library_row.addWidget(browse_btn)
         layout.addRow("自定义照片库", library_row)
 
+        # 自定义图片查看器：留空 = 用系统默认程序打开原图。
+        viewer_row = QHBoxLayout()
+        self.image_viewer_edit = QLineEdit(current_settings.image_viewer_path)
+        self.image_viewer_edit.setPlaceholderText("留空 = 系统默认程序")
+        viewer_row.addWidget(self.image_viewer_edit, stretch=1)
+        viewer_btn = QPushButton("选择")
+        viewer_btn.clicked.connect(self._choose_image_viewer)
+        viewer_row.addWidget(viewer_btn)
+        layout.addRow("自定义图片查看器", viewer_row)
+
         self.photo_fill_shortcut_edit = QLineEdit(current_settings.photo_filename_fill_shortcut)
         self.photo_fill_shortcut_edit.setPlaceholderText(DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT)
         layout.addRow("照片名填充快捷键", self.photo_fill_shortcut_edit)
@@ -5305,6 +5498,18 @@ class SettingsDialog(QDialog):
         self.check_updates_box = QCheckBox("启动时自动检查 GitHub 更新")
         self.check_updates_box.setChecked(current_settings.check_updates_on_startup)
         layout.addRow("软件更新", self.check_updates_box)
+
+        # 界面字体大小：影响所有主体字体（列表/表单/标签/按钮等）。
+        # 0=系统默认；这里展示绝对 pt 值，复位时回到系统默认字号。
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setRange(7, 24)
+        self.font_size_spin.setSuffix(" pt")
+        self.font_size_spin.setToolTip("调整界面主体字体大小；也可用 Ctrl+加/减/0 快捷键")
+        self.font_size_spin.setValue(
+            current_settings.ui_font_size if current_settings.ui_font_size > 0
+            else (_default_app_font_point or self.font().pointSize())
+        )
+        layout.addRow("界面字体大小", self.font_size_spin)
 
         btn_row = QHBoxLayout()
         btn_row.addWidget(QPushButton("保存", clicked=self.accept))
@@ -5324,8 +5529,11 @@ class SettingsDialog(QDialog):
         management_idx = management_keys.index(defaults.photo_management_mode)
         self.photo_management_combo.setCurrentIndex(management_idx)
         self.photo_library_edit.setText(defaults.photo_library_path)
+        self.image_viewer_edit.setText(defaults.image_viewer_path)
         self.photo_fill_shortcut_edit.setText(defaults.photo_filename_fill_shortcut)
         self.check_updates_box.setChecked(defaults.check_updates_on_startup)
+        # 字体大小复位到系统默认（spinbox 展示系统默认 pt，设置值存 0）。
+        self.font_size_spin.setValue(_default_app_font_point or self.font().pointSize())
         # Apply immediately
         self.app.store.set_undo_depth(200)
         save_settings(defaults)
@@ -5333,6 +5541,8 @@ class SettingsDialog(QDialog):
         self.app._show_grid_filenames = defaults.show_grid_filenames
         self.app._show_filename_check.setChecked(defaults.show_grid_filenames)
         self.app._apply_photo_filename_fill_shortcut()
+        apply_app_font_size(defaults.ui_font_size)  # defaults.ui_font_size == 0 -> 系统默认
+        self.app._refresh_all_windows_fonts()
         QMessageBox.information(self, "已恢复", "所有设置已恢复为默认值。")
 
     def _choose_photo_library(self) -> None:
@@ -5341,14 +5551,28 @@ class SettingsDialog(QDialog):
         if directory:
             self.photo_library_edit.setText(directory)
 
+    def _choose_image_viewer(self) -> None:
+        current = self.image_viewer_edit.text().strip()
+        path, _ = QFileDialog.getOpenFileName(self, "选择图片查看器程序", current or "")
+        if path:
+            self.image_viewer_edit.setText(path)
+
     @property
     def undo_depth(self) -> int:
         return self.undo_spin.value()
 
     @property
+    def image_viewer_path(self) -> str:
+        return self.image_viewer_edit.text().strip()
+
+    @property
     def photo_filename_fill_shortcut(self) -> str:
         value = self.photo_fill_shortcut_edit.text().strip()
         return value or DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT
+
+    @property
+    def font_size(self) -> int:
+        return int(self.font_size_spin.value())
 
 
 # ---------------------------------------------------------------------------
@@ -5361,10 +5585,17 @@ class WindowManager:
         self._windows: dict[Path, SpecimenWindow] = {}
 
     def register(self, window: SpecimenWindow) -> None:
+        # 未绑定工作区的窗口（首次启动尚未选工作区）不注册；
+        # 载入工作区时 _load_workspace_into_window 会再次调用 register。
+        if getattr(window, "workspace_root", None) is None:
+            return
         self._windows[window.workspace_root.resolve()] = window
 
     def unregister(self, window: SpecimenWindow) -> None:
-        key = window.workspace_root.resolve()
+        key = getattr(window, "workspace_root", None)
+        if key is None:
+            return
+        key = key.resolve()
         if self._windows.get(key) is window:
             self._windows.pop(key, None)
 
@@ -5397,9 +5628,21 @@ def run_app(workspace_root: Path | str | None) -> None:
     if workspace_root is None:
         workspace_root = default_workspace()
     app = QApplication.instance() or QApplication(sys.argv)
+    # 记录系统默认字号，并应用用户保存的全局字体大小（窗口创建前完成，新窗口即继承）。
+    global _default_app_font_point
+    _default_app_font_point = app.font().pointSize()
+    apply_app_font_size(load_settings().ui_font_size)
+    # 旧逻辑：无全局样式，外观全靠各处零散 setStyleSheet。现统一应用共享主题
+    # QSS（菜单/按钮/表格/工具栏观感统一）；主题不含 font 规则，不影响字体缩放。
+    from .theme import apply_app_theme
+    apply_app_theme(app)
     manager = WindowManager(app)
     window = manager.open_workspace(workspace_root)
+    # 行为变化：首次启动无工作区时 open_workspace 现在返回未绑定窗口（非 None），
+    # 不再走此退出分支 —— 窗口已显示并会提示选择工作区。
+    # window is None 现在仅表示真正的启动失败（如 --workspace 指向无效目录，
+    # SpecimenWindow 抛 SystemExit）。
     if window is None:
-        QMessageBox.warning(None, "标本入库管理", "未选择工作区，程序将退出。")
+        QMessageBox.warning(None, "标本入库管理", "工作区无效，程序将退出。")
         return
     app.exec_()

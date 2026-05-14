@@ -141,6 +141,18 @@ class CoreTests(unittest.TestCase):
         manager.unregister(window)
         self.assertFalse(manager.focus_workspace(self.tmp / "workspace"))
 
+    def test_window_manager_tolerates_unbound_window(self) -> None:
+        # 首次启动尚未选工作区的窗口 workspace_root 为 None；
+        # register/unregister 必须是 no-op 且不抛异常。
+        class UnboundWindow:
+            workspace_root = None
+
+        manager = WindowManager(app=None)
+        window = UnboundWindow()
+        manager.register(window)  # 不应注册、不应抛异常
+        self.assertEqual(manager._windows, {})
+        manager.unregister(window)  # 同样 no-op
+
     def test_build_release_script_compiles(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
         py_compile.compile(str(project_root / "build_release.py"), doraise=True)
@@ -855,6 +867,8 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(settings.carry_over_specimen_fields)
             # 旧 settings.json 缺该键时，入库汇总可见列为空（运行时回退到默认列集）
             self.assertEqual(settings.summary_visible_columns, [])
+            # 旧 settings.json 缺该键时，界面字体大小为 0（运行时用系统默认字号）
+            self.assertEqual(settings.ui_font_size, 0)
 
             settings.show_grid_filenames = False
             settings.photo_filename_fill_shortcut = "Ctrl+Shift+F"
@@ -862,6 +876,7 @@ class CoreTests(unittest.TestCase):
             settings.photo_library_path = str(self.tmp / "library")
             settings.carry_over_specimen_fields = False
             settings.summary_visible_columns = ["入库编号*", "管内编号*", "照片数"]
+            settings.ui_font_size = 14
             save_settings(settings)
             reloaded = load_settings()
             self.assertFalse(reloaded.show_grid_filenames)
@@ -870,6 +885,11 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(reloaded.photo_library_path, str(self.tmp / "library"))
             self.assertFalse(reloaded.carry_over_specimen_fields)
             self.assertEqual(reloaded.summary_visible_columns, ["入库编号*", "管内编号*", "照片数"])
+            self.assertEqual(reloaded.ui_font_size, 14)
+            # 越界字号被钳制到 [7, 24]
+            reloaded.ui_font_size = 999
+            save_settings(reloaded)
+            self.assertEqual(load_settings().ui_font_size, 24)
         finally:
             if old_appdata is None:
                 os.environ.pop("APPDATA", None)
@@ -907,12 +927,19 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(rec["备注"], "标本备注")
         self.assertEqual(rec["分类备注"], "分类的备注")
         self.assertEqual(rec["照片数"], 1)
+        # 照片聚合列：文件名 / 绝对路径 / 描述，均按入库编号聚合为 list
         self.assertEqual(rec["照片文件名"], ["summary.jpg"])
-        # 缺分类信息的记录：分类列留空，照片数为 0
+        self.assertEqual(len(rec["照片绝对路径"]), 1)
+        self.assertTrue(rec["照片绝对路径"][0].endswith("summary.jpg"))
+        self.assertEqual(rec["照片描述"], [])  # 未填描述
+        # 缺分类信息的记录：分类列留空，照片数为 0，照片聚合列为空 list
         rec2 = by_voucher[second]
         self.assertEqual(rec2["种名*"], "")
         self.assertEqual(rec2["分类备注"], "")
         self.assertEqual(rec2["照片数"], 0)
+        self.assertEqual(rec2["照片文件名"], [])
+        self.assertEqual(rec2["照片绝对路径"], [])
+        self.assertEqual(rec2["照片描述"], [])
 
     def test_is_unsafe_workspace_root_rejects_root_and_home(self) -> None:
         from specimen_app.workspace import is_unsafe_workspace_root

@@ -51,8 +51,11 @@ from .models import (
     ImportConflictError,
     ImportResult,
     PHOTO_COUNT_COLUMN,
+    PHOTO_DESC_COLUMN,
     PHOTO_FILE,
+    PHOTO_FILENAME_COLUMN,
     PHOTO_HEADERS,
+    PHOTO_PATH_COLUMN,
     SPECIMEN_FILE,
     SPECIMEN_HEADERS,
     SPECIMEN_REQUIRED,
@@ -260,7 +263,8 @@ class ExcelStore:
         """把分散在多个 Excel 的字段汇总成一张宽表（纯内存视图，不改任何文件结构）。
 
         每条记录是扁平 dict，键为 SUMMARY_COLUMNS：标本全字段 + 分类全字段（分类"备注"
-        用"分类备注"消歧）+ 照片数；另附 "照片文件名"(list) 供详情/搜索使用（不在 SUMMARY_COLUMNS 内）。
+        用"分类备注"消歧）+ 照片数 + 照片聚合列（照片文件名 / 照片绝对路径 / 照片描述，
+        均为 list，按入库编号聚合该编号下所有照片对应值）。
         左连接：缺分类信息的入库编号也会出现，分类列留空。
         """
         specimens = self.read_rows("specimen")
@@ -273,6 +277,9 @@ class ExcelStore:
         }
         photo_counts: dict[str, int] = {}
         photo_filenames: dict[str, list[str]] = {}
+        # 同模式再聚合绝对路径 / 描述，供入库汇总的照片聚合列使用。
+        photo_abs_paths: dict[str, list[str]] = {}
+        photo_descs: dict[str, list[str]] = {}
         for row in photos:
             voucher = self._value(row, "入库编号*")
             if not voucher:
@@ -281,6 +288,12 @@ class ExcelStore:
             file_name = self._value(row, "文件名")
             if file_name:
                 photo_filenames.setdefault(voucher, []).append(file_name)
+            abs_path = self._value(row, "绝对路径")
+            if abs_path:
+                photo_abs_paths.setdefault(voucher, []).append(abs_path)
+            desc = self._value(row, "描述")
+            if desc:
+                photo_descs.setdefault(voucher, []).append(desc)
         records: list[dict[str, Any]] = []
         for row in specimens:
             voucher = self._value(row, "入库编号*")
@@ -292,11 +305,18 @@ class ExcelStore:
                 category, excel_field = SUMMARY_COLUMN_SOURCE[col]
                 if col == PHOTO_COUNT_COLUMN:
                     record[col] = photo_counts.get(voucher, 0)
+                elif col == PHOTO_FILENAME_COLUMN:
+                    record[col] = photo_filenames.get(voucher, [])
+                elif col == PHOTO_PATH_COLUMN:
+                    record[col] = photo_abs_paths.get(voucher, [])
+                elif col == PHOTO_DESC_COLUMN:
+                    record[col] = photo_descs.get(voucher, [])
                 elif category == "classification":
                     record[col] = self._value(class_row, excel_field)
                 else:  # specimen 列与主键"入库编号*"都取自标本行
                     record[col] = self._value(row, excel_field)
-            record["照片文件名"] = photo_filenames.get(voucher, [])
+            # 旧逻辑：循环外单独 record["照片文件名"] = ...；现"照片文件名"已是 SUMMARY_COLUMN，
+            # 由上面循环统一设置（键名不变，_apply_filters 仍按 record["照片文件名"] 取）。
             records.append(record)
         records.sort(key=lambda r: parse_voucher_serial(r["入库编号*"]) or 0)
         return records
