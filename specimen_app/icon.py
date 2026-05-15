@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from PyQt5.QtCore import Qt, QRectF
@@ -9,6 +10,38 @@ from PyQt5.QtGui import QPixmap
 
 
 _ICON_SIZE = 256
+
+# 预生成的应用图标变体（tools/generate_icon_variants.py 产物，存 assets/）。
+# key = 变体目录名，value = 设置对话框显示名。default 不在此 —— 缺图标时回退到
+# create_app_icon() 程序生成的经典图标。
+APP_ICON_VARIANTS: dict[str, str] = {
+    "specimen_blue": "标本蓝",
+    "ledger_green": "账本绿",
+    "photo_coral": "照片珊瑚",
+    "archive_indigo": "归档靛蓝",
+}
+DEFAULT_APP_ICON_VARIANT = "specimen_blue"
+_VARIANT_REL_DIR = Path("assets") / "icons" / "app-icon-variants"
+
+
+def _variant_icon_path(variant: str) -> Path | None:
+    """定位某图标变体的 .ico 文件；源码运行 / PyInstaller 打包都能找到，找不到返回 None。"""
+    if variant not in APP_ICON_VARIANTS:
+        return None
+    rel = _VARIANT_REL_DIR / variant / f"{variant}.ico"
+    roots: list[Path] = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            roots.append(Path(meipass))
+        roots.append(Path(sys.executable).resolve().parent / "_internal")
+    roots.append(Path(__file__).resolve().parent.parent)  # 项目根
+    roots.append(Path.cwd())
+    for root in roots:
+        candidate = root / rel
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def create_app_icon() -> QImage:
@@ -95,8 +128,19 @@ def create_app_icon() -> QImage:
     return img
 
 
-def get_app_icon() -> QIcon:
-    """Return the app icon as QIcon."""
+def get_app_icon(variant: str | None = None) -> QIcon:
+    """Return the app icon as QIcon.
+
+    旧逻辑：无参，永远返回 create_app_icon() 程序生成的经典图标。
+    现支持 variant：给定且能在 assets/ 找到对应 .ico 就用它；否则回退程序生成图标
+    （兼容：不传 variant 时行为与旧版一致）。
+    """
+    if variant:
+        path = _variant_icon_path(variant)
+        if path is not None:
+            icon = QIcon(str(path))
+            if not icon.isNull():
+                return icon
     img = create_app_icon()
     return QIcon(QPixmap.fromImage(img))
 

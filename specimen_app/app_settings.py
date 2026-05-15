@@ -49,6 +49,9 @@ class AppSettings:
     summary_visible_columns: list[str] = field(default_factory=list)  # 入库汇总宽表可见列（空=用默认集）
     ui_font_size: int = 0  # 全局界面字体大小（pt）；0=未设置，用系统默认。范围 7–24
     image_viewer_path: str = ""  # 自定义图片查看器程序路径；空=用系统默认程序打开原图
+    cursor_style: str = "default"  # 趣味光标样式 key（见 cursors.CURSOR_STYLE_OPTIONS）；default=系统箭头
+    app_icon_variant: str = "specimen_blue"  # 应用图标变体 key（见 icon.APP_ICON_VARIANTS）
+    auto_save_enabled: bool = True  # 录入是否自动保存（输入停 0.5s 自动写）；关时靠手动「保存」按钮
 
 
 def app_config_dir() -> Path:
@@ -106,6 +109,20 @@ def load_settings() -> AppSettings:
     image_viewer_path = data.get("image_viewer_path", "")
     if not isinstance(image_viewer_path, str):
         image_viewer_path = ""
+    # 趣味光标样式：旧 settings.json 无此键 -> 默认箭头；非法值也回退默认。
+    from .cursors import CURSOR_STYLE_OPTIONS  # 局部 import：cursors 只依赖 PyQt，无循环
+    cursor_style = str(data.get("cursor_style", "default"))
+    if cursor_style not in CURSOR_STYLE_OPTIONS:
+        cursor_style = "default"
+    # 应用图标变体：旧 settings.json 无此键 -> 默认变体；非法值也回退默认。
+    from .icon import APP_ICON_VARIANTS, DEFAULT_APP_ICON_VARIANT
+    app_icon_variant = str(data.get("app_icon_variant", DEFAULT_APP_ICON_VARIANT))
+    if app_icon_variant not in APP_ICON_VARIANTS:
+        app_icon_variant = DEFAULT_APP_ICON_VARIANT
+    # 自动保存：旧 settings.json 无此键 -> 默认 True（保持原有"一直自动保存"行为）。
+    auto_save_enabled = data.get("auto_save_enabled", True)
+    if not isinstance(auto_save_enabled, bool):
+        auto_save_enabled = True
     return AppSettings(
         last_workspace=str(data.get("last_workspace", "")),
         recent_workspaces=[str(item) for item in data.get("recent_workspaces", []) if item],
@@ -123,6 +140,9 @@ def load_settings() -> AppSettings:
         summary_visible_columns=summary_visible_columns,
         ui_font_size=ui_font_size,
         image_viewer_path=image_viewer_path,
+        cursor_style=cursor_style,
+        app_icon_variant=app_icon_variant,
+        auto_save_enabled=auto_save_enabled,
     )
 
 
@@ -146,6 +166,9 @@ def save_settings(settings: AppSettings) -> None:
         "summary_visible_columns": settings.summary_visible_columns,
         "ui_font_size": settings.ui_font_size,
         "image_viewer_path": settings.image_viewer_path,
+        "cursor_style": settings.cursor_style,
+        "app_icon_variant": settings.app_icon_variant,
+        "auto_save_enabled": settings.auto_save_enabled,
     }
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)

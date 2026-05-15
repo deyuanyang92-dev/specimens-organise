@@ -43,6 +43,7 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem,
     QTextEdit,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
     QCompleter,
@@ -318,6 +319,52 @@ def apply_app_font_size(size: int) -> None:
     if target and target > 0:
         font.setPointSize(target)
     app.setFont(font)
+
+
+def apply_app_cursor(style: str) -> None:
+    """按 style 给所有顶层窗口设趣味光标；"default"/未知 -> unsetCursor 恢复系统箭头。
+
+    刻意用逐顶层窗口 setCursor，而非 QApplication.setOverrideCursor —— 后者是栈式
+    全局覆盖，会把文本框 I-beam、splitter 拉伸、忙碌光标全盖掉。setCursor 只替换
+    "默认箭头"出现处，QLineEdit / QSplitter 等自带光标的控件照常工作。
+    """
+    app = QApplication.instance()
+    if app is None:
+        return
+    from .cursors import make_cursor
+    cursor = make_cursor(style)
+    for widget in app.topLevelWidgets():
+        if cursor is None:
+            widget.unsetCursor()
+        else:
+            widget.setCursor(cursor)
+
+
+def apply_app_icon(variant: str) -> None:
+    """按 variant 给 QApplication 及所有顶层窗口设应用图标。
+
+    找不到对应素材时 get_app_icon 自动回退程序生成的经典图标（不会崩）。
+    """
+    app = QApplication.instance()
+    if app is None:
+        return
+    icon = get_app_icon(variant)
+    app.setWindowIcon(icon)
+    for widget in app.topLevelWidgets():
+        widget.setWindowIcon(icon)
+
+
+def _species_matcher() -> SpeciesMatcher:
+    """用软件自带的分类预设建 SpeciesMatcher。
+
+    旧逻辑：读 workspace_root/字段模版/表格信息预设字段.xlsx —— 工作区缺该文件时
+    种名/科名自动匹配静默失效。现改读**软件自带**的 specimen_app/字段模版/ 下预设
+    （随软件分发），与工作区无关。找不到时给个不存在路径占位，SpeciesMatcher 会
+    优雅空载（_rows=[]）。
+    """
+    from .field_help import bundled_template_path
+    preset = bundled_template_path("表格信息预设字段.xlsx")
+    return SpeciesMatcher(preset or Path("__missing_taxonomy_preset__.xlsx"))
 
 
 # ---------------------------------------------------------------------------
@@ -780,7 +827,8 @@ class SpecimenWindow(QMainWindow):
         super().__init__()
         self.manager = manager
         self.setWindowTitle("标本入库管理")
-        self.setWindowIcon(get_app_icon())
+        # 旧：get_app_icon() 永远用程序生成图标。现按用户选的图标变体加载。
+        self.setWindowIcon(get_app_icon(load_settings().app_icon_variant))
         self.resize(1320, 820)
         self.setMinimumSize(QSize(1100, 680))
 
@@ -823,7 +871,7 @@ class SpecimenWindow(QMainWindow):
                 raise SystemExit from exc
 
             _startup_mark("SpecimenWindow: ExcelStore ready")
-            self.matcher = SpeciesMatcher(self.workspace_root / "字段模版" / "表格信息预设字段.xlsx")
+            self.matcher = _species_matcher()  # 旧：读 workspace_root/字段模版/，现读软件自带预设
 
         self.current_voucher: str | None = None
         self.current_photos: list[dict[str, str]] = []
@@ -860,6 +908,8 @@ class SpecimenWindow(QMainWindow):
         self._taxonomy_candidate_rows: dict[str, list[tuple[str, SpeciesMatch | FamilyMatch]]] = {}
 
         self._save_timers: dict[str, QTimer] = {}
+        # 自动保存开关：True=输入停 0.5s 自动写；False=只在点「保存」按钮时写。工具栏可勾选切换。
+        self.auto_save_enabled = load_settings().auto_save_enabled
         self._list_refresh_timer = QTimer(self)
         self._list_refresh_timer.setSingleShot(True)
         self._list_refresh_timer.timeout.connect(self.refresh_list)
@@ -880,6 +930,9 @@ class SpecimenWindow(QMainWindow):
 
         self._build_ui()
         _startup_mark("SpecimenWindow._build_ui")
+
+        # 新建主窗口即应用当前趣味光标设置（与字体在窗口创建时继承同理）。
+        apply_app_cursor(load_settings().cursor_style)
 
         if self.workspace_root is not None:
             remember_workspace(self.workspace_root)
@@ -902,6 +955,11 @@ class SpecimenWindow(QMainWindow):
             self.select_voucher(vouchers[0], defer_preview=True)
         _startup_mark("_finish_initial_load: first voucher selected")
         self.statusBar().showMessage("工作区已加载", 2000)
+        # 分类预设缺失时给个非阻塞提示（Part 6 兜底补齐失败 / 模板源也没有时才会到这）。
+        if self.matcher is not None and not list(self.matcher.all_rows()):
+            self.statusBar().showMessage(
+                "分类预设缺失，种名自动匹配不可用（缺 字段模版/表格信息预设字段.xlsx）", 8000
+            )
         QTimer.singleShot(1200, self._build_search_index_background)
         QTimer.singleShot(2500, self._maybe_check_updates_on_startup)
 
@@ -964,6 +1022,9 @@ class SpecimenWindow(QMainWindow):
             Path(sys.executable).resolve().parent.parent,
             Path(sys.executable).resolve().parent.parent.parent,
             Path(__file__).resolve().parents[1],
+            # specimen_app/ 自身：a35358b 已把 specimen_app/字段模版/ 提交进仓库作兜底
+            # 模板源；打包后由 build_release.py --add-data 带进 _internal/specimen_app/。
+            Path(__file__).resolve().parent,
         ]
         for candidate in candidates:
             if not candidate:
@@ -1068,6 +1129,16 @@ class SpecimenWindow(QMainWindow):
             action = QAction(label, self)
             action.triggered.connect(slot)
             toolbar.addAction(action)
+
+        # 自动保存开关：可勾选按钮，状态持久化到 settings.json（仿旧「沿用上条信息」范式）。
+        # 旧：固定文字「自动保存」，勾选态在工具栏里很难分辨。现文字直接显示「开/关」。
+        self._auto_save_action = QAction(self)
+        self._auto_save_action.setCheckable(True)
+        self._auto_save_action.setChecked(self.auto_save_enabled)
+        self._auto_save_action.setToolTip("勾选=输入后自动保存；取消=只在点「保存」按钮时写入")
+        self._auto_save_action.toggled.connect(self._on_auto_save_toggled)
+        self._update_auto_save_action_text()
+        toolbar.addAction(self._auto_save_action)
 
         # Workspace bar
         ws_bar = QHBoxLayout()
@@ -1310,7 +1381,8 @@ class SpecimenWindow(QMainWindow):
             else:
                 widget = QLineEdit()
                 widget.textChanged.connect(lambda text, f=field: self.schedule_save("specimen", f))
-            sf_layout.addRow(field, widget)
+            # 标签保持纯文字；「?」填写说明跟在输入框后面（_wrap_field_with_hint）。
+            sf_layout.addRow(field, self._wrap_field_with_hint(field, widget))
             self.specimen_widgets[field] = widget
         spec_save_btn = QPushButton("保存标本信息")
         spec_save_btn.clicked.connect(lambda: self._save_panel("specimen"))
@@ -1361,7 +1433,8 @@ class SpecimenWindow(QMainWindow):
             else:
                 widget.textChanged.connect(lambda text: self.schedule_save("photo", "描述"))
             self.photo_widgets[field] = widget
-            row.addWidget(widget)
+            # 「?」填写说明跟在输入框后面（无说明的字段 _wrap 直接返回原控件）。
+            row.addWidget(self._wrap_field_with_hint(field, widget))
             pf_layout.addLayout(row)
         photo_save_btn = QPushButton("保存照片信息")
         photo_save_btn.clicked.connect(lambda: self._save_panel("photo"))
@@ -1378,7 +1451,8 @@ class SpecimenWindow(QMainWindow):
         for field in EDITABLE_CLASSIFICATION_COLUMNS:
             widget = QLineEdit()
             widget.textChanged.connect(lambda text, f=field: self.schedule_save("classification", f))
-            cf_layout.addRow(field, widget)
+            # 标签保持纯文字；「?」填写说明跟在输入框后面（_wrap_field_with_hint）。
+            cf_layout.addRow(field, self._wrap_field_with_hint(field, widget))
             self.class_widgets[field] = widget
             if field in TAXONOMY_LOOKUP_INPUT_COLUMNS:
                 self._attach_taxonomy_lookup_to_classification_field(field, widget)
@@ -1473,6 +1547,47 @@ class SpecimenWindow(QMainWindow):
         self._photo_filename_fill_action.triggered.connect(self.fill_current_photo_from_filename)
         self.addAction(self._photo_filename_fill_action)
         self._apply_photo_filename_fill_shortcut()
+
+    def _wrap_field_with_hint(self, field: str, widget: QWidget) -> QWidget:
+        """把输入控件包一层，在其**后面**放一个低调的「?」信息按钮（参考专业软件做法）。
+
+        旧实现 _make_field_label 把「?」放标签旁、还带 stretch，太显眼。现改为：
+        「?」跟在输入框后、固定 18px、灰色小字、hover 才变蓝 —— hover 看摘要、点击弹完整说明。
+        无填写说明的字段直接返回原控件（不包，不加「?」）。
+        """
+        from .field_help import field_help_for
+        info = field_help_for(field)
+        if not info:
+            return widget
+        parts: list[str] = []
+        if info.get("示例"):
+            parts.append(f"填写示例：{info['示例']}")
+        if info.get("说明"):
+            parts.append(f"说明：{info['说明']}")
+        if info.get("其他要求"):
+            parts.append(f"其他要求：{info['其他要求']}")
+        tip = "\n".join(parts)
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(2)
+        row.addWidget(widget, stretch=1)
+        hint = QToolButton()
+        hint.setText("?")
+        hint.setAutoRaise(True)
+        hint.setFixedSize(18, 18)
+        hint.setFocusPolicy(Qt.NoFocus)
+        # 低调：灰色细字，hover 才变主题蓝；不抢输入框的视觉重心。
+        hint.setStyleSheet(
+            "QToolButton { color: #9aa4ad; border: none; }"
+            " QToolButton:hover { color: #2a6fbd; }"
+        )
+        hint.setToolTip(tip)
+        hint.clicked.connect(
+            lambda _=False, f=field, t=tip: QMessageBox.information(self, f"「{f}」填写说明", t)
+        )
+        row.addWidget(hint)
+        return container
 
     def _apply_photo_filename_fill_shortcut(self) -> None:
         if self._photo_filename_fill_action is None:
@@ -1864,6 +1979,23 @@ class SpecimenWindow(QMainWindow):
 
     # ---- Field save (debounced) ----
 
+    def _update_auto_save_action_text(self) -> None:
+        """工具栏「自动保存」按钮文字直接显示开/关状态（勾选态本身不够醒目）。"""
+        action = getattr(self, "_auto_save_action", None)
+        if action is not None:
+            action.setText("自动保存：开" if self.auto_save_enabled else "自动保存：关")
+
+    def _on_auto_save_toggled(self, checked: bool) -> None:
+        """工具栏「自动保存」勾选切换：更新内存开关 + 按钮文字 + 持久化到 settings.json。"""
+        self.auto_save_enabled = checked
+        self._update_auto_save_action_text()
+        settings = load_settings()
+        settings.auto_save_enabled = checked
+        save_settings(settings)
+        self.statusBar().showMessage(
+            "已开启自动保存" if checked else "已关闭自动保存（改动需点「保存」按钮写入）", 3000
+        )
+
     def schedule_save(self, category: str, field: str) -> None:
         if self._loading or not self.current_voucher:
             return
@@ -1874,7 +2006,10 @@ class SpecimenWindow(QMainWindow):
             timer.setSingleShot(True)
             timer.timeout.connect(lambda v=voucher, c=category, f=field: self.save_field(c, f, v))
             self._save_timers[key] = timer
-        self._save_timers[key].start(500)
+        # 旧逻辑：无条件 start(500) 自动保存。现按开关：自动保存关时 timer 仅登记不启动，
+        # 这样手动「保存」按钮的 _flush_pending_saves 仍能把改动捞出来写（关开关照样能存）。
+        if self.auto_save_enabled:
+            self._save_timers[key].start(500)
 
     def _cancel_pending_saves(self) -> None:
         for timer in self._save_timers.values():
@@ -3507,7 +3642,7 @@ class SpecimenWindow(QMainWindow):
             self.store.close()
         self.store = new_store
         self.workspace_root = target_path
-        self.matcher = SpeciesMatcher(self.workspace_root / "字段模版" / "表格信息预设字段.xlsx")
+        self.matcher = _species_matcher()  # 旧：读 workspace_root/字段模版/，现读软件自带预设
         # thumbnail_cache：未绑定启动时为 None，这里首次创建。
         if self.thumbnail_cache is None:
             self.thumbnail_cache = ThumbnailCache(self.workspace_root)
@@ -3654,12 +3789,17 @@ class SpecimenWindow(QMainWindow):
             current_settings.photo_filename_fill_shortcut = dlg.photo_filename_fill_shortcut
             current_settings.check_updates_on_startup = dlg.check_updates_box.isChecked()
             current_settings.ui_font_size = dlg.font_size
+            current_settings.cursor_style = dlg.cursor_style
+            current_settings.app_icon_variant = dlg.app_icon_variant
             save_settings(current_settings)
             self._cached_preview_quality = current_settings.preview_quality
             self._apply_photo_filename_fill_shortcut()
             # 应用全局字体大小并刷新所有窗口的表格字体/列宽。
             apply_app_font_size(current_settings.ui_font_size)
             self._refresh_all_windows_fonts()
+            # 应用趣味光标 + 应用图标变体（对所有已打开窗口即时生效）。
+            apply_app_cursor(current_settings.cursor_style)
+            apply_app_icon(current_settings.app_icon_variant)
 
     # ---- 全局字体缩放 ----
 
@@ -5511,6 +5651,34 @@ class SettingsDialog(QDialog):
         )
         layout.addRow("界面字体大小", self.font_size_spin)
 
+        # 趣味光标样式：替代默认箭头，可选卡通食指/手掌/钢笔/爪印/星星。
+        from .cursors import CURSOR_STYLE_OPTIONS
+        self.cursor_combo = QComboBox()
+        cursor_keys = list(CURSOR_STYLE_OPTIONS.keys())
+        for key in cursor_keys:
+            self.cursor_combo.addItem(CURSOR_STYLE_OPTIONS[key], key)
+        cursor_idx = (
+            cursor_keys.index(current_settings.cursor_style)
+            if current_settings.cursor_style in cursor_keys else 0
+        )
+        self.cursor_combo.setCurrentIndex(cursor_idx)
+        self.cursor_combo.setToolTip("把鼠标默认箭头换成趣味光标；文本框/拉伸等专用光标不受影响")
+        layout.addRow("光标样式", self.cursor_combo)
+
+        # 应用图标变体：4 款预生成图标可切换（窗口/任务栏图标）。
+        from .icon import APP_ICON_VARIANTS
+        self.icon_combo = QComboBox()
+        icon_keys = list(APP_ICON_VARIANTS.keys())
+        for key in icon_keys:
+            self.icon_combo.addItem(APP_ICON_VARIANTS[key], key)
+        icon_idx = (
+            icon_keys.index(current_settings.app_icon_variant)
+            if current_settings.app_icon_variant in icon_keys else 0
+        )
+        self.icon_combo.setCurrentIndex(icon_idx)
+        self.icon_combo.setToolTip("切换应用图标（窗口与任务栏）；exe 文件图标在打包时固定")
+        layout.addRow("应用图标", self.icon_combo)
+
         btn_row = QHBoxLayout()
         btn_row.addWidget(QPushButton("保存", clicked=self.accept))
         restore_btn = QPushButton("恢复默认设置")
@@ -5534,6 +5702,18 @@ class SettingsDialog(QDialog):
         self.check_updates_box.setChecked(defaults.check_updates_on_startup)
         # 字体大小复位到系统默认（spinbox 展示系统默认 pt，设置值存 0）。
         self.font_size_spin.setValue(_default_app_font_point or self.font().pointSize())
+        # 光标样式复位到默认箭头。
+        from .cursors import CURSOR_STYLE_OPTIONS
+        cursor_keys = list(CURSOR_STYLE_OPTIONS.keys())
+        self.cursor_combo.setCurrentIndex(
+            cursor_keys.index(defaults.cursor_style) if defaults.cursor_style in cursor_keys else 0
+        )
+        # 应用图标复位到默认变体。
+        from .icon import APP_ICON_VARIANTS
+        icon_keys = list(APP_ICON_VARIANTS.keys())
+        self.icon_combo.setCurrentIndex(
+            icon_keys.index(defaults.app_icon_variant) if defaults.app_icon_variant in icon_keys else 0
+        )
         # Apply immediately
         self.app.store.set_undo_depth(200)
         save_settings(defaults)
@@ -5543,6 +5723,8 @@ class SettingsDialog(QDialog):
         self.app._apply_photo_filename_fill_shortcut()
         apply_app_font_size(defaults.ui_font_size)  # defaults.ui_font_size == 0 -> 系统默认
         self.app._refresh_all_windows_fonts()
+        apply_app_cursor(defaults.cursor_style)  # 恢复系统箭头
+        apply_app_icon(defaults.app_icon_variant)  # 恢复默认图标变体
         QMessageBox.information(self, "已恢复", "所有设置已恢复为默认值。")
 
     def _choose_photo_library(self) -> None:
@@ -5564,6 +5746,17 @@ class SettingsDialog(QDialog):
     @property
     def image_viewer_path(self) -> str:
         return self.image_viewer_edit.text().strip()
+
+    @property
+    def cursor_style(self) -> str:
+        key = self.cursor_combo.currentData()
+        return key if isinstance(key, str) and key else "default"
+
+    @property
+    def app_icon_variant(self) -> str:
+        from .icon import DEFAULT_APP_ICON_VARIANT
+        key = self.icon_combo.currentData()
+        return key if isinstance(key, str) and key else DEFAULT_APP_ICON_VARIANT
 
     @property
     def photo_filename_fill_shortcut(self) -> str:
@@ -5645,4 +5838,8 @@ def run_app(workspace_root: Path | str | None) -> None:
     if window is None:
         QMessageBox.warning(None, "标本入库管理", "工作区无效，程序将退出。")
         return
+    # 旧逻辑：无此调用，光标始终系统箭头。现按用户设置应用趣味光标（窗口已创建后调用）。
+    _startup_settings = load_settings()
+    apply_app_cursor(_startup_settings.cursor_style)
+    apply_app_icon(_startup_settings.app_icon_variant)  # 应用用户选的图标变体
     app.exec_()

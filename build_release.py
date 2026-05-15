@@ -70,7 +70,7 @@ def _zip_files(zip_path: Path, base_dir: Path, rel_files: list[str], arc_prefix:
     return sha256(zip_path)
 
 
-def build_release(version: str, project_root: Path) -> Path:
+def build_release(version: str, project_root: Path, icon_path: Path | None = None) -> Path:
     release_dir = project_root / "releases" / f"v{version}"
     release_dir.mkdir(parents=True, exist_ok=True)
 
@@ -80,18 +80,38 @@ def build_release(version: str, project_root: Path) -> Path:
     spec_path = project_root / "build" / "specs"
     spec_path.mkdir(parents=True, exist_ok=True)
 
-    # Generate icon file for PyInstaller
-    icon_dir = project_root / "build" / "icons"
-    icon_dir.mkdir(parents=True, exist_ok=True)
-    icon_ico = icon_dir / "app_icon.ico"
-    try:
-        from specimen_app.icon import create_app_icon
-        img = create_app_icon()
-        img.save(str(icon_ico), "ICO")
-        print(f"图标已生成: {icon_ico}")
-    except Exception as exc:
-        print(f"警告：图标生成失败 ({exc})，将使用默认图标")
-        icon_ico = None
+    # Generate or select icon file for PyInstaller.
+    icon_file: Path | None = None
+    if icon_path is not None:
+        icon_file = icon_path if icon_path.is_absolute() else project_root / icon_path
+        if not icon_file.exists():
+            raise FileNotFoundError(f"指定图标不存在: {icon_file}")
+        print(f"使用指定图标: {icon_file}")
+    else:
+        # 未显式指定时：优先用预生成的默认图标变体（assets/），否则回退程序生成图标。
+        from specimen_app.icon import DEFAULT_APP_ICON_VARIANT
+        default_variant_ico = (
+            project_root / "assets" / "icons" / "app-icon-variants"
+            / DEFAULT_APP_ICON_VARIANT / f"{DEFAULT_APP_ICON_VARIANT}.ico"
+        )
+        if default_variant_ico.exists():
+            icon_file = default_variant_ico
+            print(f"使用默认图标变体: {icon_file}")
+        else:
+            icon_dir = project_root / "build" / "icons"
+            icon_dir.mkdir(parents=True, exist_ok=True)
+            icon_file = icon_dir / "app_icon.ico"
+            try:
+                from specimen_app.icon import create_app_icon
+                img = create_app_icon()
+                img.save(str(icon_file), "ICO")
+                print(f"图标已生成: {icon_file}")
+            except Exception as exc:
+                print(f"警告：图标生成失败 ({exc})，将使用默认图标")
+                icon_file = None
+
+    # 把图标变体素材打进包，运行时「设置 → 应用图标」才能切换。
+    icon_variants_dir = project_root / "assets" / "icons" / "app-icon-variants"
 
     command = [
         sys.executable,
@@ -112,8 +132,21 @@ def build_release(version: str, project_root: Path) -> Path:
         "--hidden-import",
         "tifffile",
     ]
-    if icon_ico and icon_ico.exists():
-        command.extend(["--icon", str(icon_ico)])
+    if icon_file and icon_file.exists():
+        command.extend(["--icon", str(icon_file)])
+    if icon_variants_dir.is_dir():
+        # PyInstaller --add-data 用 os.pathsep 分隔 src/dest（Win=";"，Linux=":"）。
+        command.extend([
+            "--add-data",
+            f"{icon_variants_dir}{os.pathsep}assets/icons/app-icon-variants",
+        ])
+    # 兜底字段模版：打开缺 字段模版/ 的工作区时从这里补齐（种名/科名自动匹配依赖它）。
+    bundled_templates = project_root / "specimen_app" / "字段模版"
+    if bundled_templates.is_dir():
+        command.extend([
+            "--add-data",
+            f"{bundled_templates}{os.pathsep}specimen_app/字段模版",
+        ])
     command.append("run_app.py")
     # 原代码保留说明：这里曾多出一个独立的 "]"，会导致 build_release.py 语法错误。
     subprocess.run(command, cwd=project_root, check=True)
@@ -218,6 +251,7 @@ def build_release(version: str, project_root: Path) -> Path:
         "stable_exe": str(stable_exe),
         "stable_updated": stable_updated,
         "stable_error": stable_error,
+        "icon": str(icon_file) if icon_file else "",
         "sha256": digest,
         "zip": zip_name,
         "zip_sha256": zip_digest,
@@ -259,8 +293,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=f"构建 {APP_NAME} {os_label} release")
     parser.add_argument("--version", default=__version__, help="发布版本号，默认读取 specimen_app.__version__")
     parser.add_argument("--project-root", default=".", help="项目根目录")
+    parser.add_argument("--icon", default="", help="可选：指定 PyInstaller 使用的图标文件，例如 .ico 或 .icns")
     args = parser.parse_args()
-    exe = build_release(args.version, Path(args.project_root).resolve())
+    icon = Path(args.icon) if args.icon else None
+    exe = build_release(args.version, Path(args.project_root).resolve(), icon)
     print(exe)
 
 
