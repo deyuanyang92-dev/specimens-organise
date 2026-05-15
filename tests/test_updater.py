@@ -97,7 +97,7 @@ class DownloadReleaseTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.served = self.root / "served"
         self.served.mkdir()
-        self.zip_name = "标本入库管理_v0.4.0_linux.zip"
+        self.zip_name = "setup_v0.4.0_linux.zip"
         self.zip_path = self.served / self.zip_name
         _make_release_zip(self.zip_path, "0.4.0")
         digest = updater._file_sha256(self.zip_path)

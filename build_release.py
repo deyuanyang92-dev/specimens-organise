@@ -191,8 +191,10 @@ def build_release(version: str, project_root: Path, icon_path: Path | None = Non
         encoding="utf-8",
     )
 
-    # 完整 zip：保留不动，向后兼容老客户端 / 无 update_manifest 的旧 release 回退路径。
-    zip_name = f"{APP_NAME}_v{version}_{platform_tag}.zip"
+    # 完整 zip：用户首次安装下载的包。命名改为纯 ASCII（旧：APP_NAME 前缀含中文，
+    # GitHub Actions 上传后文件名中文部分丢失，在 Releases 页显示为 _v{ver}_{plat}.zip，
+    # 用户看不懂；现改为 setup_ 前缀，意义明确、不含特殊字符）。
+    zip_name = f"setup_v{version}_{platform_tag}.zip"
     zip_path = release_dir / zip_name
     if zip_path.exists():
         zip_path.unlink()

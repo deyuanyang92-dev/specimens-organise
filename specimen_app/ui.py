@@ -364,6 +364,10 @@ def _species_matcher() -> SpeciesMatcher:
     """
     from .field_help import bundled_template_path
     preset = bundled_template_path("表格信息预设字段.xlsx")
+    if preset:
+        _startup_mark(f"taxonomy preset found: {preset}")
+    else:
+        _startup_mark("taxonomy preset: NOT FOUND — species autofill will be disabled")
     return SpeciesMatcher(preset or Path("__missing_taxonomy_preset__.xlsx"))
 
 
@@ -955,11 +959,9 @@ class SpecimenWindow(QMainWindow):
             self.select_voucher(vouchers[0], defer_preview=True)
         _startup_mark("_finish_initial_load: first voucher selected")
         self.statusBar().showMessage("工作区已加载", 2000)
-        # 分类预设缺失时给个非阻塞提示（Part 6 兜底补齐失败 / 模板源也没有时才会到这）。
+        # 分类预设缺失时显示持久黄色警告条（旧：8 秒状态栏消息，极易错过）。
         if self.matcher is not None and not list(self.matcher.all_rows()):
-            self.statusBar().showMessage(
-                "分类预设缺失，种名自动匹配不可用（缺 字段模版/表格信息预设字段.xlsx）", 8000
-            )
+            self._preset_warning_banner.show()
         QTimer.singleShot(1200, self._build_search_index_background)
         QTimer.singleShot(2500, self._maybe_check_updates_on_startup)
 
@@ -1164,6 +1166,20 @@ class SpecimenWindow(QMainWindow):
         central_layout = QVBoxLayout(central)
         central_layout.setContentsMargins(8, 8, 8, 4)
         central_layout.addLayout(ws_bar)
+
+        # 分类预设缺失警告条：正常启动时 hide()；bundled_template_path 找不到文件时 show()。
+        # 旧：_finish_initial_load 里仅有 8 秒状态栏消息，极易错过。现改为持久黄色条。
+        self._preset_warning_banner = QLabel(
+            "[ ! ] 分类预设文件缺失 — 种名/科名自动匹配已停用"
+            "（字段模版/表格信息预设字段.xlsx 未找到，请重新安装或更新软件）"
+        )
+        self._preset_warning_banner.setWordWrap(True)
+        self._preset_warning_banner.setStyleSheet(
+            "background-color: #fff3cd; color: #856404; padding: 6px 12px;"
+            "border-bottom: 1px solid #ffc107;"
+        )
+        self._preset_warning_banner.hide()
+        central_layout.addWidget(self._preset_warning_banner)
 
         # Stacked: graphics view (single) + grid frame (grid)
         self._photo_stack_container = QWidget()
@@ -1509,6 +1525,9 @@ class SpecimenWindow(QMainWindow):
         tools_menu.addAction("操作记录", self._open_action_log)
         # 新增：用 Excel 直接打开数据目录里的 xlsx（密码门，复用管理密码）。
         tools_menu.addAction("用 Excel 打开数据文件…", self._open_data_in_excel)
+        # 新增：将工作区数据版本号降回 1.0.0，以便旧版软件可以再次打开（旧：无此功能，升级后锁死）。
+        tools_menu.addSeparator()
+        tools_menu.addAction("降低工作区兼容版本…", self._downgrade_workspace_schema)
 
         view_menu = self.menuBar().addMenu("视图")
         for panel_name, panel_ref in [
@@ -2288,6 +2307,80 @@ class SpecimenWindow(QMainWindow):
             self, "已打开数据目录",
             "已打开「数据」目录，请用 Excel 打开其中的 .xlsx 文件编辑。\n\n"
             "编辑保存后，务必在本程序「重新打开工作区」或重启程序，才能加载最新数据。",
+        )
+
+    def _downgrade_workspace_schema(self) -> None:
+        """将工作区兼容版本降回 1.0.0，以便旧版软件可以打开此工作区。
+
+        旧：无此功能。用户用新版打开工作区后数据版本升至 1.1.x，旧软件看到版本高于其支持的
+        1.0.0 就锁死写入，且无任何恢复途径。现：新版软件提供本工具，让用户自助降级。
+        降级只改 工作区配置.json 里的版本号，不回滚任何数据内容。
+        """
+        TARGET_VERSION = "1.0.0"
+        store = getattr(self, "store", None)
+        if store is None:
+            QMessageBox.information(self, "未选择工作区", "请先选择工作区再使用此功能。")
+            return
+        current_version = str(store.config.get("data_schema_version", "1.0.0"))
+        def _ver(v: str) -> tuple[int, ...]:
+            parts = []
+            for p in str(v).split(".")[:3]:
+                try:
+                    parts.append(int(p))
+                except ValueError:
+                    parts.append(0)
+            return tuple(parts)
+
+        if _ver(current_version) <= _ver(TARGET_VERSION):
+            QMessageBox.information(
+                self, "无需操作",
+                f"当前工作区兼容版本已为 {current_version}，旧版软件可以直接打开。",
+            )
+            return
+        password, ok = QInputDialog.getText(
+            self, "降低工作区兼容版本",
+            "此操作将工作区数据版本降至 1.0.0，以便旧版软件（v0.3.x 及以下）可以打开。\n\n"
+            "数据内容不会改变，可随时用新版软件重新打开（会自动升回最新版本）。\n\n"
+            "请输入管理密码确认：",
+            QLineEdit.Password,
+        )
+        if not ok or not password:
+            return
+        if password != ADMIN_PASSWORD:
+            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
+            return
+        answer = QMessageBox.question(
+            self, "是否先创建数据快照？",
+            f"即将把工作区数据版本从 {current_version} 降至 {TARGET_VERSION}。\n\n"
+            "建议先创建数据快照，万一出现问题可以恢复。是否先建快照？",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Cancel:
+            return
+        if answer == QMessageBox.Yes:
+            try:
+                snapshot = store.create_data_snapshot(
+                    "降级兼容版本前快照", f"用户将数据版本从 {current_version} 降至 {TARGET_VERSION} 前自动快照"
+                )
+                self.statusBar().showMessage(f"已创建数据快照：{snapshot.name}", 5000)
+            except Exception as exc:
+                if QMessageBox.warning(
+                    self, "快照失败",
+                    f"创建数据快照失败：{exc}\n\n仍要继续降级吗？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                ) != QMessageBox.Yes:
+                    return
+        try:
+            store.downgrade_schema_version(TARGET_VERSION)
+        except Exception as exc:
+            QMessageBox.critical(self, "降级失败", f"操作失败：{exc}")
+            return
+        QMessageBox.information(
+            self, "降级完成",
+            f"工作区兼容版本已降至 {TARGET_VERSION}。\n\n"
+            "旧版软件现在可以打开此工作区。\n"
+            "下次用新版软件打开时，版本会自动升回最新。",
         )
 
     def _context_delete_voucher(self, voucher: str) -> None:

@@ -184,7 +184,11 @@ def check_latest_release(timeout: int = _TIMEOUT) -> LatestRelease | None:
     for asset in assets:
         name = str(asset.get("name", "") or "")
         url = str(asset.get("browser_download_url", "") or "")
-        if name.lower().endswith(".zip") and plat in name.lower():
+        # 旧：第一个含平台名的 .zip 就选中。新版 release 有 app_*、runtime_* 增量包，
+        # 如果它们排在前面会被误选为全量 fallback 包。明确跳过增量包前缀。
+        nl = name.lower()
+        if (nl.endswith(".zip") and plat in nl
+                and not nl.startswith("app_") and not nl.startswith("runtime_")):
             zip_url, zip_name = url, name
             break
     if not zip_url:

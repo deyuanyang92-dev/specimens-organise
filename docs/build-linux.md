@@ -62,7 +62,7 @@ releases/v0.4.0/
   ├── 标本入库管理_v0.4.0/         # 程序目录（onedir 模式）
   │   ├── 标本入库管理_v0.4.0     # 主程序（无后缀）
   │   └── _internal/              # Qt 运行时等
-  ├── 标本入库管理_v0.4.0_linux.zip
+  ├── setup_v0.4.0_linux.zip
   ├── update_manifest_linux.json
   └── sha256.txt
 ```
@@ -73,7 +73,7 @@ releases/v0.4.0/
 
 ```bash
 # 用户端运行
-unzip 标本入库管理_v0.4.0_linux.zip
+unzip setup_v0.4.0_linux.zip
 cd 标本入库管理_v0.4.0/
 chmod +x 标本入库管理_v0.4.0
 ./标本入库管理_v0.4.0

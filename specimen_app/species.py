@@ -114,7 +114,12 @@ class SpeciesMatcher:
         self._rows = self._load_rows()
 
     def _load_rows(self) -> list[SpeciesMatch]:
-        wb = load_workbook(self.preset_path, read_only=True, data_only=True)
+        # 旧：无异常保护，openpyxl 读取错误会向上抛，导致 _finish_initial_load 崩溃。
+        # 现：文件损坏 / 读取异常一律返回 []，由调用方的 all_rows() 触发空预设警告。
+        try:
+            wb = load_workbook(self.preset_path, read_only=True, data_only=True)
+        except Exception:
+            return []
         try:
             ws = wb.active
             header = [str(cell.value or "").strip() for cell in next(ws.iter_rows(max_row=1))]
@@ -136,6 +141,8 @@ class SpeciesMatcher:
                     )
                 )
             return rows
+        except Exception:
+            return []
         finally:
             wb.close()
 

@@ -24,7 +24,7 @@
 3. `.github/workflows/release.yml` 自动触发：在 `windows-latest` 和 `ubuntu-latest` 上各跑
    `python build_release.py --version 0.3.1`，把以下资产上传到对应的 GitHub Release：
 
-   - `标本入库管理_v0.3.1_{平台}.zip` + `.sha256` —— 完整包（向后兼容 / 回退用）
+   - `setup_v0.3.1_{平台}.zip` + `.sha256` —— 完整包（向后兼容 / 回退用；旧名含中文，GitHub Actions 上传后中文部分丢失，已改为 setup_ 前缀）
    - `app_v0.3.1_{平台}.zip` + `.sha256` —— **应用包**（小，应用代码，每版都变）
    - `runtime_{平台}_{hash}.zip` + `.sha256` —— **运行时包**（大，Python/PyQt5 等，按内容 hash 命名）
    - `update_manifest_{平台}.json` —— 增量更新清单，客户端据此决定怎么下

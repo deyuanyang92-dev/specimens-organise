@@ -1407,8 +1407,20 @@ class ExcelStore:
         current = str(self.config.get("data_schema_version", CURRENT_DATA_SCHEMA_VERSION))
         if _version_tuple(current) > _version_tuple(CURRENT_DATA_SCHEMA_VERSION):
             raise ImportConflictError(
-                f"该工作区数据版本为 {current}，高于当前软件支持的 {CURRENT_DATA_SCHEMA_VERSION}，已禁止写入。"
+                f"该工作区数据版本为 {current}，高于当前软件支持的 {CURRENT_DATA_SCHEMA_VERSION}，已禁止写入。\n\n"
+                "请升级软件到最新版本后再打开；或先用新版软件的「工具 → 降低工作区兼容版本」"
+                "将工作区版本降至 1.0.0，旧版软件即可重新打开。"
             )
+
+    def downgrade_schema_version(self, target: str = "1.0.0") -> None:
+        """将工作区兼容版本降至 target，以便旧版软件可以打开。
+
+        旧：无此方法，用户用新版打开工作区后数据版本升至 1.1.x，旧软件因版本检查锁死。
+        只修改 工作区配置.json 里的 data_schema_version，不回滚任何数据内容。
+        下次用新版软件打开时，_upgrade_workspace_schema 会自动重新升级。
+        """
+        self.config["data_schema_version"] = target
+        self._save_config()
 
     def _upgrade_workspace_schema(self) -> None:
         current = str(self.config.get("data_schema_version", "1.0.0"))
