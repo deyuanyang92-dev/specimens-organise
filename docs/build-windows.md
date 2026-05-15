@@ -65,15 +65,15 @@ python build_release.py
 也可指定版本号：
 
 ```cmd
-python build_release.py --version 0.2.4
+python build_release.py --version 0.4.0
 ```
 
 ## 构建产物
 
 ```
-releases/v0.2.4/
-  ├── 标本入库管理_v0.2.4/          # 完整程序目录
-  │   ├── 标本入库管理_v0.2.4.exe   # 主程序
+releases/v0.4.0/
+  ├── 标本入库管理_v0.4.0/          # 完整程序目录
+  │   ├── 标本入库管理_v0.4.0.exe   # 主程序
   │   ├── *.dll                     # 依赖库
   │   └── ...
   ├── build_info.json               # 构建信息
@@ -81,7 +81,7 @@ releases/v0.2.4/
   └── sha256.txt                    # 校验文件
 
 dist/标本入库管理/                    # 最新稳定版（同上目录结构的副本）
-  └── 标本入库管理_v0.2.4.exe
+  └── 标本入库管理_v0.4.0.exe
 ```
 
 ## 分发
