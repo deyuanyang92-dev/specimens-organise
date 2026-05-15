@@ -87,7 +87,7 @@ def build_release(version: str, project_root: Path, icon_path: Path | None = Non
         icon_file = icon_path if icon_path.is_absolute() else project_root / icon_path
         if not icon_file.exists():
             raise FileNotFoundError(f"指定图标不存在: {icon_file}")
-        print(f"使用指定图标: {icon_file}")
+        print(f"[icon] using specified icon: {icon_file}")
     else:
         # 未显式指定时：优先用预生成的默认图标变体（assets/），否则回退程序生成图标。
         from specimen_app.icon import DEFAULT_APP_ICON_VARIANT
@@ -97,7 +97,7 @@ def build_release(version: str, project_root: Path, icon_path: Path | None = Non
         )
         if default_variant_ico.exists():
             icon_file = default_variant_ico
-            print(f"使用默认图标变体: {icon_file}")
+            print(f"[icon] using default variant: {icon_file}")
         else:
             icon_dir = project_root / "build" / "icons"
             icon_dir.mkdir(parents=True, exist_ok=True)
@@ -106,9 +106,9 @@ def build_release(version: str, project_root: Path, icon_path: Path | None = Non
                 from specimen_app.icon import create_app_icon
                 img = create_app_icon()
                 img.save(str(icon_file), "ICO")
-                print(f"图标已生成: {icon_file}")
+                print(f"[icon] generated: {icon_file}")
             except Exception as exc:
-                print(f"警告：图标生成失败 ({exc})，将使用默认图标")
+                print(f"[icon] WARNING: generation failed ({exc}), no icon")
                 icon_file = None
 
     # 把图标变体素材打进包，运行时「设置 → 应用图标」才能切换。
