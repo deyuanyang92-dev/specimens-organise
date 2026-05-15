@@ -298,7 +298,7 @@ def main() -> None:
     args = parser.parse_args()
     icon = Path(args.icon) if args.icon else None
     exe = build_release(args.version, Path(args.project_root).resolve(), icon)
-    print(exe)
+    sys.stdout.buffer.write((str(exe) + "\n").encode("utf-8", errors="replace"))
 
 
 if __name__ == "__main__":
