@@ -13,7 +13,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from openpyxl import load_workbook
+# 规范化软件设计 2026-05 P1 优化:openpyxl 改函数内 lazy import,启动期不触发加载。
+# Python import 缓存保证首次真加载,后续是 sys.modules 字典查询(0 开销)。
 
 _TEMPLATE_DIR_NAME = "字段模版"
 _FIELD_HELP_FILE = "数据录入字段及字段说明.xlsx"
@@ -70,6 +71,7 @@ def load_field_help() -> dict[str, dict[str, str]]:
         _field_help_cache = result
         return result
     try:
+        from openpyxl import load_workbook  # lazy, P1 优化
         wb = load_workbook(path, read_only=True, data_only=True)
         try:
             # Sheet2 是字段说明表；找不到就退而用第二个 sheet。

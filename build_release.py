@@ -41,7 +41,10 @@ def partition_bundle(versioned_dir: Path, app_pkg: str = "specimen_app") -> tupl
     """把 bundle 目录下的文件分成 (应用分区, 运行时分区)，路径均为相对 bundle 目录的 posix 字符串。
 
     规则（确定、不依赖上一次构建）：
-    - 应用分区 = 根目录的 exe（文件名以 APP_NAME 开头）∪ ``_internal/{app_pkg}/**`` ∪ APP_META_FILE
+    - 应用分区 = 根目录的 exe（文件名以 APP_NAME 开头）
+        ∪ ``_internal/{app_pkg}/**`` ∪ APP_META_FILE
+        ∪ ``_internal/docs/**``（用户手册随应用一起更新，体积小，不进 runtime_hash —
+           规范化软件设计 2026-05 新增）
     - 运行时分区 = 其余全部
     """
     app_files: list[str] = []
@@ -56,6 +59,7 @@ def partition_bundle(versioned_dir: Path, app_pkg: str = "specimen_app") -> tupl
             rel_posix == APP_META_FILE
             or (len(parts) == 1 and parts[0].startswith(APP_NAME))
             or (len(parts) >= 2 and parts[0] == "_internal" and parts[1] == app_pkg)
+            or (len(parts) >= 2 and parts[0] == "_internal" and parts[1] == "docs")
         )
         (app_files if is_app else runtime_files).append(rel_posix)
     return app_files, runtime_files
@@ -147,6 +151,23 @@ def build_release(version: str, project_root: Path, icon_path: Path | None = Non
         command.extend([
             "--add-data",
             f"{bundled_templates}{os.pathsep}specimen_app/字段模版",
+        ])
+    # WoRMS 启动缓存：装机自带 ~15MB gz，离线环境开箱即可查 WoRMS 分类。
+    # 缺失时不报错（开发态或精简发布版），运行时 ensure_bootstrap_cache() 会跳过。
+    worms_bootstrap = project_root / "specimen_app" / "assets" / "worms_cache_bootstrap.sqlite.gz"
+    if worms_bootstrap.is_file():
+        command.extend([
+            "--add-data",
+            f"{worms_bootstrap}{os.pathsep}specimen_app/assets",
+        ])
+    # 用户手册（规范化软件设计 2026-05 新增）：docs/manual/*.md + 图片随包发布，
+    # Help → 使用说明 由 specimen_app/help_dialog.py 的 QTextBrowser + markdown 库即时渲染。
+    # 缺失时不报错；运行时 manual_root() 会返回 None，Help → 使用说明 弹兜底提示。
+    docs_manual = project_root / "docs" / "manual"
+    if docs_manual.is_dir():
+        command.extend([
+            "--add-data",
+            f"{docs_manual}{os.pathsep}docs/manual",
         ])
     command.append("run_app.py")
     # 原代码保留说明：这里曾多出一个独立的 "]"，会导致 build_release.py 语法错误。

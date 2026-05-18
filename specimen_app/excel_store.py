@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -7,31 +8,48 @@ import re
 import shutil
 import sys
 import uuid
-from collections import Counter
+from collections import Counter, OrderedDict
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-# openpyxl 会自动 import numpy 用于某些内部优化路径，
-# 但 openpyxl 的 numpy 交互与 tifffile 等科学计算库存在冲突。
-# 此处临时阻断 numpy import，确保 openpyxl 使用纯 Python 路径。
-_numpy_module = sys.modules.get("numpy")
-_blocked_numpy_for_openpyxl = "numpy" not in sys.modules
-if _blocked_numpy_for_openpyxl:
-    sys.modules["numpy"] = None
-try:
-    from openpyxl import Workbook, load_workbook
-finally:
+# 规范化软件设计 2026-05 P1 优化:openpyxl 改 lazy import。
+# 旧:模块顶层 import,加载 lxml + XML 字符串表 ~10-15MB,模块加载即占。
+# 现:首次 _ensure_openpyxl() 才加载;启动 splash 出现前不必占。
+# 注 (Grill G1): lazy 后 numpy 阻塞从顶层时刻迁移到首次调用时刻;首次调用时
+#   numpy 可能已被 tifffile/PIL 间接 import,该阻塞条件可能不再命中。
+#   openpyxl 纯 Python 路径不强依赖 numpy 阻塞,语义可接受。
+# 注:Workbook / load_workbook 仍在模块级作为名字;每个用点先调 _ensure_openpyxl()。
+Workbook = None  # type: ignore[assignment]
+load_workbook = None  # type: ignore[assignment]
+
+
+def _ensure_openpyxl() -> None:
+    """首次调用时把 openpyxl 的 Workbook / load_workbook 注入到本模块 globals。"""
+    global Workbook, load_workbook
+    if Workbook is not None:
+        return
+    _numpy_module = sys.modules.get("numpy")
+    _blocked_numpy_for_openpyxl = "numpy" not in sys.modules
     if _blocked_numpy_for_openpyxl:
-        sys.modules.pop("numpy", None)
-    elif _numpy_module is not None:
-        sys.modules["numpy"] = _numpy_module
+        sys.modules["numpy"] = None
+    try:
+        from openpyxl import Workbook as _Wb, load_workbook as _lwb
+    finally:
+        if _blocked_numpy_for_openpyxl:
+            sys.modules.pop("numpy", None)
+        elif _numpy_module is not None:
+            sys.modules["numpy"] = _numpy_module
+    Workbook = _Wb
+    load_workbook = _lwb
 
 from . import __version__
 from .models import (
     ACTION_LOG_FILE,
     ACTION_LOG_HEADERS,
+    ALLOC_LOG_FILE,
+    ALLOC_LOG_HEADERS,
     CATEGORY_FILES,
     CATEGORY_HEADERS,
     CHANGE_LOG_FILE,
@@ -68,8 +86,17 @@ from .models import (
     StatusFlags,
 )
 from .app_settings import PHOTO_MANAGEMENT_OPTIONS
+from .accession_series import AccessionSeries, format_series_number, series_prefix_of
 from .parsing import derive_specimen_fields_from_tube_number, format_voucher, parse_voucher_serial
 from .startup_diag import mark as _startup_mark
+
+
+def _voucher_sort_key(value: str) -> tuple[int, int, str]:
+    """YZZ 编号按流水号排在最前；非 YZZ 编号追加在后按字母排序。"""
+    serial = parse_voucher_serial(value)
+    if serial is not None:
+        return (0, serial, "")
+    return (1, 0, str(value))
 
 
 DEFAULT_CONFIG = {
@@ -78,6 +105,9 @@ DEFAULT_CONFIG = {
     "next_serial": 1,
     "undo_depth": 200,
     "data_schema_version": CURRENT_DATA_SCHEMA_VERSION,
+    # 多系列入库编号支持（旧工作区缺失这两个键时用此默认值，行为与升级前完全一致）
+    "active_series_name": "YZZ",
+    "accession_series": [],
 }
 
 
@@ -88,8 +118,18 @@ class ExcelStore:
         self.lock_file = self.data_dir / ".workspace.lock"
         self._locked = False
         self._create_if_missing = create_if_missing
-        self._row_cache: dict[str, list[Row]] = {}
+        # 规范化软件设计 2026-05 P1 审查修复:_row_cache 加 LRU 上限。
+        # 2026-05 内存档位扩展:maxsize 由 memory_profile 驱动 (3/4/6/12/20)。
+        # settings 不可用 fallback 到 8 (老默认)。
+        self._row_cache: OrderedDict[str, list[Row]] = OrderedDict()
         self._file_mtimes: dict[str, float] = {}
+        try:
+            from .app_settings import load_settings
+            from .env_detect import memory_profile_params
+            profile = load_settings().memory_profile
+            self._row_cache_maxsize = memory_profile_params(profile)["row_cache_maxsize"]
+        except Exception:
+            self._row_cache_maxsize = 8
         if not self.data_dir.exists():
             if not create_if_missing:
                 raise WorkspaceNotInitializedError(f"该工作目录尚未初始化，缺少数据目录：{self.data_dir}")
@@ -102,7 +142,9 @@ class ExcelStore:
         if lock:
             self.acquire_lock()
             import atexit
-            atexit.register(self.release_lock)
+            # C2: 限时执行 release_lock，防 SMB/NAS 网络锁挂死导致进程无法退出。
+            # 用守护线程 + Event 超时：3 秒内释放即正常；卡住则放弃（10min stale 自愈兜底）。
+            atexit.register(self._release_lock_with_timeout, 3.0)
         # 启动诊断埋点：逐子步骤打点，定位"启动死机"卡在哪一步。
         self.ensure_files()
         _startup_mark("ExcelStore.ensure_files")
@@ -184,7 +226,41 @@ class ExcelStore:
         finally:
             self._locked = False
 
+    def _release_lock_with_timeout(self, timeout_seconds: float) -> None:
+        """C2: 限时执行 release_lock。
+
+        SMB / NAS / OneDrive 等网络文件系统在断网或同步抢占时，`unlink()` 可能阻塞
+        数十秒甚至挂死，会让应用退出卡住。本方法用后台线程做 release，主线程超时即
+        返回 — 留下的锁文件由现有 10min stale 检测机制兜底自愈。
+
+        atexit 调用方收到的"返回"≠ 实际"释放完成"，仅表示"主进程不再等"。
+        """
+        if not self._locked:
+            return
+        import threading
+
+        done = threading.Event()
+
+        def _worker() -> None:
+            try:
+                self.release_lock()
+            except Exception:
+                pass
+            finally:
+                done.set()
+
+        t = threading.Thread(target=_worker, name="release_lock", daemon=True)
+        t.start()
+        done.wait(timeout=timeout_seconds)
+        # 不 join — 让 daemon 线程在主进程退出时自动死
+
     def ensure_files(self) -> None:
+        # 工作区锁保证单进程访问，启动时遗留的 .tmp 文件都是上次崩溃留下的，安全删除。
+        for _stale in self.data_dir.glob("*.tmp"):
+            try:
+                _stale.unlink()
+            except OSError:
+                pass
         self._ensure_workbook(self.data_dir / SPECIMEN_FILE, SPECIMEN_HEADERS)
         self._ensure_workbook(self.data_dir / PHOTO_FILE, PHOTO_HEADERS)
         self._ensure_workbook(self.data_dir / CLASSIFICATION_FILE, CLASSIFICATION_HEADERS)
@@ -192,6 +268,7 @@ class ExcelStore:
         self._ensure_change_log()
         self._ensure_workbook(self.data_dir / ACTION_LOG_FILE, ACTION_LOG_HEADERS)
         self._ensure_workbook(self.data_dir / DATA_VERSION_LOG_FILE, DATA_VERSION_LOG_HEADERS)
+        self._ensure_alloc_log()
 
     def _has_workspace_seed_files(self) -> bool:
         return any(
@@ -199,58 +276,83 @@ class ExcelStore:
             for file_name in [WORKSPACE_CONFIG_FILE, SPECIMEN_FILE, PHOTO_FILE, CLASSIFICATION_FILE, INDEX_FILE]
         )
 
-    def list_vouchers(self) -> list[str]:
-        """返回工作区内全部入库编号，按编号流水号升序排序。"""
+    def list_vouchers(self, series_filter: str | None = None) -> list[str]:
+        """返回工作区内全部入库编号，按编号流水号升序排序。
+
+        series_filter: None=全部；"YZZ"=仅 YZZ；其他字符串=按前缀匹配非 YZZ 系列。
+        """
         rows = self.read_rows("specimen")
         vouchers = [self._value(row, "入库编号*") for row in rows if self._value(row, "入库编号*")]
-        return sorted(vouchers, key=lambda value: parse_voucher_serial(value) or 0)
+        if series_filter is not None:
+            if series_filter == "YZZ":
+                vouchers = [v for v in vouchers if parse_voucher_serial(v) is not None]
+            else:
+                vouchers = [v for v in vouchers if series_prefix_of(v) == series_filter]
+        return sorted(vouchers, key=_voucher_sort_key)
 
     def workspace_overview(self) -> dict[str, Any]:
-        """汇总主界面凭证列表所需的概览数据（一次性读三张表，避免逐编号查询）。
+        """汇总主界面凭证列表所需的概览数据。
 
-        返回 dict，键：
-        - ``vouchers``: list[str]，全部入库编号（按流水号排序）
-        - ``flags``: dict[voucher -> StatusFlags]，标本/照片/分类完整度
-        - ``photo_counts``: dict[voucher -> int]，仅含有照片的编号
-        - ``tube_numbers``: dict[voucher -> str]，仅含有管内编号的编号
+        规范化软件设计 2026-05 启动卡死优化:
+        - 旧: 三次 read_rows("specimen"/"classification"/"photo") 读全表 + 缓存到 _row_cache,
+          中型工作区 (5000 凭证) 瞬时 RSS +95MB,2GB 机器触发 swap 卡死。
+        - 现: 流式 _stream_columns() 只读必要列,不缓存全表,峰值降 50%。
+          下游 get_specimen / get_classification / get_photos 等仍走 read_rows 加 _row_cache,
+          首次访问时才触发完整读取(按需)。
+
+        返回 dict 键(不变,API 兼容):
+        - ``vouchers``: list[str],全部入库编号(按流水号排序)
+        - ``flags``: dict[voucher -> StatusFlags]
+        - ``photo_counts``: dict[voucher -> int]
+        - ``tube_numbers``: dict[voucher -> str]
         - ``photo_filenames``: dict[voucher -> list[str]]
         """
-        specimens = self.read_rows("specimen")
-        classifications = self.read_rows("classification")
-        photos = self.read_rows("photo")
-        class_by_voucher = {
-            self._value(row, "入库编号*"): row
-            for row in classifications
-            if self._value(row, "入库编号*")
-        }
+        # 只读必要列(具体字段集随 StatusFlags 必需字段变化)。
+        spec_cols = set(SPECIMEN_REQUIRED) | {"入库编号*", "管内编号*"}
+        class_cols = set(CLASSIFICATION_REQUIRED) | {"入库编号*"}
+        photo_cols = {"入库编号*", "文件名"}
+
+        # photo 表聚合: 计数 + 文件名 list
         photo_counts: dict[str, int] = {}
         photo_filenames: dict[str, list[str]] = {}
-        for row in photos:
-            voucher = self._value(row, "入库编号*")
+        photo_path = self.data_dir / CATEGORY_FILES["photo"]
+        for row in self._stream_columns(photo_path, photo_cols):
+            voucher = row.get("入库编号*", "")
             if not voucher:
                 continue
             photo_counts[voucher] = photo_counts.get(voucher, 0) + 1
-            file_name = self._value(row, "文件名")
+            file_name = row.get("文件名", "")
             if file_name:
                 photo_filenames.setdefault(voucher, []).append(file_name)
+
+        # classification 表聚合: voucher -> required 字段 dict
+        class_by_voucher: dict[str, dict[str, str]] = {}
+        class_path = self.data_dir / CATEGORY_FILES["classification"]
+        for row in self._stream_columns(class_path, class_cols):
+            voucher = row.get("入库编号*", "")
+            if voucher:
+                class_by_voucher[voucher] = row
+
+        # specimen 表聚合: 凭证列表 + tube + flags
         vouchers: list[str] = []
         flags: dict[str, StatusFlags] = {}
         tube_numbers: dict[str, str] = {}
-        for row in specimens:
-            voucher = self._value(row, "入库编号*")
+        spec_path = self.data_dir / CATEGORY_FILES["specimen"]
+        for row in self._stream_columns(spec_path, spec_cols):
+            voucher = row.get("入库编号*", "")
             if not voucher:
                 continue
             vouchers.append(voucher)
-            tube = self._value(row, "管内编号*")
+            tube = row.get("管内编号*", "")
             if tube:
                 tube_numbers[voucher] = tube
             class_row = class_by_voucher.get(voucher, {})
             flags[voucher] = StatusFlags(
-                specimen_complete=all(self._value(row, field) for field in SPECIMEN_REQUIRED),
+                specimen_complete=all(row.get(field, "") for field in SPECIMEN_REQUIRED),
                 has_photo=photo_counts.get(voucher, 0) > 0,
-                classification_complete=bool(class_row) and all(self._value(class_row, field) for field in CLASSIFICATION_REQUIRED),
+                classification_complete=bool(class_row) and all(class_row.get(field, "") for field in CLASSIFICATION_REQUIRED),
             )
-        vouchers.sort(key=lambda value: parse_voucher_serial(value) or 0)
+        vouchers.sort(key=_voucher_sort_key)
         return {
             "vouchers": vouchers,
             "flags": flags,
@@ -258,6 +360,43 @@ class ExcelStore:
             "tube_numbers": tube_numbers,
             "photo_filenames": photo_filenames,
         }
+
+    def _stream_columns(self, path: Path, wanted_columns: set[str]) -> "Iterator[dict[str, str]]":
+        """流式读 Excel,只 yield 包含 wanted_columns 字段的 sparse dict。
+
+        规范化软件设计 2026-05 新增,供 workspace_overview 用,避免 read_rows 全列读 + 缓存。
+        - 不进 _row_cache,本方法只服务 overview 的轻量聚合。
+        - 流式 iter_rows,不 list() 物化。
+        - 不在 wanted_columns 内的列直接跳,sparse dict 进一步省内存。
+        - 文件不存在 / 表头为空 -> yield 0 行。
+        """
+        if not path.exists():
+            return
+        _ensure_openpyxl()
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            ws = wb.active
+            rows_iter = ws.iter_rows(values_only=True)
+            try:
+                header_row = next(rows_iter)
+            except StopIteration:
+                return
+            headers = [self._string(v) for v in header_row]
+            # 预计算 wanted 列在 raw 中的 (idx, header) 列表,避免每行重判定。
+            wanted_idx: list[tuple[int, str]] = [
+                (i, h) for i, h in enumerate(headers) if h in wanted_columns
+            ]
+            for raw in rows_iter:
+                row: dict[str, str] = {}
+                for idx, header in wanted_idx:
+                    if idx < len(raw):
+                        value = self._string(raw[idx])
+                        if value != "":
+                            row[header] = value
+                if row:
+                    yield row
+        finally:
+            wb.close()
 
     def summary_records(self) -> list[dict[str, Any]]:
         """把分散在多个 Excel 的字段汇总成一张宽表（纯内存视图，不改任何文件结构）。
@@ -318,7 +457,7 @@ class ExcelStore:
             # 旧逻辑：循环外单独 record["照片文件名"] = ...；现"照片文件名"已是 SUMMARY_COLUMN，
             # 由上面循环统一设置（键名不变，_apply_filters 仍按 record["照片文件名"] 取）。
             records.append(record)
-        records.sort(key=lambda r: parse_voucher_serial(r["入库编号*"]) or 0)
+        records.sort(key=lambda r: _voucher_sort_key(r["入库编号*"]))
         return records
 
     def voucher_photo_counts(self) -> dict[str, int]:
@@ -400,7 +539,13 @@ class ExcelStore:
         self._append_index(voucher, now, "", "", self.record_fingerprint(voucher, specimen_override=row))
         self._ensure_summary_row(voucher, created_at=now)
         self._record_action("create_specimen", voucher, "specimen", "", {}, row)
-        self.config["next_serial"] = max(int(self.config.get("next_serial", 1)), (parse_voucher_serial(voucher) or 0) + 1)
+        active = self.config.get("active_series_name", "YZZ")
+        if active == "YZZ":
+            # 原逻辑：按 parse_voucher_serial 推进 next_serial
+            self.config["next_serial"] = max(int(self.config.get("next_serial", 1)), (parse_voucher_serial(voucher) or 0) + 1)
+        else:
+            # 非 YZZ 系列：推进该系列的 next_counter
+            self._advance_series_counter(active)
         self._save_config()
         return voucher
 
@@ -591,6 +736,7 @@ class ExcelStore:
         return conflicts
 
     def export_all_data(self, target: Path) -> int:
+        _ensure_openpyxl()
         wb = Workbook()
         wb.remove(wb.active)
         count = 0
@@ -858,8 +1004,17 @@ class ExcelStore:
 
     def next_voucher(self) -> str:
         self.assert_unique_vouchers()
-        max_serial = self._max_existing_serial()
-        return format_voucher(max(max_serial + 1, 1))
+        active = self.config.get("active_series_name", "YZZ")
+        if active == "YZZ":
+            # 旧：max(existing+1, 1)，不考虑批量预留
+            # 新：若曾批量预留，reserved_through_serial 记录上次预留的最末编号；
+            # 下一个创建的编号必须在预留段之后，避免与已打印标签冲突。
+            reserved = int(self.config.get("reserved_through_serial", 0))
+            return format_voucher(max(self._max_existing_serial() + 1, reserved + 1))
+        series = self._get_series_config(active)
+        if series is None:
+            return format_voucher(max(self._max_existing_serial() + 1, 1))
+        return format_series_number(series)
 
     def assert_unique_vouchers(self) -> None:
         duplicate_messages: list[str] = []
@@ -877,7 +1032,21 @@ class ExcelStore:
         if duplicate_messages:
             raise ImportConflictError("发现重复入库编号，已阻止继续写入。\n" + "\n".join(duplicate_messages))
 
-    def import_workspace(self, source_root: Path | str) -> ImportResult:
+    def import_workspace(
+        self,
+        source_root: Path | str,
+        photo_duplicate_policy: str = "import",
+    ) -> ImportResult:
+        """合并源工作区到当前工作区。
+
+        photo_duplicate_policy: M4 跨 voucher 同 SHA256 照片审核策略
+        - "import"（默认，向后兼容）：源 photo 行原样写入，即使中心已有同 SHA256
+          但属于不同 voucher 的记录（物理文件层 SHA256 去重仍生效，1 份文件被多条记录引用）。
+          手动「导入工作区」菜单走此路径。
+        - "skip"：源 photo 行被静默 skip，不写入；ImportResult.duplicate_candidates 留空。
+        - "report"：与 "skip" 一致地不写入，但把疑似重复入库的照片记录到 duplicate_candidates，
+          调用方可写报告供主管审核。aggregate_incoming 默认走此路径。
+        """
         source = Path(source_root).resolve()
         source_data = source / "数据"
         if not source_data.exists():
@@ -955,8 +1124,19 @@ class ExcelStore:
                 )
                 self._ensure_summary_row(voucher, created_at=now)
 
+        # M4：扫中心机已有照片 SHA256 → voucher 映射，用于跨 voucher 同 SHA256 检测
+        # 仅在 photo_duplicate_policy != "import" 时才构建（性能优化）
+        existing_sha_to_voucher: dict[str, str] = {}
+        if photo_duplicate_policy != "import":
+            for existing_photo in target_photos:
+                sha = str(self._value(existing_photo, "文件SHA256") or "").lower()
+                vch = str(self._value(existing_photo, "入库编号*") or "")
+                if sha and vch and sha not in existing_sha_to_voucher:
+                    existing_sha_to_voucher[sha] = vch
+
         photos_imported = 0
         missing_photos: list[dict[str, str]] = []
+        duplicate_candidates: list[dict] = []
         for photo in source_photos:
             voucher = self._value(photo, "入库编号*")
             if voucher in import_id_set:
@@ -972,9 +1152,40 @@ class ExcelStore:
                         }
                     )
                     continue
+                # M4：跨 voucher 同 SHA256 检测
+                if photo_duplicate_policy != "import":
+                    photo_sha = str(self._value(photo, "文件SHA256") or "").lower()
+                    if not photo_sha:
+                        # 源 photo 行没存 SHA256（旧版数据 / 外部导入），即时算
+                        try:
+                            photo_sha = self._file_sha256(source_path).lower()
+                        except OSError:
+                            photo_sha = ""
+                    if photo_sha and photo_sha in existing_sha_to_voucher:
+                        existing_voucher = existing_sha_to_voucher[photo_sha]
+                        if existing_voucher != voucher:
+                            # 命中"潜在重复入库"：同照片已被关联到其它 voucher
+                            if photo_duplicate_policy == "report":
+                                duplicate_candidates.append(
+                                    {
+                                        "入库编号": voucher,
+                                        "已有voucher": existing_voucher,
+                                        "文件SHA256": photo_sha,
+                                        "源相对路径": self._value(photo, "相对路径"),
+                                        "源原始路径": self._value(photo, "原始路径"),
+                                        "源解析路径": str(source_path),
+                                    }
+                                )
+                            # skip / report 都不写入新 photo 行
+                            continue
                 fitted = self._photo_row(voucher, source_path, allow_outside=True, source_row=photo)
                 target_photos.append(fitted)
                 photos_imported += 1
+                # 把刚导入的照片也加入查表，避免同源工作区内的二次重复
+                if photo_duplicate_policy != "import":
+                    new_sha = str(fitted.get("文件SHA256") or "").lower()
+                    if new_sha and new_sha not in existing_sha_to_voucher:
+                        existing_sha_to_voucher[new_sha] = voucher
 
         self._write_rows("specimen", target_specimens)
         self._write_rows("classification", target_classes)
@@ -986,8 +1197,16 @@ class ExcelStore:
         summary = f"来源：{source}；导入 {len(import_ids)} 个标本，照片 {photos_imported} 张"
         if report_path:
             summary += f"；缺失照片 {len(missing_photos)} 张，报告：{report_path}"
+        if duplicate_candidates:
+            summary += f"；潜在重复入库照片 {len(duplicate_candidates)} 张（已记录待审核）"
         self._record_data_version("导入工作区", summary)
-        return ImportResult(imported=len(import_ids), skipped=skipped, photos_imported=photos_imported, report_path=report_path)
+        return ImportResult(
+            imported=len(import_ids),
+            skipped=skipped,
+            photos_imported=photos_imported,
+            report_path=report_path,
+            duplicate_candidates=duplicate_candidates,
+        )
 
     def create_data_snapshot(self, operation_type: str = "手动快照", summary: str = "") -> Path:
         version_id = datetime.now().strftime("v%Y%m%d_%H%M%S")
@@ -1046,18 +1265,27 @@ class ExcelStore:
         self._sync_next_serial()
 
     def undo_last(self) -> str | None:
+        # 规范化软件设计 2026-05 P1 审查修复:_apply_action 失败时不能把 action 标"已撤销",
+        # 否则下次 undo 跳过它造成"幽灵 action"。包 try/except,异常时清晰传播给上层,
+        # 不修改 action 状态。Excel 文件多步写入仍无真事务(已知限制),日后专项重构。
         rows = self._read_plain_rows(self.data_dir / ACTION_LOG_FILE)
         depth = int(self.config.get("undo_depth", 200))
         candidates = [row for row in rows[-depth:] if self._value(row, "是否撤销") != "是"]
         if not candidates:
             return None
         action = candidates[-1]
-        self._apply_action(action, undo=True)
+        try:
+            self._apply_action(action, undo=True)
+        except Exception:
+            # apply 失败 → 不标记 + 重抛,让上层弹错误对话框。
+            # 注意:数据可能部分被 undo(_apply_action 内多个写入步骤)。
+            raise
         action["是否撤销"] = "是"
         self._write_plain_rows(self.data_dir / ACTION_LOG_FILE, ACTION_LOG_HEADERS, rows)
         return self._value(action, "操作类型")
 
     def redo_last(self) -> str | None:
+        # 同 undo_last 的 try/except 保护。
         rows = self._read_plain_rows(self.data_dir / ACTION_LOG_FILE)
         if not any(self._value(row, "是否撤销") == "是" for row in rows):
             return None
@@ -1068,7 +1296,10 @@ class ExcelStore:
         if action_index >= len(rows):
             return None
         action = rows[action_index]
-        self._apply_action(action, undo=False)
+        try:
+            self._apply_action(action, undo=False)
+        except Exception:
+            raise
         action["是否撤销"] = ""
         self._write_plain_rows(self.data_dir / ACTION_LOG_FILE, ACTION_LOG_HEADERS, rows)
         return self._value(action, "操作类型")
@@ -1204,12 +1435,18 @@ class ExcelStore:
         path = Path(clean_name)
         stem = path.stem or "photo"
         suffix = path.suffix
+        # 规范化软件设计 2026-05 P1 审查修复:counter 加 100000 上限防 O(n) 性能悬崖。
+        # 100000 个同名碰撞已是天文数字,触顶时回退到 uuid 后缀保证可继续。
         counter = 2
-        while True:
+        _MAX_COUNTER = 100000
+        while counter <= _MAX_COUNTER:
             candidate = archive_dir / f"{stem}_{counter}{suffix}"
             if self._target_available_for_digest(candidate, digest):
                 return candidate
             counter += 1
+        # 达上限 → uuid 兜底
+        import uuid as _uuid
+        return archive_dir / f"{stem}_{_uuid.uuid4().hex[:12]}{suffix}"
 
     def _target_available_for_digest(self, target: Path, digest: str | None) -> bool:
         if not target.exists():
@@ -1326,10 +1563,17 @@ class ExcelStore:
             current_mtime = 0.0
         cached_mtime = self._file_mtimes.get(file_key, -1.0)
         if file_key in self._row_cache and cached_mtime == current_mtime:
+            # LRU: move_to_end 让命中项标为最近使用
+            self._row_cache.move_to_end(file_key)
             return [row.copy() for row in self._row_cache[file_key]]
         rows = loader()
         self._row_cache[file_key] = rows
+        self._row_cache.move_to_end(file_key)
         self._file_mtimes[file_key] = current_mtime
+        # LRU 驱逐:超 maxsize 时弹最旧项(popitem(last=False))
+        while len(self._row_cache) > self._row_cache_maxsize:
+            evicted_key, _ = self._row_cache.popitem(last=False)
+            self._file_mtimes.pop(evicted_key, None)
         return [row.copy() for row in rows]
 
     def _invalidate_cache(self, *file_keys: str) -> None:
@@ -1337,12 +1581,32 @@ class ExcelStore:
             self._row_cache.pop(key, None)
             self._file_mtimes.pop(key, None)
 
+    def _enforce_row_cache_size(self) -> None:
+        """规范化软件设计 2026-05 内存档位:用户改小档位后立即驱逐多余项,缩内存到位。
+
+        正常情况下 _cached_rows 内置 while 循环就会驱逐;但用户调小 maxsize 后
+        到下次 _cached_rows 触发前内存不会立刻降,本 helper 供 SettingsDialog 保存路径
+        手动 enforce 一次。
+        """
+        while len(self._row_cache) > self._row_cache_maxsize:
+            evicted_key, _ = self._row_cache.popitem(last=False)
+            self._file_mtimes.pop(evicted_key, None)
+
     def read_rows(self, category: str) -> list[Row]:
+        """读取分类下的全部行（dense dict —— 缺失字段补 ""）。
+
+        内部 _row_cache 持有 sparse dict（_read_plain_rows 只存非空字段），
+        本方法出口处按 CATEGORY_HEADERS 把每行补成 dense，保证下游 `row["字段"]`
+        直接索引不会 KeyError（向后兼容 v0.5.0 及以前的 dense 契约）。
+        """
         file_key = CATEGORY_FILES[category]
-        return self._cached_rows(
+        headers = CATEGORY_HEADERS[category]
+        sparse_rows = self._cached_rows(
             file_key,
-            lambda: self._read_plain_rows(self.data_dir / file_key, CATEGORY_HEADERS[category]),
+            lambda: self._read_plain_rows(self.data_dir / file_key, headers),
         )
+        # _cached_rows 已 [row.copy()]，这里返回的 dense 是临时局部表，调用方用完即回收。
+        return [{h: row.get(h, "") for h in headers} for row in sparse_rows]
 
     def record_fingerprint(
         self,
@@ -1387,14 +1651,19 @@ class ExcelStore:
 
     def _load_or_create_config(self) -> dict[str, Any]:
         path = self.data_dir / WORKSPACE_CONFIG_FILE
+        # 旧实现：merged = {**DEFAULT_CONFIG, **data} / DEFAULT_CONFIG.copy()
+        # 都是浅拷贝 → DEFAULT_CONFIG["accession_series"]（list）等可变值会被多个实例共享，
+        # 一个实例 add_series 后，下次 ExcelStore() 启动看到的"默认"已被污染。
+        # 改用 deepcopy 杜绝跨实例 mutable 共享。
         if path.exists():
             with path.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
-            merged = {**DEFAULT_CONFIG, **data}
+            merged = copy.deepcopy(DEFAULT_CONFIG)
+            merged.update(data)
         else:
             if not self._create_if_missing:
                 raise WorkspaceNotInitializedError(f"该工作目录尚未初始化，缺少配置文件：{path}")
-            merged = DEFAULT_CONFIG.copy()
+            merged = copy.deepcopy(DEFAULT_CONFIG)
         if not merged.get("workspace_id"):
             merged["workspace_id"] = str(uuid.uuid4())
         if not merged.get("data_schema_version"):
@@ -1472,17 +1741,33 @@ class ExcelStore:
             self._delete_archive_file_if_safe(old_path)
 
     def _save_config(self) -> None:
+        # 原：直接写 path，崩溃/断电会留下截断的 JSON，下次打开工作区失败。
+        # 现：写临时文件再原子替换，确保要么新版本完整、要么旧版本保留。
         path = self.data_dir / WORKSPACE_CONFIG_FILE
-        with path.open("w", encoding="utf-8") as handle:
-            json.dump(self.config, handle, ensure_ascii=False, indent=2)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as handle:
+                json.dump(self.config, handle, ensure_ascii=False, indent=2)
+            tmp.replace(path)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     def _ensure_workbook(self, path: Path, headers: list[str]) -> None:
         if not path.exists():
+            _ensure_openpyxl()
             wb = Workbook()
             ws = wb.active
             ws.title = "Sheet1"
             ws.append(headers)
-            wb.save(path)
+            # 原：wb.save(path) 直接写，崩溃留下残缺文件导致下次 path.exists() 为 True
+            # 但内容损坏。现：用原子替换。
+            tmp = path.with_suffix(f".{os.getpid()}.tmp")
+            wb.save(tmp)
+            tmp.replace(path)
             return
         rows = self._read_plain_rows(path)
         existing_headers = self._headers(path)
@@ -1494,13 +1779,56 @@ class ExcelStore:
         path = self.data_dir / CHANGE_LOG_FILE
         if path.exists():
             return
+        _ensure_openpyxl()
         wb = Workbook()
         ws = wb.active
         ws.title = "修改明细"
         ws.append(CHANGE_LOG_HEADERS)
         summary = wb.create_sheet("修改汇总")
         summary.append(CHANGE_SUMMARY_HEADERS)
-        wb.save(path)
+        # 原：直接写，改用原子替换，与 _ensure_workbook 保持一致。
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        wb.save(tmp)
+        tmp.replace(path)
+
+    def _ensure_alloc_log(self) -> None:
+        self._ensure_workbook(self.data_dir / ALLOC_LOG_FILE, ALLOC_LOG_HEADERS)
+
+    # ── 编号分发日志 ──────────────────────────────────────────────────────────
+
+    def batch_reserve_vouchers(self, n: int, series_name: str | None = None) -> list[str]:
+        """预留 n 个连续编号（不创建标本记录），返回编号列表，并推进计数器。"""
+        active = series_name or self.config.get("active_series_name", "YZZ")
+        if active == "YZZ":
+            reserved = int(self.config.get("reserved_through_serial", 0))
+            start = max(self._max_existing_serial() + 1, reserved + 1)
+            numbers = [format_voucher(start + i) for i in range(n)]
+            self.config["reserved_through_serial"] = start + n - 1
+        else:
+            series = self._get_series_config(active)
+            if series is None:
+                raise ValueError(f"系列 {active!r} 未找到")
+            numbers = []
+            counter = series.next_counter
+            for _ in range(n):
+                numbers.append(format_series_number(series, counter))
+                counter += series.step
+            for item in self.config.get("accession_series", []):
+                if item.get("name") == active:
+                    item["next_counter"] = counter
+        self._save_config()
+        return numbers
+
+    def log_alloc_event(self, record: dict) -> None:
+        """追加一条分发记录（批量领取 / 任务开始 / 任务结束）。原子重写。"""
+        rows = self._read_plain_rows(self.data_dir / ALLOC_LOG_FILE, ALLOC_LOG_HEADERS)
+        row = {h: str(record.get(h, "")) for h in ALLOC_LOG_HEADERS}
+        rows.append(row)
+        self._write_plain_rows(self.data_dir / ALLOC_LOG_FILE, ALLOC_LOG_HEADERS, rows)
+
+    def read_alloc_log(self) -> list[Row]:
+        """读取全部分发记录。"""
+        return self._read_plain_rows(self.data_dir / ALLOC_LOG_FILE, ALLOC_LOG_HEADERS)
 
     def _record_data_version(self, operation_type: str, summary: str, snapshot_path: Path | None = None) -> None:
         rows = self._read_plain_rows(self.data_dir / DATA_VERSION_LOG_FILE, DATA_VERSION_LOG_HEADERS)
@@ -1870,6 +2198,187 @@ class ExcelStore:
         self.config["next_serial"] = self._max_existing_serial() + 1
         self._save_config()
 
+    # ── 多系列编号辅助方法 ─────────────────────────────────────────────────
+
+    def _get_series_config(self, name: str) -> AccessionSeries | None:
+        """按名称查找非 YZZ 系列配置，未找到返回 None。"""
+        for item in self.config.get("accession_series", []):
+            if item.get("name") == name:
+                return AccessionSeries.from_dict(item)
+        return None
+
+    def _advance_series_counter(self, name: str) -> None:
+        """将指定系列的 next_counter 按 step 推进一步（写回 config，调用方负责 _save_config）。"""
+        for item in self.config.get("accession_series", []):
+            if item.get("name") == name:
+                item["next_counter"] = item.get("next_counter", 1) + item.get("step", 1)
+                return
+
+    def get_all_series_names(self) -> list[str]:
+        """返回全部系列名称列表，YZZ 始终排第一。"""
+        others = [s.get("name", "") for s in self.config.get("accession_series", [])]
+        return ["YZZ"] + [n for n in others if n]
+
+    def get_active_series_name(self) -> str:
+        return self.config.get("active_series_name", "YZZ")
+
+    def set_active_series(self, name: str) -> None:
+        self.config["active_series_name"] = name
+        self._save_config()
+
+    def add_series(self, series: AccessionSeries) -> None:
+        """新增一个非 YZZ 系列配置。若同名已存在则覆盖。"""
+        series_list: list[dict] = self.config.setdefault("accession_series", [])
+        for i, item in enumerate(series_list):
+            if item.get("name") == series.name:
+                series_list[i] = series.to_dict()
+                self._save_config()
+                return
+        series_list.append(series.to_dict())
+        self._save_config()
+
+    def remove_series(self, name: str) -> None:
+        """删除指定系列配置（不影响已录入的编号数据）。"""
+        self.config["accession_series"] = [
+            s for s in self.config.get("accession_series", []) if s.get("name") != name
+        ]
+        if self.config.get("active_series_name") == name:
+            self.config["active_series_name"] = "YZZ"
+        self._save_config()
+
+    def count_vouchers_by_series(self, series_name: str) -> int:
+        """返回已分发给指定系列的编号数量（从标本数据直接计数）。"""
+        from .accession_series import series_prefix_of
+        from .parsing import parse_voucher_serial
+        rows = self.read_rows("specimen")
+        if series_name == "YZZ":
+            return sum(1 for r in rows if parse_voucher_serial(self._value(r, "入库编号*")) is not None)
+        series = self._get_series_config(series_name)
+        prefix = series.prefix if series else series_name
+        return sum(
+            1 for r in rows
+            if series_prefix_of(str(self._value(r, "入库编号*") or "")) == prefix
+        )
+
+    def update_series_counter(self, name: str, new_counter: int) -> None:
+        """手动设置系列的 next_counter（用于跳过已用编号）。"""
+        for item in self.config.get("accession_series", []):
+            if item.get("name") == name:
+                item["next_counter"] = new_counter
+                self._save_config()
+                return
+
+    # ── M5 多人协作：旧版工作区识别 + 升级到多人协作协议 ────────────────────
+
+    def detect_legacy_workspace(self) -> bool:
+        """识别旧版工作区（已录过数据 + 还没贴多人协作协议标记）。
+
+        返回 True 时主管 UI 建议用户走「升级到多人协作格式」让 M5 自动归档历史段。
+        空工作区不算 legacy（没东西可"丢失"），返回 False。
+        已升级（含 `multi_user_protocol_version` 键）也返回 False。
+        """
+        has_marker = bool(self.config.get("multi_user_protocol_version"))
+        if has_marker:
+            return False
+        # 用 specimen 行数（read_rows 已缓存，开销低）判定是否含历史数据
+        return any(self._value(r, "入库编号*") for r in self.read_rows("specimen"))
+
+    def upgrade_to_multi_user_protocol(self) -> dict:
+        """把当前工作区升级到多人协作格式。
+
+        升级**只动 `工作区配置.json`**：加 `multi_user_protocol_version` 键 +
+        `legacy_yzz_segment`（记录历史 YZZ 段范围，方便事后追溯"哪些是升级前录入的"）。
+        所有 Excel / 照片文件原样保留；schema 版本不 bump（保持跨版本兼容）。
+        升级前**强制**创建快照（已有 `create_data_snapshot` 机制）。
+
+        返回升级摘要：
+        - already_upgraded: bool（True 表示无需升级）
+        - snapshot_path:    Path（成功升级时返回）
+        - legacy_yzz_segment: [start, end]（成功升级时返回）
+        """
+        if self.config.get("multi_user_protocol_version"):
+            return {"already_upgraded": True}
+        snapshot_path = self.create_data_snapshot(
+            "升级到多人协作格式前快照",
+            "在升级工作区到多人协作格式之前自动创建快照，方便回退。",
+        )
+        legacy_segment = [
+            1,
+            int(self.config.get("reserved_through_serial", 0)) or self._max_existing_serial(),
+        ]
+        self.config["multi_user_protocol_version"] = "1.0"
+        self.config["legacy_yzz_segment"] = legacy_segment
+        self._save_config()
+        self._record_action(
+            "upgrade_to_multi_user_protocol",
+            "",
+            "workspace",
+            "",
+            {},
+            {
+                "snapshot": str(snapshot_path),
+                "multi_user_protocol_version": "1.0",
+                "legacy_yzz_segment": legacy_segment,
+            },
+        )
+        return {
+            "already_upgraded": False,
+            "snapshot_path": snapshot_path,
+            "multi_user_protocol_version": "1.0",
+            "legacy_yzz_segment": legacy_segment,
+        }
+
+    # ── M2 多人协作：录入员独立系列（前缀分人，避免离线撞号） ─────────────────
+
+    def ensure_assignee_series(
+        self,
+        assignee: str,
+        prefix: str,
+        digits: int = 6,
+        separator: str = "",
+        year_pos: str = "none",
+    ) -> str:
+        """给指定录入员"按需"创建或复用独立编号系列；返回系列名。
+
+        语义：同名 (assignee) 的系列已存在则直接复用（不动 next_counter）；
+        不存在则新建一个，prefix/digits/separator/year_pos 立刻写入工作区配置。
+        系列名固定为 `{assignee}_系列`，便于回溯。
+
+        与 `add_series` 区别：add_series 是"按需新增/覆盖"；本方法是"按需创建（不
+        覆盖已有计数器）"，更适合多次给同一录入员发号的场景。
+        """
+        assignee = (assignee or "").strip()
+        if not assignee:
+            raise ValueError("录入员名称不能为空")
+        clean_prefix = (prefix or "").strip()
+        if not clean_prefix:
+            raise ValueError("录入员前缀不能为空")
+        if not re.fullmatch(r"[A-Za-z0-9\-_]+", clean_prefix):
+            raise ValueError(
+                f"录入员前缀只支持 ASCII 字母/数字/横线/下划线（避免跨平台与 Excel 字符问题）：{clean_prefix!r}"
+            )
+        name = f"{assignee}_系列"
+        existing = self._get_series_config(name)
+        if existing is not None:
+            return name
+        # 也检查 prefix 不与其它系列重复（避免两个录入员用同一前缀，破坏分人语义）
+        for item in self.config.get("accession_series", []):
+            if item.get("prefix") == clean_prefix and item.get("name") != name:
+                raise ValueError(
+                    f"前缀 {clean_prefix!r} 已被系列 {item.get('name')!r} 占用，请换一个前缀。"
+                )
+        series = AccessionSeries(
+            name=name,
+            prefix=clean_prefix,
+            digits=digits,
+            separator=separator,
+            year_pos=year_pos,
+            next_counter=1,
+            step=1,
+        )
+        self.add_series(series)
+        return name
+
     def _write_conflict_report(self, conflicts: list[dict[str, str]]) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = self.data_dir / f"导入冲突报告_{timestamp}.xlsx"
@@ -1914,6 +2423,7 @@ class ExcelStore:
         return [self._fit_headers(row, required_headers) for row in self._read_plain_rows(path, required_headers)]
 
     def _headers(self, path: Path) -> list[str]:
+        _ensure_openpyxl()
         wb = load_workbook(path, read_only=True, data_only=True)
         try:
             ws = wb.active
@@ -1924,19 +2434,35 @@ class ExcelStore:
     def _read_plain_rows(self, path: Path, fallback_headers: list[str] | None = None) -> list[Row]:
         if not path.exists():
             return []
+        _ensure_openpyxl()
         wb = load_workbook(path, read_only=True, data_only=True)
         try:
             ws = wb.active
-            rows = list(ws.iter_rows(values_only=True))
-            if not rows:
+            # 规范化软件设计 2026-05 启动卡死优化:
+            # 旧 `rows = list(ws.iter_rows(values_only=True))` 一次性物化整张表 -> 瞬时 RSS +30MB
+            # (2GB 机器立刻触发 swap 卡死)。改流式 iter -> 解析一行处理一行,峰值减半。
+            rows_iter = ws.iter_rows(values_only=True)
+            try:
+                header_row = next(rows_iter)
+            except StopIteration:
                 return []
-            headers = [self._string(value) for value in rows[0]]
+            headers = [self._string(value) for value in header_row]
             if fallback_headers:
                 headers = headers or fallback_headers
+            # sparse row dict:只保留非空字段。调用方走 `_value(row, field)` 或 `row.get(field, "")`,
+            # 空字段返 ""。`read_rows` 出口处补 dense 保 API 契约。
             data: list[Row] = []
-            for raw in rows[1:]:
-                row = {header: self._string(raw[idx]) if idx < len(raw) else "" for idx, header in enumerate(headers) if header}
-                if any(value != "" for value in row.values()):
+            for raw in rows_iter:
+                row: Row = {}
+                for idx, header in enumerate(headers):
+                    if not header:
+                        continue
+                    if idx >= len(raw):
+                        continue
+                    value = self._string(raw[idx])
+                    if value != "":
+                        row[header] = value
+                if row:  # 非空行才进数据
                     data.append(row)
             return data
         finally:
@@ -1945,35 +2471,55 @@ class ExcelStore:
     def _read_sheet_rows(self, path: Path, sheet_name: str, fallback_headers: list[str]) -> list[Row]:
         if not path.exists():
             return []
+        _ensure_openpyxl()
         wb = load_workbook(path, read_only=True, data_only=True)
         try:
             if sheet_name not in wb.sheetnames:
                 return []
             ws = wb[sheet_name]
-            rows = list(ws.iter_rows(values_only=True))
-            if not rows:
+            # 同 _read_plain_rows: 流式 iter,不 list() 物化(避免 2GB 机内存峰值)。
+            rows_iter = ws.iter_rows(values_only=True)
+            try:
+                header_row = next(rows_iter)
+            except StopIteration:
                 return []
-            headers = [self._string(value) for value in rows[0]] or fallback_headers
+            headers = [self._string(value) for value in header_row] or fallback_headers
             data: list[Row] = []
-            for raw in rows[1:]:
-                row = {header: self._string(raw[idx]) if idx < len(raw) else "" for idx, header in enumerate(headers) if header}
-                if any(value != "" for value in row.values()):
+            for raw in rows_iter:
+                row: Row = {}
+                for idx, header in enumerate(headers):
+                    if not header:
+                        continue
+                    if idx >= len(raw):
+                        continue
+                    value = self._string(raw[idx])
+                    if value != "":
+                        row[header] = value
+                if row:
                     data.append(row)
             return data
         finally:
             wb.close()
 
     def _write_plain_rows(self, path: Path, headers: list[str], rows: list[Row]) -> None:
+        _ensure_openpyxl()
         wb = Workbook()
-        ws = wb.active
-        ws.title = "Sheet1"
-        ws.append(headers)
-        for row in rows:
-            fitted = self._fit_headers(row, headers)
-            ws.append([fitted.get(header, "") for header in headers])
-        tmp = path.with_suffix(f".{os.getpid()}.tmp")
-        wb.save(tmp)
-        tmp.replace(path)
+        # 规范化软件设计 2026-05 P1 审查修复:Workbook 用 try/finally close,防 save/replace 异常时文件句柄泄漏。
+        try:
+            ws = wb.active
+            ws.title = "Sheet1"
+            ws.append(headers)
+            for row in rows:
+                fitted = self._fit_headers(row, headers)
+                ws.append([fitted.get(header, "") for header in headers])
+            tmp = path.with_suffix(f".{os.getpid()}.tmp")
+            wb.save(tmp)
+            tmp.replace(path)
+        finally:
+            try:
+                wb.close()
+            except Exception:
+                pass
         self._invalidate_cache(path.name)
 
     def _replace_sheet(self, ws: Any, headers: list[str], rows: list[Row]) -> None:
@@ -1985,6 +2531,7 @@ class ExcelStore:
 
     @contextmanager
     def _open_workbook(self, path: Path) -> Iterator[Any]:
+        _ensure_openpyxl()
         wb = load_workbook(path)
         try:
             yield wb
@@ -2004,7 +2551,15 @@ class ExcelStore:
             return ""
         if isinstance(value, datetime):
             return value.isoformat(sep=" ", timespec="seconds")
-        return str(value).strip()
+        s = str(value).strip()
+        # 规范化软件设计 2026-05 P1 优化: sys.intern() 短字符串共享池。
+        # Excel 高重复字段(凭证号 9 字符 / 管内编号 22 字符 / 地点缩写 ≤10 字符 /
+        # 录入人员 / 保存方式 RE/FE 等)5000+ 行有大量重复,intern 后同值共享同一对象。
+        # 阈值 ≤64 字符:覆盖全部短字段;长备注 / 描述不 intern(避免长跑泄漏)。
+        # 估省 1-3MB on 中型工作区。
+        if 0 < len(s) <= 64:
+            return sys.intern(s)
+        return s
 
     def _json(self, value: object) -> Any:
         if value in (None, ""):

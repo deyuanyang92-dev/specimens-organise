@@ -106,12 +106,16 @@ def is_newer(candidate: str, current: str = __version__) -> bool:
 # ---------------------------------------------------------------------------
 
 def _validate_url(url: str) -> None:
+    # 规范化软件设计 2026-05 P1 审查修复:用 parsed.hostname (剥端口) 而非 netloc,
+    # 防 "github.com:80@evil.com" 类 URL 利用 netloc 含 userinfo/port 绕过校验。
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https":
         raise UpdateError("下载地址必须是 HTTPS。")
-    host = (parsed.netloc or "").lower()
+    if parsed.username or parsed.password:
+        raise UpdateError("URL 不允许内嵌凭据。")
+    host = (parsed.hostname or "").lower()
     if not any(host == h or host.endswith("." + h) for h in _ALLOWED_HOSTS):
-        raise UpdateError(f"拒绝从非 GitHub 域名下载：{host}")
+        raise UpdateError(f"拒绝从非 GitHub 域名下载:{host}")
 
 
 def _http_get(url: str, *, timeout: int = _TIMEOUT) -> bytes:
@@ -254,14 +258,22 @@ def _extract_expected_hash(text: str, zip_name: str) -> str | None:
 
 
 def _safe_extract(zip_path: Path, dest: Path) -> None:
-    """解压 zip，并防止 zip-slip（成员路径逃逸出 dest）。"""
+    """解压 zip,并防止 zip-slip(成员路径逃逸出 dest)。
+
+    规范化软件设计 2026-05 P1 审查修复:用 Path.relative_to() 跨平台一致,
+    且拒绝绝对路径成员。
+    """
     dest.mkdir(parents=True, exist_ok=True)
-    dest_resolved = str(dest.resolve())
+    dest_resolved = dest.resolve()
     with zipfile.ZipFile(zip_path) as archive:
         for member in archive.namelist():
+            if Path(member).is_absolute() or member.startswith("/") or member.startswith("\\"):
+                raise UpdateError(f"压缩包包含绝对路径,已中止:{member}")
             target = (dest / member).resolve()
-            if str(target) != dest_resolved and not str(target).startswith(dest_resolved + os.sep):
-                raise UpdateError(f"压缩包包含非法路径，已中止：{member}")
+            try:
+                target.relative_to(dest_resolved)
+            except ValueError:
+                raise UpdateError(f"压缩包包含非法路径,已中止:{member}")
         archive.extractall(dest)
 
 

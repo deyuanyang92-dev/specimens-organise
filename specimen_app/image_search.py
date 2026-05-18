@@ -500,7 +500,9 @@ def _save_image_index_to_disk(cache_root: Path | str, key: tuple[tuple[str, ...]
     path = _image_index_disk_path(cache_root, key)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        # P1 审查修复:tmp 后缀加 uuid4 防同 PID 短期内多写竞争。
+        import uuid as _uuid
+        tmp = path.with_suffix(f".{os.getpid()}.{_uuid.uuid4().hex[:8]}.tmp")
         payload = {
             "version": IMAGE_INDEX_DISK_VERSION,
             "roots": list(key[0]),
@@ -721,7 +723,9 @@ def _save_search_index_to_disk(
     path = _image_index_disk_path(cache_root, key)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        # P1 审查修复:tmp 后缀加 uuid4 防同 PID 短期内多写竞争。
+        import uuid as _uuid
+        tmp = path.with_suffix(f".{os.getpid()}.{_uuid.uuid4().hex[:8]}.tmp")
         payload = {
             "version": IMAGE_INDEX_DISK_VERSION,
             "roots": list(key[0]),

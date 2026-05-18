@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -13,11 +13,12 @@ from .classification_fields import (
 
 SPECIMEN_FILE = "标本信息.xlsx"
 PHOTO_FILE = "照片信息.xlsx"
-CLASSIFICATION_FILE = "分类信息.xlsx"
+CLASSIFICATION_FILE = "分类信息.xlsx"  # 也供 server_sync.preview_aggregate 引用
 INDEX_FILE = "编号索引.xlsx"
 CHANGE_LOG_FILE = "修改记录.xlsx"
 ACTION_LOG_FILE = "操作记录.xlsx"
 DATA_VERSION_LOG_FILE = "数据版本记录.xlsx"
+ALLOC_LOG_FILE = "编号分发记录.xlsx"
 WORKSPACE_CONFIG_FILE = "工作区配置.json"
 DATA_VERSION_DIR = "数据版本"
 CURRENT_DATA_SCHEMA_VERSION = "1.1.2"
@@ -94,6 +95,20 @@ DATA_VERSION_LOG_HEADERS = [
     "操作者",
     "摘要",
     "快照路径",
+]
+
+ALLOC_LOG_HEADERS = [
+    "记录ID",
+    "时间",
+    "类型",        # 批量领取 / 任务开始 / 任务结束
+    "人员",
+    "用途",
+    "备注",
+    "编号系列",
+    "编号起始",
+    "编号结束",
+    "数量",
+    "关联任务ID",  # 任务结束时指向对应的任务开始记录ID
 ]
 
 SPECIMEN_REQUIRED = ["入库编号*", "管内编号*", "采集地点缩写*"]
@@ -200,7 +215,9 @@ class ImportConflictError(WorkspaceError):
         self.report_path = report_path
 
 
-@dataclass(frozen=True)
+# 规范化软件设计 2026-05 P1 优化:frozen dataclass 加 slots=True 省 __dict__ overhead。
+# Python 3.10+ 原生支持;3.13 项目内可用。5000 凭证 × StatusFlags ~ 省 750KB。
+@dataclass(frozen=True, slots=True)
 class StatusFlags:
     specimen_complete: bool
     has_photo: bool
@@ -214,20 +231,65 @@ class StatusFlags:
         ))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)  # P1 优化:slots 省 __dict__ overhead
 class ImportResult:
     imported: int
     skipped: int
     photos_imported: int
     report_path: Path | None = None
+    # M4 跨 voucher 同 SHA256 照片审核：当 import_workspace 的 photo_duplicate_policy
+    # 为 "report"/"skip" 时，命中"中心已存在同 SHA256 但属于不同 voucher"的源 photo 行
+    # 记录到这里。"report" 模式下源照片不会被写入 `照片信息.xlsx`，由调用方（aggregate_incoming）
+    # 收集到 duplicates/ 报告里，主管在 UI 审核后再决定是否补登。
+    # 默认行为（"import"）不写入此列表，向后兼容所有现有调用。
+    duplicate_candidates: list[dict] = field(default_factory=list)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ActionResult:
     action_id: str
     action_type: str
     voucher: str
     description: str
+
+
+# 多人协作 — 收件箱聚合返回结构（M1 / M4 / S3 字段）
+# conflicted / errored / duplicates 元素结构见 server_sync.aggregate_incoming 文档。
+# - conflicted:    list of (subdir_name, message, report_path | None)
+# - errored:       list of (subdir_name, message)
+# - duplicates:    list of (subdir_name, candidates_list, report_path | None)
+#                  candidates_list 元素见 ImportResult.duplicate_candidates 注释。
+# - name_conflicts (S3): list of (original_filename, entries_list)
+#                  entries_list 元素 = {"subdir":..., "voucher":..., "sha256":..., "archived_filename":...}
+#                  仅含跨子目录"原始文件名相同但 SHA256 不同"的项。物理层已通过加后缀 _2 解决，
+#                  这是告知用户"发生过同名不同内容"的事后报告。
+@dataclass(frozen=True, slots=True)
+class AggregateReport:
+    processed: list[str] = field(default_factory=list)
+    conflicted: list[tuple] = field(default_factory=list)
+    errored: list[tuple] = field(default_factory=list)
+    duplicates: list[tuple] = field(default_factory=list)
+    name_conflicts: list[tuple] = field(default_factory=list)
+    total_imported: int = 0
+    total_photos: int = 0
+    snapshot_path: Path | None = None
+    name_conflicts_report_path: Path | None = None
+
+
+# 多人协作 — 合并预览（S7 dry-run 结构，纯只读扫描结果）
+@dataclass(frozen=True, slots=True)
+class AggregatePreview:
+    """合并前的只读预览。每个候选子目录的预测结果。"""
+    # 每个候选子目录的预测：(subdir_name, predicted_outcome, voucher_count, note)
+    # predicted_outcome ∈ {"new", "skipped", "conflict", "segment_violation", "unreadable"}
+    candidates: list[tuple] = field(default_factory=list)
+    total_candidates: int = 0
+    predicted_new_vouchers: int = 0
+    predicted_skipped_vouchers: int = 0
+    predicted_conflicts: int = 0
+    predicted_photos: int = 0
+    predicted_name_conflicts: int = 0
+    predicted_cross_voucher_duplicates: int = 0
 
 
 Row = dict[str, Any]

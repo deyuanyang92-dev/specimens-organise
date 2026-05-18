@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>海洋动物标本图像机器学习物种分类综述与训练方案（2024-2026）</title>
+  <style>
+    :root {
+      --ink: #14213d;
+      --muted: #5c667a;
+      --line: #d9e1ea;
+      --paper: #f7fafc;
+      --panel: #ffffff;
+      --blue: #0b6b8f;
+      --teal: #0f8f86;
+      --green: #347d39;
+      --amber: #a15c07;
+      --red: #b42318;
+      --shadow: 0 18px 42px rgba(20, 33, 61, 0.10);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        linear-gradient(135deg, rgba(11, 107, 143, 0.08), transparent 32rem),
+        linear-gradient(225deg, rgba(15, 143, 134, 0.10), transparent 28rem),
+        var(--paper);
+      font-family: "Source Han Sans SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+      line-height: 1.72;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      gap: 0;
+      min-height: 100vh;
+    }
+
+    aside {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      padding: 28px 22px;
+      background: rgba(255, 255, 255, 0.82);
+      border-right: 1px solid var(--line);
+      overflow: auto;
+    }
+
+    aside h2 {
+      margin: 0 0 14px;
+      font-size: 18px;
+      line-height: 1.35;
+    }
+
+    nav a {
+      display: block;
+      padding: 7px 0;
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 14px;
+    }
+
+    nav a:hover { color: var(--blue); }
+
+    main {
+      padding: 44px 52px 72px;
+      max-width: 1220px;
+    }
+
+    .hero {
+      padding: 36px;
+      background: linear-gradient(135deg, rgba(255,255,255,0.94), rgba(237, 249, 248, 0.88));
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+
+    h1 {
+      margin: 0 0 14px;
+      font-size: clamp(28px, 4vw, 48px);
+      line-height: 1.15;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      max-width: 880px;
+      color: var(--muted);
+      font-size: 18px;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 22px;
+    }
+
+    .pill {
+      padding: 6px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #fff;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    section {
+      margin-top: 34px;
+      padding: 28px;
+      background: rgba(255,255,255,0.92);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(20, 33, 61, 0.05);
+    }
+
+    h2 {
+      margin: 0 0 14px;
+      font-size: 28px;
+      line-height: 1.25;
+    }
+
+    h3 {
+      margin: 22px 0 8px;
+      font-size: 20px;
+      line-height: 1.3;
+    }
+
+    p { margin: 0 0 12px; }
+
+    ul, ol {
+      margin: 8px 0 16px 22px;
+      padding: 0;
+    }
+
+    li { margin: 5px 0; }
+
+    code {
+      padding: 2px 5px;
+      border-radius: 4px;
+      background: #eef4f8;
+      color: #0f4662;
+      font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+      font-size: 0.92em;
+    }
+
+    pre {
+      overflow: auto;
+      padding: 16px;
+      border-radius: 8px;
+      background: #102033;
+      color: #e8f4ff;
+      line-height: 1.55;
+    }
+
+    pre code {
+      padding: 0;
+      background: transparent;
+      color: inherit;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 14px;
+    }
+
+    .note {
+      padding: 16px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #fbfdff;
+    }
+
+    .note strong {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--blue);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0 22px;
+      font-size: 14px;
+      background: #fff;
+    }
+
+    th, td {
+      border: 1px solid var(--line);
+      padding: 10px 12px;
+      vertical-align: top;
+    }
+
+    th {
+      background: #edf7f9;
+      text-align: left;
+      color: #12384a;
+    }
+
+    a { color: #075f80; }
+
+    .tag {
+      display: inline-block;
+      margin: 2px 4px 2px 0;
+      padding: 2px 7px;
+      border-radius: 999px;
+      border: 1px solid #cbdce8;
+      background: #f5fbfd;
+      color: #17465c;
+      font-size: 12px;
+    }
+
+    .rank {
+      font-weight: 700;
+      color: var(--teal);
+    }
+
+    .warn {
+      border-left: 4px solid var(--amber);
+      background: #fff8eb;
+    }
+
+    .danger {
+      border-left: 4px solid var(--red);
+      background: #fff5f4;
+    }
+
+    .ok {
+      border-left: 4px solid var(--green);
+      background: #f1fbf3;
+    }
+
+    footer {
+      margin-top: 34px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; }
+      aside {
+        position: relative;
+        height: auto;
+        border-right: none;
+        border-bottom: 1px solid var(--line);
+      }
+      main { padding: 24px 16px 48px; }
+      .hero, section { padding: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside>
+      <h2>海洋动物图像 AI 综述</h2>
+      <nav>
+        <a href="#summary">结论摘要</a>
+        <a href="#dataset">当前数据</a>
+        <a href="#progress">2024-2026 研究进展</a>
+        <a href="#github">GitHub 生态</a>
+        <a href="#methods">主流方法</a>
+        <a href="#labels">标注体系</a>
+        <a href="#training">训练方案</a>
+        <a href="#software">软件集成</a>
+        <a href="#metrics">评价指标</a>
+        <a href="#roadmap">实施路线</a>
+        <a href="#refs">参考链接</a>
+      </nav>
+    </aside>
+
+    <main>
+      <div class="hero">
+        <h1>海洋动物标本图像机器学习物种分类综述与训练方案（2024-2026）</h1>
+        <p class="subtitle">面向整体照、头部、疣足、刚毛等多部位图像，梳理当前机器学习用于物种分类的主流方法，并给出适合专业分类学家的专家参与式训练与软件集成路线。</p>
+        <div class="meta">
+          <span class="pill">生成日期：2026-05-15</span>
+          <span class="pill">数据路径：/mnt/n/codex/specimen-organise/测试数据集</span>
+          <span class="pill">重点：2024-2026</span>
+          <span class="pill">输出：候选识别 + 专家确认</span>
+        </div>
+      </div>
+
+      <section id="summary">
+        <h2>1. 结论摘要</h2>
+        <div class="grid">
+          <div class="note ok"><strong>最优先测试</strong>BioCLIP 2、DINOv2、Bio-DINO 的 embedding 和 kNN 检索。当前标签不足，不宜直接训练大型监督模型。</div>
+          <div class="note"><strong>最合理训练单位</strong>不是单张图片，而是一个标本个体及其多张证据图：整体、头部、疣足、刚毛、显微图。</div>
+          <div class="note warn"><strong>关键短板</strong>当前已有 160 张 TIFF 原图，但 Excel 中专家确认物种标签极少。标签质量比模型选择更重要。</div>
+          <div class="note"><strong>软件目标</strong>点击图片后给出 Top-k 分类候选、相似历史标本和自动填表建议，由专家确认后写入正式字段。</div>
+        </div>
+      </section>
+
+      <section id="dataset">
+        <h2>2. 当前数据</h2>
+        <table>
+          <tr><th>项目</th><th>结果</th></tr>
+          <tr><td>原始图片</td><td>160 张 `.tif`</td></tr>
+          <tr><td>总大小</td><td>约 6.2GB</td></tr>
+          <tr><td>单张尺寸</td><td>约 5130 x 3826 或 5182 x 3886</td></tr>
+          <tr><td>内容</td><td>黑底标准化标本照，带标尺/色卡，主体清楚</td></tr>
+          <tr><td>照片信息记录</td><td>40 条</td></tr>
+          <tr><td>有物种名的分类记录</td><td>3 条</td></tr>
+          <tr><td>可直接监督训练样本</td><td>约 4 张图片</td></tr>
+          <tr><td>疑似文件名分组</td><td>约 25 个代码，如 WSC、XTC、CSC、BZC、Cirratulidae</td></tr>
+        </table>
+        <p>当前图像质量足够好，但正式标签不足。第一步应建立 manifest、补齐标签、生成降采样训练图。</p>
+      </section>
+
+      <section id="progress">
+        <h2>3. 2024-2026 研究进展</h2>
+        <h3>3.1 生物视觉基础模型</h3>
+        <p><span class="rank">BioCLIP</span>（CVPR 2024）是近年最重要的生物视觉基础模型之一，面向 Tree of Life 训练，适合生物图像的 zero-shot、few-shot 和 embedding 检索。</p>
+        <p><span class="rank">BioCLIP 2</span>（2025）扩大到 TreeOfLife-200M，模型说明中提到约 214M 生物图像，强调层级对比学习和生物学 embedding 结构。对本项目应作为第一优先级。</p>
+        <p><span class="rank">Bio-DINO</span> 是生物多样性图像自监督 encoder，训练于约 31M 生物图像，适合做纯视觉相似检索。</p>
+        <p><span class="rank">Insect-Foundation</span>（IJCV 2025）说明类群专用视觉-语言基础模型正在成为趋势。</p>
+
+        <h3>3.2 自监督表征</h3>
+        <p>DINOv2（TMLR 2024）是强通用自监督视觉模型。对标签少的生物图像，常见路线是 frozen encoder + kNN / logistic regression / clustering。</p>
+
+        <h3>3.3 细粒度视觉分类</h3>
+        <p>FGVC 研究关注低类间差异和高类内差异。FET-FGVC（Pattern Recognition 2024）和 MCM-ViT（2025）都强调局部判别区域、多尺度和 mask 引导。对头部、疣足、刚毛等诊断性状非常相关。</p>
+
+        <h3>3.4 LifeCLEF 与真实生物识别</h3>
+        <p>LifeCLEF 2025 覆盖 AnimalCLEF、BirdCLEF+、FungiCLEF、GeoLifeCLEF、PlantCLEF。研究趋势是长尾、少样本、开放集、多标签、专家验证。</p>
+
+        <h3>3.5 层级与开放世界</h3>
+        <p>TaxonomyNet（Scientific Reports 2026）强调多阶元输出的一致性。对分类学软件而言，模型应同时输出科、属、种，并在种级不确定时退回到属/科级，而不是强制预测。</p>
+      </section>
+
+      <section id="github">
+        <h2>4. GitHub 项目生态</h2>
+        <table>
+          <tr><th>项目</th><th>Stars</th><th>许可证</th><th>用途</th><th>建议</th></tr>
+          <tr><td>ultralytics/ultralytics</td><td>57,156</td><td>AGPL-3.0</td><td>YOLO 检测/分割</td><td>可实验；正式集成注意许可证</td></tr>
+          <tr><td>facebookresearch/segment-anything</td><td>54,153</td><td>Apache-2.0</td><td>SAM 分割</td><td>可做主体/部位裁剪</td></tr>
+          <tr><td>huggingface/pytorch-image-models</td><td>36,810</td><td>Apache-2.0</td><td>timm 分类模型库</td><td>监督训练首选</td></tr>
+          <tr><td>mlfoundations/open_clip</td><td>13,806</td><td>NOASSERTION</td><td>CLIP/OpenCLIP</td><td>BioCLIP 生态</td></tr>
+          <tr><td>facebookresearch/dinov2</td><td>12,839</td><td>Apache-2.0</td><td>DINOv2</td><td>必测 embedding</td></tr>
+          <tr><td>facebookresearch/dinov3</td><td>10,392</td><td>NOASSERTION</td><td>DINOv3</td><td>第二批对照</td></tr>
+          <tr><td>IDEA-Research/GroundingDINO</td><td>10,108</td><td>Apache-2.0</td><td>文本提示检测</td><td>探索部位定位</td></tr>
+          <tr><td>Imageomics/bioclip</td><td>256</td><td>NOASSERTION</td><td>BioCLIP</td><td>star 不高但最相关</td></tr>
+          <tr><td>HumanSignal/label-studio</td><td>27,321</td><td>Apache-2.0</td><td>标注</td><td>推荐标注平台</td></tr>
+          <tr><td>cvat-ai/cvat</td><td>15,846</td><td>MIT</td><td>bbox/mask 标注</td><td>适合部位框选</td></tr>
+          <tr><td>voxel51/fiftyone</td><td>10,708</td><td>Apache-2.0</td><td>数据浏览/错误分析</td><td>强烈推荐</td></tr>
+        </table>
+      </section>
+
+      <section id="methods">
+        <h2>5. 主流方法体系</h2>
+        <div class="grid">
+          <div class="note"><strong>迁移学习分类</strong>EfficientNet、ConvNeXt、MobileNet、Swin、ViT。标签足够后训练稳定，但容易学到背景伪特征。</div>
+          <div class="note"><strong>生物基础模型</strong>BioCLIP 2、BioCLIP、OpenCLIP。适合 zero-shot、few-shot、拉丁名候选和 embedding 检索。</div>
+          <div class="note"><strong>自监督 embedding</strong>DINOv2、DINOv3、Bio-DINO。适合少标签、聚类、相似标本检索。</div>
+          <div class="note"><strong>局部/部位 FGVC</strong>attention、mask、part-based、multi-scale。适合头部、疣足、刚毛等诊断结构。</div>
+          <div class="note"><strong>检测/分割 + 分类</strong>SAM、GroundingDINO、YOLO。用于去除黑底、标尺、色卡，裁剪主体或局部结构。</div>
+          <div class="note"><strong>多图融合</strong>一个标本多张图，使用加权平均、attention pooling 或 MIL 输出标本级候选。</div>
+        </div>
+      </section>
+
+      <section id="labels">
+        <h2>6. 标注体系</h2>
+        <p>训练体系应围绕标本个体，而不是单张图片。建议每张图记录：</p>
+        <pre><code>specimen_id
+image_id
+image_path
+view_type        whole / head / parapodium / chaetae / microscope
+body_region      anterior / middle / posterior / unknown
+magnification    whole / macro / microscope_40x / microscope_100x
+species_name
+genus_name
+family_name
+expert_status    unlabeled / ai_suggested / expert_confirmed / rejected / cf / aff / sp
+diagnostic_note</code></pre>
+        <p>图片部位建议从这些枚举开始：</p>
+        <p>
+          <span class="tag">whole</span>
+          <span class="tag">head</span>
+          <span class="tag">parapodium</span>
+          <span class="tag">chaetae</span>
+          <span class="tag">pygidium</span>
+          <span class="tag">dorsal</span>
+          <span class="tag">ventral</span>
+          <span class="tag">microscope</span>
+          <span class="tag">unknown</span>
+        </p>
+      </section>
+
+      <section id="training">
+        <h2>7. 详细训练方案</h2>
+        <h3>阶段 0：数据治理</h3>
+        <ol>
+          <li>扫描全部 TIFF，生成 `manifest.csv`。</li>
+          <li>计算 SHA256，建立原图与派生图映射。</li>
+          <li>读取 Excel 的照片、标本、分类信息。</li>
+          <li>输出缺失报告：有图无标签、有记录无文件、有分类无照片、疑似重复。</li>
+        </ol>
+
+        <h3>阶段 1：图像预处理</h3>
+        <pre><code>dataset_derivatives/
+  jpg_1024/
+  jpg_768/
+  jpg_512/
+  thumb_256/</code></pre>
+        <p>原图保留不动，训练读取 JPEG/WebP 派生图。</p>
+
+        <h3>阶段 2：embedding 与相似检索</h3>
+        <p>先跑 BioCLIP 2、DINOv2、Bio-DINO，提取 embedding，做相似图检索和聚类。这一步最适合当前标签少的阶段。</p>
+
+        <h3>阶段 3：zero-shot / few-shot</h3>
+        <p>用拉丁种名、中文种名、属、科、形态短语构建候选词，测试 BioCLIP 2 输出 Top-k 的能力。</p>
+
+        <h3>阶段 4：监督分类基线</h3>
+        <p>标签足够后，用 EfficientNet-B0、ConvNeXt-Tiny、MobileNetV3、Swin-Tiny 训练。必须按 specimen_id 分组切分。</p>
+        <pre><code>image_size: 384 或 512
+batch_size: 4-16
+amp: true
+optimizer: AdamW
+epochs: 30-100
+early_stopping: true
+class_balanced_sampler: true</code></pre>
+
+        <h3>阶段 5：部位识别器</h3>
+        <p>先训练 `image -> view_type`，让软件能自动判断整体、头部、疣足、刚毛、显微图。</p>
+
+        <h3>阶段 6：部位专用模型</h3>
+        <p>分别训练 whole、head、parapodium、chaetae 的 embedding 或分类头。不同部位的解剖信息不同，不应全部混训。</p>
+
+        <h3>阶段 7：标本级多图融合</h3>
+        <pre><code>score(taxon) =
+  1.0 * mean(whole_scores) +
+  1.5 * mean(head_scores) +
+  2.0 * mean(parapodium_scores) +
+  2.5 * mean(chaetae_scores)</code></pre>
+        <p>后续可升级为 attention pooling 或 multiple instance learning。</p>
+      </section>
+
+      <section id="software">
+        <h2>8. 软件集成方案</h2>
+        <div class="note danger">
+          <strong>关键规则</strong>
+          AI 不直接覆盖专家字段。AI 只写建议字段，专家确认后再写入正式分类信息。
+        </div>
+        <p>点击图片后，AI 面板建议显示：</p>
+        <ul>
+          <li>当前图片部位：whole / head / parapodium / chaetae</li>
+          <li>单图候选 Top-5</li>
+          <li>标本级候选 Top-5</li>
+          <li>相似历史标本 Top-10</li>
+          <li>证据分解：整体、头部、疣足、刚毛分别支持什么</li>
+          <li>操作：填入分类信息、只填科/属、加入待复核、驳回建议</li>
+        </ul>
+        <p>推荐架构：</p>
+        <pre><code>PyQt 主程序
+  -> 本地 AI 推理服务 FastAPI/CLI
+      -> 模型加载
+      -> embedding 缓存
+      -> top-k 预测
+      -> 返回 JSON</code></pre>
+      </section>
+
+      <section id="metrics">
+        <h2>9. 评价指标</h2>
+        <table>
+          <tr><th>类别</th><th>指标</th></tr>
+          <tr><td>分类层级</td><td>family_top1, genus_top1, species_top1, species_top3, species_top5, hierarchical_consistency</td></tr>
+          <tr><td>长尾/少样本</td><td>macro_f1, balanced_accuracy, per_class_recall, rare_species_recall</td></tr>
+          <tr><td>检索</td><td>same_species_recall@1, same_species_recall@5, same_genus_recall@5, mAP</td></tr>
+          <tr><td>专家工作流</td><td>expert_accept_rate, expert_edit_rate, expert_reject_rate, time_saved_per_specimen</td></tr>
+          <tr><td>可靠性</td><td>calibration_error, unknown_rejection_accuracy, confusion_between_cryptic_groups</td></tr>
+        </table>
+      </section>
+
+      <section id="roadmap">
+        <h2>10. 实施路线</h2>
+        <table>
+          <tr><th>时间</th><th>目标</th><th>产出</th></tr>
+          <tr><td>第 1 周</td><td>数据清点与 manifest</td><td>manifest.csv、缺标签报告、JPEG 派生图</td></tr>
+          <tr><td>第 2 周</td><td>embedding 检索</td><td>BioCLIP 2 / DINOv2 相似图检索结果</td></tr>
+          <tr><td>第 3-4 周</td><td>专家补标</td><td>高质量 specimen-level 标签和 view_type 标签</td></tr>
+          <tr><td>第 5 周</td><td>监督基线</td><td>ConvNeXt-Tiny / EfficientNet-B0 对比报告</td></tr>
+          <tr><td>第 6-8 周</td><td>细节图扩展</td><td>部位识别器、部位 embedding 检索</td></tr>
+          <tr><td>第 9-12 周</td><td>软件集成</td><td>AI 识别面板、专家确认、自动填表建议</td></tr>
+        </table>
+      </section>
+
+      <section id="refs">
+        <h2>11. 关键参考链接</h2>
+        <ul>
+          <li><a href="https://openaccess.thecvf.com/content/CVPR2024/html/Stevens_BioCLIP_A_Vision_Foundation_Model_for_the_Tree_of_Life_CVPR_2024_paper.html">BioCLIP, CVPR 2024</a></li>
+          <li><a href="https://arxiv.org/abs/2505.23883">BioCLIP 2, arXiv 2025</a></li>
+          <li><a href="https://huggingface.co/imageomics/bioclip-2">BioCLIP 2 Hugging Face</a></li>
+          <li><a href="https://openreview.net/forum?id=a68SUt6zFt">DINOv2, TMLR 2024</a></li>
+          <li><a href="https://huggingface.co/birder-project/vit_reg4_so150m_p14_ls_dino-v2-bio">Bio-DINO model</a></li>
+          <li><a href="https://www.sciencedirect.com/science/article/pii/S0031320324000165">FET-FGVC, Pattern Recognition 2024</a></li>
+          <li><a href="https://www.sciencedirect.com/science/article/pii/S0045790624008140">MCM-ViT, 2025</a></li>
+          <li><a href="https://www.imageclef.org/LifeCLEF2025">LifeCLEF 2025</a></li>
+          <li><a href="https://arxiv.org/abs/2407.08027">Fish-Vista, 2024</a></li>
+          <li><a href="https://arxiv.org/abs/2505.14707">CrypticBio, 2025</a></li>
+          <li><a href="https://www.nature.com/articles/s41598-025-34944-x">TaxonomyNet, Scientific Reports 2026</a></li>
+          <li><a href="https://github.com/huggingface/pytorch-image-models">timm</a></li>
+          <li><a href="https://github.com/facebookresearch/segment-anything">Segment Anything</a></li>
+          <li><a href="https://github.com/google/cameratrapai">SpeciesNet / CameraTrapAI</a></li>
+        </ul>
+      </section>
+
+      <footer>
+        完整 Markdown 版本：docs/marine_species_ml_review_2024_2026.md
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

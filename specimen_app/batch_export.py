@@ -17,10 +17,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment
+# 规范化软件设计 2026-05 P1 优化:openpyxl 改函数内 lazy import,启动期不触发加载。
+# 模块常量 _HEADER_FONT 等改为 lazy property(_get_header_style).
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -29,6 +30,8 @@ from PyQt5.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -39,15 +42,59 @@ from PyQt5.QtWidgets import (
 
 if TYPE_CHECKING:
     from .excel_store import ExcelStore
+    from openpyxl import Workbook  # 仅 type hint 用,运行时 from __future__ annotations 不解析
 
-# Excel 表头样式
-_HEADER_FONT = Font(bold=True, size=11)
-_HEADER_FILL = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-_HEADER_ALIGNMENT = Alignment(horizontal="center")
+# Excel 表头样式 — lazy(模块加载时不触发 openpyxl import)
+_HEADER_STYLE_CACHE: tuple | None = None
+
+def _get_header_style() -> tuple:
+    """首次调用时加载 openpyxl 并构造 (Font, PatternFill, Alignment)。"""
+    global _HEADER_STYLE_CACHE
+    if _HEADER_STYLE_CACHE is None:
+        from openpyxl.styles import Font, PatternFill, Alignment
+        _HEADER_STYLE_CACHE = (
+            Font(bold=True, size=11),
+            PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid"),
+            Alignment(horizontal="center"),
+        )
+    return _HEADER_STYLE_CACHE
 
 # 照片导出格式：「保持原格式」= 原样 shutil.copy2（旧行为，兼容）；其余用 Pillow 重新编码。
 PHOTO_EXPORT_FORMATS = ("保持原格式", "JPG", "PNG", "TIFF")
 _FORMAT_EXT = {"JPG": ".jpg", "PNG": ".png", "TIFF": ".tif"}
+
+_UNSAFE_CHARS = re.compile(r'[/\\:*?"<>|]')
+
+
+def _safe_dirname(name: str) -> str:
+    """Return a filesystem-safe directory name from *name*.
+
+    Replaces Windows-illegal chars with '_', strips leading/trailing dots,
+    and caps at 60 characters (prevents MAX_PATH overrun with 科/属/种 nesting).
+    """
+    cleaned = _UNSAFE_CHARS.sub("_", name).strip(". ")
+    return cleaned[:60] or "_"
+
+
+def _species_dirname(cls: dict) -> str:
+    """Build species folder name from classification dict (中文种名_拉丁种名 or fallback)."""
+    cn  = (cls.get("种名*") or "").strip()
+    lat = (cls.get("种拉丁") or "").strip()
+    if cn and lat:
+        return _safe_dirname(f"{cn}_{lat}")
+    return _safe_dirname(cn or lat or "未知种")
+
+
+# Each resolver: (spec_dict, cls_dict) → folder name string (already safe).
+# Order of keys = default display order in the UI list.
+_LEVEL_RESOLVERS = {
+    "采集地点缩写": lambda spec, cls: _safe_dirname(spec.get("采集地点缩写*") or "未知地点"),
+    "目":          lambda spec, cls: _safe_dirname(cls.get("目") or "未知目"),
+    "科":          lambda spec, cls: _safe_dirname(cls.get("科*") or "未分类"),
+    "属":          lambda spec, cls: _safe_dirname(cls.get("属名") or "未知属"),
+    "种名":        lambda spec, cls: _species_dirname(cls),
+}
+_FOLDER_LEVEL_DEFAULTS = {"科", "属", "种名"}  # checked by default (= original 按科/属/种名 behavior)
 
 
 def _parse_voucher_numbers(text: str) -> list[str]:
@@ -72,11 +119,12 @@ def _parse_voucher_numbers(text: str) -> list[str]:
 
 def _write_header_row(ws, headers: list[str]) -> None:
     """写入带样式的表头行。"""
+    header_font, header_fill, header_alignment = _get_header_style()
     for col_idx, header in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col_idx, value=header)
-        cell.font = _HEADER_FONT
-        cell.fill = _HEADER_FILL
-        cell.alignment = _HEADER_ALIGNMENT
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_alignment
 
 
 def _auto_width(ws, min_width: int = 8, max_width: int = 60) -> None:
@@ -220,6 +268,24 @@ class BatchExportDialog(QDialog):
         resize_row.addStretch()
         fmt_layout.addLayout(resize_row)
 
+        # 文件夹层级：勾选 + 拖拽排序（原「按分类建子目录」复选框 → 原下拉预设 → 现自由组合列表）
+        # 默认勾选「科/属/种名」= 原有默认行为；全不勾 = 平铺。
+        fmt_layout.addWidget(QLabel("文件夹层级（勾选 + 拖拽排序）："))
+        self._folder_levels = QListWidget()
+        self._folder_levels.setDragDropMode(QAbstractItemView.InternalMove)
+        self._folder_levels.setFixedHeight(130)
+        self._folder_levels.setToolTip(
+            "勾选的层级按列表顺序拼成导出路径（可上下拖动调整顺序）。\n"
+            "全不勾选 = 平铺（所有照片在「照片/」根下）。\n"
+            "无论如何组合，文件名末尾均追加 _入库编号。"
+        )
+        for _lvl_label in _LEVEL_RESOLVERS:
+            _item = QListWidgetItem(_lvl_label)
+            _item.setFlags(_item.flags() | Qt.ItemIsUserCheckable)
+            _item.setCheckState(Qt.Checked if _lvl_label in _FOLDER_LEVEL_DEFAULTS else Qt.Unchecked)
+            self._folder_levels.addItem(_item)
+        fmt_layout.addWidget(self._folder_levels)
+
         layout.addWidget(fmt_group)
 
         # 「照片文件」勾选状态联动整组启用（与 ZIP 选项同一个信号源）。
@@ -278,6 +344,7 @@ class BatchExportDialog(QDialog):
         can_resize = photo_on and fmt != "保持原格式"
         self._chk_resize.setEnabled(can_resize)
         self._resize_spin.setEnabled(can_resize and self._chk_resize.isChecked())
+        self._folder_levels.setEnabled(photo_on)
 
     # ---- 导出逻辑 ----
 
@@ -337,24 +404,31 @@ class BatchExportDialog(QDialog):
 
         try:
             # 写入合并 Excel 文件
+            from openpyxl import Workbook  # lazy, P1 优化
             wb = Workbook()
-            # 删除默认空白 sheet（openpyxl 新工作簿自带 "Sheet"）
-            wb.remove(wb.active)
+            # 规范化软件设计 2026-05 P1 审查修复:用 try/finally 确保 Workbook 在任意路径都 close,
+            # 防 save 抛异常时文件句柄泄漏。
+            try:
+                # 删除默认空白 sheet（openpyxl 新工作簿自带 "Sheet"）
+                wb.remove(wb.active)
 
-            if self._chk_specimen.isChecked():
-                self._export_specimen_sheet(wb, valid_vouchers, errors)
+                if self._chk_specimen.isChecked():
+                    self._export_specimen_sheet(wb, valid_vouchers, errors)
 
-            if self._chk_classification.isChecked():
-                self._export_classification_sheet(wb, valid_vouchers, errors)
+                if self._chk_classification.isChecked():
+                    self._export_classification_sheet(wb, valid_vouchers, errors)
 
-            if self._chk_photo_paths.isChecked():
-                self._export_photo_paths_sheet(wb, valid_vouchers, errors)
+                if self._chk_photo_paths.isChecked():
+                    self._export_photo_paths_sheet(wb, valid_vouchers, errors)
 
-            if wb.sheetnames:
-                xlsx_path = export_dir / "导出汇总.xlsx"
-                wb.save(xlsx_path)
-            else:
-                wb.close()
+                if wb.sheetnames:
+                    xlsx_path = export_dir / "导出汇总.xlsx"
+                    wb.save(xlsx_path)
+            finally:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
 
             # 复制照片文件
             if self._chk_photo_files.isChecked():
@@ -365,16 +439,23 @@ class BatchExportDialog(QDialog):
             return
 
         # 5. 可选 ZIP 打包
+        # 规范化软件设计 2026-05 P1 审查修复:
+        # 旧:make_archive 成功后 rmtree 若失败(权限/锁),已生成 zip 但源目录残留。
+        # 现:先 make_archive,成功后单独 try rmtree;rmtree 失败不影响 final_path(已是 zip),
+        #     仅追加警告让用户知道残留目录。
         final_path = export_dir
         if self._chk_photo_files.isChecked() and self._chk_zip.isChecked():
             zip_base = str(export_dir)
             try:
                 final_zip = shutil.make_archive(zip_base, "zip", export_dir.parent, export_dir.name)
-                # 打包成功后清理原目录
-                shutil.rmtree(export_dir)
                 final_path = Path(final_zip)
+                # 打包成功 → 尝试清理源目录(失败不阻断)
+                try:
+                    shutil.rmtree(export_dir)
+                except Exception as rm_exc:
+                    errors.append(f"ZIP 已生成,但清理临时目录失败:{rm_exc}(可手动删 {export_dir})")
             except Exception as exc:
-                errors.append(f"ZIP 打包失败：{exc}")
+                errors.append(f"ZIP 打包失败:{exc}")
 
         # 6. 结果反馈
         missing_warning = ""
@@ -451,37 +532,67 @@ class BatchExportDialog(QDialog):
         """导出照片文件到导出目录的 /照片 子文件夹。
 
         旧逻辑：一律 shutil.copy2 原样复制。保留为「保持原格式」分支（兼容）。
-        新增：选 JPG/PNG/TIFF 时用 Pillow 重新编码（可调质量 + 可选等比缩放），
-              dest 扩展名随目标格式变；原始照片 / 工作区归档副本只读取、不改动。
-        处理同名冲突：使用 _2, _3 后缀。返回成功导出的照片数量。
+        新增：
+        - 选 JPG/PNG/TIFF 时用 Pillow 重新编码（可调质量 + 可选等比缩放）。
+        - 所有照片文件名末尾追加 _入库编号（stem_voucher.ext）。
+        - 勾选「按分类建子目录」时，按「科/属/种名」建多级子目录（fallback：未分类/未知属/未知种）。
+        处理同名冲突：使用 _2, _3 后缀（基于目标目录+文件名，避免跨目录误计）。
+        返回成功导出的照片数量。
         """
-        photo_dir = export_dir / "照片"
-        photo_dir.mkdir(exist_ok=True)
+        base_photo_dir = export_dir / "照片"
+        base_photo_dir.mkdir(exist_ok=True)
         count = 0
-        seen_names: dict[str, int] = {}
+        seen_names: dict[tuple, int] = {}  # (str(photo_dir), filename) → collision count
 
         fmt = self._photo_format.currentText()
         quality = self._quality_slider.value()
         max_edge = self._resize_spin.value() if self._chk_resize.isChecked() else 0
 
+        # Collect active (checked) levels in current display order — supports drag-reorder.
+        active_levels = [
+            self._folder_levels.item(i).text()
+            for i in range(self._folder_levels.count())
+            if self._folder_levels.item(i).checkState() == Qt.Checked
+        ]
+
         for voucher in vouchers:
             photos = self.store.get_photos(voucher)
+
+            # --- 确定目标子目录（每个标本固定一个，该标本所有照片归入同一目录）---
+            # 原逻辑：只有「按科/属/种名」和「平铺」两种。现改为自由勾选+排序（_folder_levels）。
+            if active_levels:
+                spec = self.store.get_specimen(voucher) or {}
+                cls  = self.store.get_classification(voucher) or {}
+                photo_dir = base_photo_dir
+                for lvl in active_levels:
+                    photo_dir = photo_dir / _LEVEL_RESOLVERS[lvl](spec, cls)
+            else:
+                photo_dir = base_photo_dir  # 平铺：全不勾选时
+            photo_dir.mkdir(parents=True, exist_ok=True)
+
             for photo in photos:
                 resolved = self.store.resolve_photo_path(photo)
                 if not resolved.exists():
                     continue
-                filename = str(photo.get("文件名", "")) or resolved.name
+
+                # --- 文件名：先追加 _入库编号，再转格式（保留旧行为结构，插入后缀）---
+                base_name = str(photo.get("文件名", "")) or resolved.name
+                stem, ext = os.path.splitext(base_name)
+                filename = f"{stem}_{voucher}{ext}"  # 追加入库编号后缀
+
                 # 转格式时把扩展名换成目标格式（「保持原格式」不动，等同旧行为）。
                 if fmt != "保持原格式":
-                    stem, _ext = os.path.splitext(filename)
-                    filename = f"{stem}{_FORMAT_EXT[fmt]}"
-                # 处理同名冲突（基于最终文件名）
-                if filename in seen_names:
-                    seen_names[filename] += 1
-                    stem, ext = os.path.splitext(filename)
-                    dest_name = f"{stem}_{seen_names[filename]}{ext}"
+                    stem2, _ = os.path.splitext(filename)
+                    filename = f"{stem2}{_FORMAT_EXT[fmt]}"
+
+                # 处理同名冲突（按目标目录单独计数，不同目录间互不干扰）。
+                dir_key = (str(photo_dir), filename)
+                if dir_key in seen_names:
+                    seen_names[dir_key] += 1
+                    stem3, ext3 = os.path.splitext(filename)
+                    dest_name = f"{stem3}_{seen_names[dir_key]}{ext3}"
                 else:
-                    seen_names[filename] = 1
+                    seen_names[dir_key] = 1
                     dest_name = filename
 
                 dest = photo_dir / dest_name
@@ -501,17 +612,34 @@ class BatchExportDialog(QDialog):
         """用 Pillow 把 src 重新编码为目标格式写到 dest。
 
         max_edge>0 时按最大边长等比缩小（不放大）。TIFF 等多页/特殊图先靠 Pillow
-        原生解码；解不开会抛异常，由调用方逐张兜底记入 errors。
+        原生解码；解不开会抛异常,由调用方逐张兜底记入 errors。
+
+        规范化软件设计 2026-05 P1 审查修复:
+        旧:`img = ImageOps.exif_transpose(opened)` 后 `img` 可能是新对象,
+            JPG 路径再 `img.convert("RGB")` 又创新对象,中间 Image 没显式关。
+        现:用嵌套 try/finally 确保所有中间 Image 对象的 close。
         """
         from PIL import Image, ImageOps
 
         with Image.open(src) as opened:
-            img = ImageOps.exif_transpose(opened)  # 按 EXIF 摆正方向
-            if max_edge > 0:
-                img.thumbnail((max_edge, max_edge), Image.LANCZOS)
-            if fmt == "JPG":
-                img.convert("RGB").save(dest, "JPEG", quality=quality, optimize=True)
-            elif fmt == "PNG":
-                img.save(dest, "PNG")
-            else:  # TIFF
-                img.save(dest, "TIFF")
+            img = ImageOps.exif_transpose(opened)
+            try:
+                if max_edge > 0:
+                    img.thumbnail((max_edge, max_edge), Image.LANCZOS)
+                if fmt == "JPG":
+                    rgb = img.convert("RGB")
+                    try:
+                        rgb.save(dest, "JPEG", quality=quality, optimize=True)
+                    finally:
+                        if rgb is not img:
+                            try: rgb.close()
+                            except Exception: pass
+                elif fmt == "PNG":
+                    img.save(dest, "PNG")
+                else:  # TIFF
+                    img.save(dest, "TIFF")
+            finally:
+                # exif_transpose 在大多数情况返回新对象,显式关确保不依赖 GC。
+                if img is not opened:
+                    try: img.close()
+                    except Exception: pass

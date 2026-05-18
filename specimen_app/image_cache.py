@@ -14,6 +14,7 @@ _NUMPY = None
 _TIFFFILE = None
 _TIFF_IMPORT_ATTEMPTED = False
 DEFAULT_MEMORY_CACHE_BYTES = 64 * 1024 * 1024
+LOW_MEMORY_CACHE_BYTES = 16 * 1024 * 1024  # 规范化软件设计 2026-05 启动卡死优化:2GB 机器降到 16MB
 
 # 解码硬上限（像素数）。标本扫描原图常达数亿像素，全分辨率解码进内存 + 多张并发会耗尽
 # 内存导致整机卡死。任何超过此上限的图，在做 exif/convert/缩放等会分配全尺寸缓冲的操作
@@ -21,11 +22,35 @@ DEFAULT_MEMORY_CACHE_BYTES = 64 * 1024 * 1024
 _MAX_DECODE_PIXELS = 24_000_000
 
 
+def _default_memory_limit() -> int:
+    """根据运行环境选默认缩略图缓存大小。
+
+    规范化软件设计 2026-05 起优先读 settings.memory_profile,
+    经 env_detect.memory_profile_params 映射为具体 bytes。
+    settings 未配置 / profile 异常 fallback 到原 is_low_memory 二档逻辑。
+    """
+    try:
+        from .app_settings import load_settings
+        from .env_detect import memory_profile_params
+        profile = load_settings().memory_profile
+        return memory_profile_params(profile)["thumb_cache_bytes"]
+    except Exception:
+        pass
+    try:
+        from .env_detect import is_low_memory
+        return LOW_MEMORY_CACHE_BYTES if is_low_memory() else DEFAULT_MEMORY_CACHE_BYTES
+    except Exception:
+        return DEFAULT_MEMORY_CACHE_BYTES
+
+
 class ThumbnailCache:
-    def __init__(self, workspace_root: Path | str, memory_limit_bytes: int = DEFAULT_MEMORY_CACHE_BYTES):
+    def __init__(self, workspace_root: Path | str, memory_limit_bytes: int | None = None):
         self.workspace_root = Path(workspace_root).resolve()
         self.cache_dir = self.workspace_root / "数据" / "缩略图缓存"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # memory_limit_bytes=None 时按环境自动选(规范化软件设计 2026-05 新增)。
+        if memory_limit_bytes is None:
+            memory_limit_bytes = _default_memory_limit()
         self.memory_limit_bytes = max(4 * 1024 * 1024, int(memory_limit_bytes))
         self._memory_cache: OrderedDict[str, tuple[Image.Image, int]] = OrderedDict()
         self._memory_cache_bytes = 0
@@ -128,17 +153,25 @@ def load_source_image(path: Path, max_size: tuple[int, int] | None = None) -> Im
         image = _load_tiff(path, max_size=max_size)
         if image is not None:
             return image
+    # 规范化软件设计 2026-05 P1 审查修复:image 变量多次重赋值,源缓冲与中间对象都靠 with 关闭。
+    # try/finally 确保任意中间步骤异常时,源 image 句柄也能释放(出 with 块自动关原图,
+    # 但 _downsample_if_huge / exif_transpose / convert 创建的新 Image 对象由 GC 处理)。
     with Image.open(path) as image:
         # draft() 让 JPEG 在解码阶段就按目标尺寸降比例解码（对其它格式是 no-op）；
         # 之后 _downsample_if_huge 兜底处理超大图，避免全分辨率中间缓冲导致内存爆。
         if max_size:
-            image.draft("RGB", max_size)
+            try:
+                image.draft("RGB", max_size)
+            except Exception:
+                pass  # draft 失败不阻断,仍走 _downsample_if_huge
         image = _downsample_if_huge(image, max_size)
         image = ImageOps.exif_transpose(image)
         if image.mode not in ("RGB", "L"):
             image = image.convert("RGB")
         if max_size and (image.width > max_size[0] or image.height > max_size[1]):
             image.thumbnail(max_size, Image.LANCZOS)
+        # 返回前调用 .load() 让数据完全读入内存,确保 with 关闭后图像仍可用。
+        image.load()
         return image
 
 

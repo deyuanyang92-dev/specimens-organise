@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from openpyxl import load_workbook
+# 规范化软件设计 2026-05 P1 优化:openpyxl 改函数内 lazy import,启动期不触发加载。
 
 
 @dataclass(frozen=True)
@@ -117,6 +117,7 @@ class SpeciesMatcher:
         # 旧：无异常保护，openpyxl 读取错误会向上抛，导致 _finish_initial_load 崩溃。
         # 现：文件损坏 / 读取异常一律返回 []，由调用方的 all_rows() 触发空预设警告。
         try:
+            from openpyxl import load_workbook  # lazy, P1 优化
             wb = load_workbook(self.preset_path, read_only=True, data_only=True)
         except Exception:
             return []

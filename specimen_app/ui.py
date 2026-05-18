@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import queue
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional, TYPE_CHECKING
 
-from PIL import Image
+# 规范化软件设计 2026-05 P1 优化:PIL lazy import。
+# ui.py 内仅 pil_to_qpixmap 用到 PIL.Image 实例,无 Image.* 类方法调用。
+# type hint `Image.Image` 因 `from __future__ import annotations` 而仅为字符串,运行时不解析。
+# 实际真正用 PIL 的代码在 image_cache.py 顶层 import,本模块顶层无需再加载,省 5-10MB 启动 RSS。
+if TYPE_CHECKING:
+    from PIL import Image  # type: ignore[import-not-found]
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPoint, QSize, QByteArray, QModelIndex
-from PyQt5.QtGui import QImage, QPixmap, QKeySequence, QFont, QPainter, QCursor, QFontMetrics, QStandardItem, QStandardItemModel
+from PyQt5.QtGui import QImage, QPixmap, QKeySequence, QFont, QPainter, QCursor, QFontMetrics, QColor, QStandardItem, QStandardItemModel
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
@@ -33,6 +39,7 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -84,6 +91,7 @@ from .image_search import (
     is_supported_image,
     suffixes_for_image_type,
 )
+from .accession_series import AccessionSeries, BUILTIN_PRESETS, format_series_number
 from .batch_export import BatchExportDialog  # 批量导出功能
 from .startup_diag import mark as _startup_mark
 from .models import (
@@ -104,6 +112,10 @@ from .parsing import (
     parse_voucher_serial,
 )
 from .release_manager import list_releases, release_roots
+from .server_sync import aggregate_incoming, aggregate_sources, preview_aggregate  # M1/S2/S7
+from .task_package import export_task_package, import_task_package  # M3: 任务包
+from .dwc_export import export_dwc_archive  # A1: Darwin Core Archive 导出
+from .exif_info import apply_exif_to_specimen  # A2: EXIF 抽取与回填
 from .updater import (
     check_latest_release,
     default_download_root,
@@ -271,30 +283,52 @@ ADMIN_PASSWORD = "123"
 
 
 def _open_path(path: Path) -> None:
+    # 规范化软件设计 2026-05 P1 审查修复:
+    # 旧:Windows 用 shell=True + "cmd /c start" — shell 元字符 (& | > 等) 在路径里会被解释为命令。
+    # 现:用 os.startfile (Windows 原生 API,不走 shell);失败兜底走 explorer。
     try:
         if os.name == "nt":
-            subprocess.Popen(["cmd", "/c", "start", "", str(path)], shell=True)
+            # os.startfile 是 Windows 标准 API,不走 cmd shell,路径含特殊字符也安全
+            os.startfile(str(path))
         elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(path)])
+            subprocess.Popen(["open", str(path)])  # shell=False (默认)
         else:
-            subprocess.Popen(["xdg-open", str(path)])
+            subprocess.Popen(["xdg-open", str(path)])  # shell=False (默认)
     except Exception as exc:
         QMessageBox.critical(None, "打开失败", str(exc))
 
 
 def open_image_external(path: Path) -> None:
-    """用外部程序打开原图：设置了自定义图片查看器就用它，否则回退系统默认程序。
+    """用外部程序打开原图:设置了自定义图片查看器就用它,否则回退系统默认程序。
 
-    用户要求「打开原图」走外部程序（避免在主界面内载入全分辨率导致卡顿），
-    并可在设置里自定义查看器（settings.image_viewer_path）。
+    用户要求「打开原图」走外部程序(避免在主界面内载入全分辨率导致卡顿),
+    并可在设置里自定义查看器(settings.image_viewer_path)。
+
+    规范化软件设计 2026-05 P1 审查修复:加 viewer 路径校验
+    - 必须绝对路径(防 PATH 注入)
+    - 必须文件存在
+    - Linux/Mac 必须可执行 (os.access X_OK)
+    - 不能含 shell 元字符(防绕过 list 形式 subprocess.Popen,极保守)
     """
     viewer = (load_settings().image_viewer_path or "").strip()
-    if viewer and Path(viewer).exists():
-        try:
-            subprocess.Popen([viewer, str(path)])
-            return
-        except Exception as exc:
-            QMessageBox.critical(None, "打开失败", f"自定义图片查看器启动失败：{exc}\n将改用系统默认程序。")
+    if viewer:
+        viewer_path = Path(viewer)
+        valid = (
+            viewer_path.is_absolute()
+            and viewer_path.exists()
+            and viewer_path.is_file()
+        )
+        if valid and sys.platform != "win32":
+            valid = os.access(str(viewer_path), os.X_OK)
+        if valid:
+            try:
+                subprocess.Popen([str(viewer_path), str(path)])  # list 形式, shell=False
+                return
+            except Exception as exc:
+                QMessageBox.critical(None, "打开失败", f"自定义图片查看器启动失败:{exc}\n将改用系统默认程序。")
+        elif viewer:
+            # 设置了但路径无效 → 提示一次,继续回退
+            QMessageBox.warning(None, "查看器路径无效", f"设置的查看器路径无效,改用系统默认:{viewer}")
     # 未设置 / 查看器无效 / 启动失败 -> 回退系统默认。
     _open_path(path)
 
@@ -372,6 +406,92 @@ def _species_matcher() -> SpeciesMatcher:
 
 
 # ---------------------------------------------------------------------------
+# 工具栏 / 快捷键注册表（规范化软件设计 2026-05 新增）
+# ---------------------------------------------------------------------------
+# 工具栏 action 注册表：action_id -> (display_label, slot_method_name, category, tooltip)
+# - action_id 是稳定字符串，settings.json 持久化用这个 key，不能轻易改名
+# - slot_method_name 是 SpecimenWindow 上的方法名（运行时 getattr 取）
+# - category 决定主栏内默认分组顺序：file -> edit -> view -> tools；同 category 内按声明顺序
+# - 自动保存（_auto_save_action）是 checkable QAction，特殊处理；不进本注册表
+TOOLBAR_ACTIONS: dict[str, dict] = {
+    # icon: QStyle.StandardPixmap 枚举名（_rebuild_toolbars 时用 self.style().standardIcon() 取）。
+    # 选 Qt 自带的 StandardPixmap 既零资源依赖、跨平台样式一致，又能立刻给视觉锚点。
+    "import_workspace":  {"label": "导入工作区", "slot": "import_workspace",       "category": "file",
+                          "icon": "SP_DirOpenIcon",
+                          "tooltip": "从外部目录导入工作区数据（基于指纹去重）"},
+    "import_data":       {"label": "导入数据",   "slot": "import_data_file",       "category": "file",
+                          "icon": "SP_FileDialogStart",
+                          "tooltip": "从指定目录扫描照片并按文件名匹配凭证"},
+    "export_data":       {"label": "导出数据",   "slot": "export_data",            "category": "file",
+                          "icon": "SP_DialogSaveButton",
+                          "tooltip": "把当前工作区数据导出"},
+    "batch_export":      {"label": "批量导出",   "slot": "open_batch_export",      "category": "file",
+                          "icon": "SP_FileDialogDetailedView",
+                          "tooltip": "按入库编号列表批量导出（仿 NCBI Batch Entrez）"},
+    "switch_workspace":  {"label": "切换工作区", "slot": "switch_workspace",       "category": "file",
+                          "icon": "SP_DirIcon",
+                          "tooltip": "切换当前工作区或新建工作区"},
+    "undo":              {"label": "撤回",       "slot": "undo",                   "category": "edit",
+                          "icon": "SP_ArrowBack",
+                          "tooltip": "撤回上一次操作（Ctrl+Z）"},
+    "redo":              {"label": "返回",       "slot": "redo",                   "category": "edit",
+                          "icon": "SP_ArrowForward",
+                          "tooltip": "重做（Ctrl+Y / Ctrl+Shift+Z）"},
+    "clear_photos":      {"label": "清除照片关联","slot": "clear_photos",          "category": "edit",
+                          "icon": "SP_DialogDiscardButton",
+                          "tooltip": "取消当前凭证下全部照片的关联（不删原文件）"},
+    "ingest_summary":    {"label": "入库汇总",   "slot": "open_ingest_summary",    "category": "view",
+                          "icon": "SP_FileDialogListView",
+                          "tooltip": "打开入库汇总宽表（非模态单实例）"},
+    "version_manager":   {"label": "版本管理",   "slot": "open_version_manager",   "category": "view",
+                          "icon": "SP_BrowserReload",
+                          "tooltip": "查看 / 还原数据版本快照、检查软件更新"},
+    "settings":          {"label": "设置",       "slot": "open_settings",          "category": "tools",
+                          "icon": "SP_ComputerIcon",
+                          "tooltip": "应用设置（界面字体、光标样式、自动保存等）"},
+    "worms":             {"label": "WoRMS",      "slot": "_open_worms_match",      "category": "tools",
+                          "icon": "SP_TitleBarShadeButton",
+                          "tooltip": "WoRMS 物种分类匹配窗口（单实例）"},
+}
+
+# 默认布局：用户未自定义时（settings.toolbar_layout 为空）用此。
+# 规范化软件设计 2026-05 起主栏只放 7 项高频按钮（用户反馈 13 项太挤）；
+# 低频按钮进辅栏（默认隐藏，视图菜单可勾选打开）。Photoshop / IDE 一类紧凑工具栏惯例。
+TOOLBAR_DEFAULT_LAYOUT: dict[str, list[str]] = {
+    "main": [
+        "import_workspace", "import_data", "batch_export",
+        "undo", "redo",
+        "ingest_summary",
+        "worms",
+    ],
+    "aux": [
+        "export_data", "switch_workspace",
+        "clear_photos",
+        "version_manager",
+        "settings",
+    ],
+}
+
+# 可自定义快捷键的 action 注册表（E 项）：action_id -> (display_label, default_keyseq, slot_method_name)
+# 重叠工具栏 action：工具栏 action 也能绑定全局 shortcut（一份注册表两种用途）。
+SHORTCUTABLE_ACTIONS: dict[str, dict] = {
+    "undo":               {"label": "撤回",                "default": "Ctrl+Z",        "slot": "undo"},
+    "redo":               {"label": "重做",                "default": "Ctrl+Y",        "slot": "redo"},
+    "select_all_voucher": {"label": "全选凭证",            "default": "Ctrl+A",        "slot": "_select_all_vouchers"},
+    "fit_image":          {"label": "照片适配窗口",        "default": "F",             "slot": "fit_image"},
+    "return_to_grid":     {"label": "返回照片网格",        "default": "Esc",           "slot": "return_to_grid"},
+    "zoom_in":            {"label": "界面字体放大",        "default": "Ctrl+=",        "slot": "_zoom_font_in"},
+    "zoom_out":           {"label": "界面字体缩小",        "default": "Ctrl+-",        "slot": "_zoom_font_out"},
+    "zoom_reset":         {"label": "界面字体复位",        "default": "Ctrl+0",        "slot": "_zoom_font_reset"},
+    "photo_filename_fill":{"label": "从照片文件名填充",    "default": "Ctrl+Alt+F",    "slot": "fill_current_photo_from_filename"},
+    "ingest_summary":     {"label": "打开入库汇总",        "default": "",              "slot": "open_ingest_summary"},
+    "batch_export":       {"label": "打开批量导出",        "default": "",              "slot": "open_batch_export"},
+    "worms":              {"label": "打开 WoRMS 匹配",     "default": "",              "slot": "_open_worms_match"},
+    "user_manual":        {"label": "打开使用说明",        "default": "F1",            "slot": "_open_user_manual_dialog"},
+}
+
+
+# ---------------------------------------------------------------------------
 # Background thumbnail loader (QThread + signal — no polling)
 # ---------------------------------------------------------------------------
 
@@ -387,14 +507,28 @@ class _ThumbnailRequest:
 class ThumbnailWorker(QThread):
     result_ready = pyqtSignal(int, object, object)  # token, QPixmap|None, Exception|None
 
-    def __init__(self, cache: ThumbnailCache, parent=None):
+    def __init__(self, cache: ThumbnailCache, parent=None, max_workers: int | None = None):
         super().__init__(parent)
         self.cache = cache
         self._queue: queue.Queue[_ThumbnailRequest | None] = queue.Queue()
         self._running = True
-        # 原值 max_workers=4：最多 4 张超大图同时解码，峰值内存可达数 GB，易拖垮整机。
-        # 降到 2，限制并发解码的内存峰值（解码内存上限另见 image_cache._MAX_DECODE_PIXELS）。
-        self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="thumb")
+        # 原值 max_workers=4:最多 4 张超大图同时解码,峰值内存可达数 GB,易拖垮整机。
+        # 降到 2,限制并发解码的内存峰值(解码内存上限另见 image_cache._MAX_DECODE_PIXELS)。
+        # 规范化软件设计 2026-05 内存档位:max_workers 由 memory_profile 驱动 (1/2/4)。
+        # settings 未配置或异常 fallback 到 is_low_memory 二档。
+        if max_workers is None:
+            try:
+                from .app_settings import load_settings
+                from .env_detect import memory_profile_params
+                profile = load_settings().memory_profile
+                max_workers = memory_profile_params(profile)["thumb_workers"]
+            except Exception:
+                try:
+                    from .env_detect import is_low_memory
+                    max_workers = 1 if is_low_memory() else 2
+                except Exception:
+                    max_workers = 2
+        self._pool = ThreadPoolExecutor(max_workers=max(1, int(max_workers)), thread_name_prefix="thumb")
 
     def enqueue(self, path: Path, size: tuple[int, int], token: int) -> None:
         self._queue.put(_ThumbnailRequest(path, size, token))
@@ -412,11 +546,18 @@ class ThumbnailWorker(QThread):
                 break
 
     def stop(self) -> None:
+        # 规范化软件设计 2026-05 P1 审查修复:
+        # 旧:_running=False → clear_pending → sentinel → pool.shutdown(wait=False) → self.wait(3000)
+        #     但 thread 内 run() 仍可能在 sentinel 之前提交新 _process → pool 已 shutdown → RuntimeError
+        # 现:先等 thread 退出(self.wait),再 shutdown pool。run() 取到 sentinel/_running=False 后退出,
+        #     不会再 submit;pool.shutdown 此刻就安全。
         self._running = False
         self.clear_pending()
         self._queue.put(None)  # sentinel to unblock get()
-        self._pool.shutdown(wait=True)
+        # 先等 thread 主循环退出(run()),保证不再 submit 到 pool
         self.wait(3000)
+        # pool 现在可安全 shutdown(wait=False:已提交的解码任务自行结束,不阻塞)
+        self._pool.shutdown(wait=False)
 
     def run(self) -> None:
         while self._running:
@@ -426,7 +567,11 @@ class ThumbnailWorker(QThread):
                 continue
             if req is None:
                 break
-            self._pool.submit(self._process, req)
+            # P1 审查修复:pool 已 shutdown 时 submit 会 RuntimeError → 兜底捕获
+            try:
+                self._pool.submit(self._process, req)
+            except RuntimeError:
+                break  # pool 已关闭,正常退出循环
 
     def _process(self, req: _ThumbnailRequest) -> None:
         try:
@@ -900,7 +1045,17 @@ class SpecimenWindow(QMainWindow):
             self.thumbnail_cache = ThumbnailCache(self.workspace_root)
             self._thumb_worker = ThumbnailWorker(self.thumbnail_cache, self)
             self._thumb_worker.result_ready.connect(self._on_thumbnail_ready)
-            self._thumb_worker.start()
+            # 规范化软件设计 2026-05 启动卡死优化:
+            # 旧:__init__ 内立即 start(),后台线程跟主线程 Excel 读争 I/O+内存,2GB 机卡顿。
+            # 现:_finish_initial_load 末尾 QTimer.singleShot(2000, ...) 延后 2s 才 start。
+            # K 章 (2026-05) 高档位快路径:high / extra_high 跳过延迟,立刻 start —
+            # 64GB 机不需要让主线程 I/O 独占 CPU,首次照片预览无 2s 等待。
+            try:
+                from .env_detect import is_fast_profile
+                if is_fast_profile():
+                    self._thumb_worker.start()
+            except Exception:
+                pass
         else:
             self.thumbnail_cache = None
             self._thumb_worker = None
@@ -925,6 +1080,14 @@ class SpecimenWindow(QMainWindow):
         self._photo_filename_fill_action: QAction | None = None
         # 入库汇总窗口：非模态、单实例。open_ingest_summary 据此判断是新建还是聚焦刷新。
         self._ingest_summary_dialog: "IngestSummaryDialog | None" = None
+        # WoRMS 匹配窗口：非模态、单实例（v0.5.0+，原 worms_dialog.py 模态对话框已替换）。
+        self._worms_window: "object | None" = None  # WormsMatchWindow
+        # 使用说明弹窗：非模态、单实例（规范化软件设计 2026-05 新增）。
+        self._manual_dialog: "object | None" = None  # UserManualDialog
+
+        # 录入任务状态：开始录入任务后填充，结束后清空。
+        # keys: 记录ID, 人员, 用途, 备注, 开始时间, 新增数量
+        self._active_task: dict | None = None
 
         # 搜索数据容器：必须在 _build_ui() 之前初始化，因为 UI 构造期间
         # QComboBox.currentIndexChanged 信号可能提前触发 _apply_voucher_filter。
@@ -962,8 +1125,62 @@ class SpecimenWindow(QMainWindow):
         # 分类预设缺失时显示持久黄色警告条（旧：8 秒状态栏消息，极易错过）。
         if self.matcher is not None and not list(self.matcher.all_rows()):
             self._preset_warning_banner.show()
-        QTimer.singleShot(1200, self._build_search_index_background)
+        # 旧（v0.5.0 及以前）：启动后 1.2s 自动 _build_search_index_background()，
+        # 用户多数从不开图片搜索却平白多吃 ~20MB + ~1.2s。
+        # 现（规范化软件设计 2026-05 起）：图片索引改为**按需**——open_image_search() 内
+        # 首次打开时 dlg 自带后台 worker 建索引。本启动钩子改为仅触发 gc.collect()
+        # 强制回收 openpyxl 读 Excel 用的临时对象（zip / xml DOM 等），实测可省 10–30MB。
+        QTimer.singleShot(200, self._post_load_gc)
         QTimer.singleShot(2500, self._maybe_check_updates_on_startup)
+        # 规范化软件设计 2026-05 K 章:高档位快路径检测
+        try:
+            from .env_detect import is_fast_profile
+            fast = is_fast_profile()
+        except Exception:
+            fast = False
+        # ThumbnailWorker 延后 start(规范化软件设计 2026-05 启动卡死优化):
+        # __init__ 内不立即 start,延 2s 避免与主线程 Excel 读争 CPU/内存。
+        # 高档位:__init__ 已立 start,这里跳过。
+        if self._thumb_worker is not None and not self._thumb_worker.isRunning():
+            QTimer.singleShot(2000, self._thumb_worker.start)
+        # K 章 高档位:数据预热 + 图片索引预建 (低档位不做)
+        if fast:
+            _startup_mark("fast profile: scheduling preheat + search index prebuild")
+            QTimer.singleShot(500, self._preheat_caches)
+            QTimer.singleShot(1200, self._build_search_index_background)
+
+    def _preheat_caches(self) -> None:
+        """规范化软件设计 2026-05 K 章高档位快路径:把 specimen/classification/photo 三表
+        载入 _row_cache,后续工作区切换 / 汇总 / voucher 切换 0 重读。
+
+        非阻塞:用 QThread 后台跑 read_rows(3)。高档位用户内存足够,这点 _row_cache 撑得起
+        (LRU maxsize=12/20)。
+        """
+        if self._is_closing or self.store is None:
+            return
+        _startup_mark("preheat: start")
+        try:
+            # 直接同步预热:read_rows 走 _row_cache,3 张表读完 ~200-500ms,在 _finish_initial_load
+            # 后 500ms 触发,不影响首次交互。如果工作区超大可改 QThread,目前足够。
+            self.store.read_rows("specimen")
+            self.store.read_rows("classification")
+            self.store.read_rows("photo")
+            _startup_mark("preheat: done (3 tables cached)")
+        except Exception as exc:
+            _startup_mark(f"preheat: failed ({exc})")
+
+    def _post_load_gc(self) -> None:
+        """启动初始加载后强制 gc，回收 openpyxl 读 Excel 时的临时对象。
+
+        Python 的引用计数会立刻释放，但 gc 还要清环引用；openpyxl 内部对象常有循环引用，
+        启动加载后调一次 gc.collect() 可缩短"高水位线 -> 稳态 RSS"的间隔。
+        """
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+        _startup_mark("_finish_initial_load: post-load gc done")
 
     def _prompt_initial_workspace(self) -> None:
         if self._is_closing:
@@ -1040,15 +1257,52 @@ class SpecimenWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._is_closing = True
+        # 先停定时器,防止关闭过程中回调触碰已被释放的 store。
+        timer = getattr(self, "_list_refresh_timer", None)
+        if timer is not None:
+            timer.stop()
+        # 规范化软件设计 2026-05 新增:停内存状态定时器。
+        mem_timer = getattr(self, "_memory_status_timer", None)
+        if mem_timer is not None:
+            try:
+                mem_timer.stop()
+            except Exception:
+                pass
+
+        # E3 helper：wait 超时后强杀，保证主进程一定能退（特别是 Windows 上 QThread 卡死场景）。
+        def _stop_worker(worker, wait_ms: int = 2000, label: str = "") -> None:
+            if worker is None or not worker.isRunning():
+                return
+            try:
+                worker.requestInterruption()
+            except Exception:
+                pass
+            if not worker.wait(wait_ms) and worker.isRunning():
+                try:
+                    worker.terminate()
+                    worker.wait(500)  # terminate 后给个短暂收尾窗口
+                except Exception as exc:
+                    print(f"[closeEvent] terminate {label} 失败：{exc}", file=sys.stderr)
+
         # Stop background index builder if running
-        idx_worker = getattr(self, "_index_build_worker", None)
-        if idx_worker is not None and idx_worker.isRunning():
-            idx_worker.requestInterruption()
-            idx_worker.wait(5000)
+        _stop_worker(getattr(self, "_index_build_worker", None), wait_ms=5000, label="index_builder")
         # Stop thumbnail worker
         thumb = getattr(self, "_thumb_worker", None)
         if thumb is not None:
-            thumb.stop()
+            try:
+                thumb.stop()
+            except Exception:
+                pass
+        # Stop startup update check worker (network thread, may still be polling)
+        _stop_worker(getattr(self, "_startup_update_worker", None), wait_ms=2000, label="update_check")
+        # Stop photo import thread if one is running
+        _stop_worker(getattr(self, "_import_thread", None), wait_ms=2000, label="photo_import")
+        # C1: 接管所有注册到 WindowManager 的 dialog 的 worker（如 DbManagerDialog 的 worms worker）
+        if self.manager is not None:
+            try:
+                self.manager.stop_all_dialog_workers(wait_ms=3000)
+            except Exception as exc:
+                print(f"[closeEvent] stop dialog workers 失败：{exc}", file=sys.stderr)
         try:
             settings = load_settings()
             settings.window_geometry = self.saveGeometry().toBase64().data().decode()
@@ -1064,6 +1318,17 @@ class SpecimenWindow(QMainWindow):
             print(f"[closeEvent] 保存窗口状态失败：{exc}", file=sys.stderr)
         except Exception as exc:
             print(f"[closeEvent] 保存窗口状态时发生异常：{exc}", file=sys.stderr)
+        # 关闭时若有活动录入任务，静默结束并写入日志。
+        if getattr(self, "_active_task", None) is not None:
+            try:
+                self._end_task()
+            except Exception as exc:
+                print(f"[closeEvent] 结束录入任务失败：{exc}", file=sys.stderr)
+        # 关闭前把所有待写字段全部落盘，防止 500ms 防抖还未触发时关窗口丢数据。
+        try:
+            self._flush_pending_saves()
+        except Exception as exc:
+            print(f"[closeEvent] 刷写待保存数据失败：{exc}", file=sys.stderr)
         store = getattr(self, "store", None)
         if store is not None:
             try:
@@ -1072,75 +1337,86 @@ class SpecimenWindow(QMainWindow):
                 pass
         if self.manager is not None:
             self.manager.unregister(self)
+        # E1: closeEvent 末尾 touch last_exit_clean marker，下次启动据此识别是否上次正常退出。
+        try:
+            from .crash_log import mark_app_exiting_clean
+            mark_app_exiting_clean()
+        except Exception:
+            pass
         event.accept()
 
     def eventFilter(self, obj, event) -> bool:
-        if obj is self.photo_table and event.type() == event.KeyPress:
+        # 规范化软件设计 2026-05 P1 审查修复:用 getattr 防御,_build_ui 内 splash processEvents
+        # 触发的早期事件可能在 self.photo_table / grid_frame 创建前到达,直接 self.x 会 AttributeError。
+        photo_table = getattr(self, "photo_table", None)
+        if photo_table is not None and obj is photo_table and event.type() == event.KeyPress:
             if event.matches(QKeySequence.Copy):
                 return self._copy_photo_table_selection()
             if event.modifiers() & Qt.ControlModifier and event.key() == Qt.Key_A:
-                self.photo_table.selectAll()
+                photo_table.selectAll()
                 return True
             if event.key() == Qt.Key_F2:
                 return self._edit_current_photo_table_item()
+        # grid_frame 拖入照片视觉反馈:Qt drag 事件经此 filter,正确派发到 Python(原 lambda 赋值方式失败)。
+        grid_frame = getattr(self, "grid_frame", None)
+        if grid_frame is not None and grid_frame is obj:
+            etype = event.type()
+            if etype == event.DragEnter:
+                if event.mimeData().hasUrls():
+                    event.acceptProposedAction()
+                    grid_frame.setStyleSheet("border: 2px dashed #2a6fbd;")
+                    return True
+            elif etype == event.DragMove:
+                if event.mimeData().hasUrls():
+                    event.acceptProposedAction()
+                    return True
+            elif etype == event.DragLeave:
+                grid_frame.setStyleSheet("")
+                return True
         return super().eventFilter(obj, event)
 
     # ---- UI building ----
 
     def _build_ui(self) -> None:
-        # Toolbar
-        toolbar = QToolBar("主工具栏")
-        toolbar.setObjectName("main_toolbar")
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
-        # 旧逻辑：工具栏首项是「＋新增标本」按钮。
-        # 现按需求改名为「＋新增入库编号」并移到左侧入库编号面板顶部（见 _build_ui 中 voucher_layout）。
-        # for label, slot in [
-        #     ("＋新增标本", self.new_specimen),
-        # ]:
-        #     action = QAction(label, self)
-        #     action.triggered.connect(slot)
-        #     toolbar.addAction(action)
+        # Toolbars: main + aux（规范化软件设计 2026-05 起，从单条工具栏拆为两条 + 可拖拽 + 可自定义）。
+        # - 主工具栏（main_toolbar）默认可见，放高频按钮，按 file/edit/view/tools 四组用 separator 分隔。
+        # - 辅助工具栏（aux_toolbar）默认隐藏，放低频按钮，视图菜单或自定义对话框打开。
+        # - 两条工具栏都 setMovable(True)，用户可拖到左/右/底 dock area。
+        # - 内容由 settings.toolbar_layout 控制；未配置时回落到 TOOLBAR_DEFAULT_LAYOUT。
+        # - 自动保存（_auto_save_action）始终挂主栏末尾，不进 layout（特殊 checkable QAction）。
+        self._toolbar_actions: dict[str, QAction] = {}  # action_id -> QAction，供自定义对话框 / 快捷键绑定用
+        # 两条工具栏都设 ToolButtonTextBesideIcon：图标提供视觉锚点 + 中文 label 保留可读性。
+        # icon 大小 18px：兼顾紧凑度与可识别（Qt 默认 24 偏大，跟标准字号搭配会显胖）。
+        self._main_toolbar = QToolBar("主工具栏")
+        self._main_toolbar.setObjectName("main_toolbar")
+        self._main_toolbar.setMovable(True)
+        self._main_toolbar.setIconSize(QSize(18, 18))
+        self._main_toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.addToolBar(self._main_toolbar)
+        self._aux_toolbar = QToolBar("辅助工具栏")
+        self._aux_toolbar.setObjectName("aux_toolbar")
+        self._aux_toolbar.setMovable(True)
+        self._aux_toolbar.setIconSize(QSize(18, 18))
+        self._aux_toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.addToolBarBreak()  # 让辅栏默认换行（主栏在第 1 行、辅栏在第 2 行）
+        self.addToolBar(self._aux_toolbar)
+        self._rebuild_toolbars()  # 按 settings 填充
 
-        # 旧逻辑：工具栏上有可勾选的"沿用上条信息"开关，状态持久化到 settings.json。
-        # 现按需求移除该开关 —— 沿用上一条标本信息是本工作模式的固定规则，不该是可选项；
-        # 沿用行为改为在 new_specimen() 中永远生效。settings 字段 carry_over_specimen_fields
-        # 保留不动以兼容旧 settings.json，但不再有 UI 控制。
-        # self._carry_over_action = QAction("沿用上条信息", self)
-        # self._carry_over_action.setCheckable(True)
-        # self._carry_over_action.setChecked(load_settings().carry_over_specimen_fields)
-        # self._carry_over_action.setToolTip(
-        #     "新增标本时自动沿用上一条记录的：" + "、".join(CARRY_OVER_SPECIMEN_FIELDS)
-        # )
-        # self._carry_over_action.toggled.connect(self._on_carry_over_toggled)
-        # toolbar.addAction(self._carry_over_action)
+        # 旧逻辑：工具栏首项是「＋新增标本」按钮 → 现移至左侧入库编号面板顶部，详见 voucher_layout。
+        # 旧逻辑：工具栏「沿用上条信息」checkable → 现固定规则（new_specimen 内永远生效），UI 移除。
 
-        for label, slot in [
-            ("导入工作区", self.import_workspace),
-            ("导入数据", self.import_data_file),
-            ("导出数据", self.export_data),
-            ("批量导出", self.open_batch_export),  # 批量导出：类似 NCBI Batch Entrez
-            ("切换工作区", self.switch_workspace),
-            ("撤回", self.undo),
-            ("返回", self.redo),
-            ("清除照片关联", self.clear_photos),
-            ("入库汇总", self.open_ingest_summary),
-            ("版本管理", self.open_version_manager),
-            ("设置", self.open_settings),
-        ]:
-            action = QAction(label, self)
-            action.triggered.connect(slot)
-            toolbar.addAction(action)
-
-        # 自动保存开关：可勾选按钮，状态持久化到 settings.json（仿旧「沿用上条信息」范式）。
-        # 旧：固定文字「自动保存」，勾选态在工具栏里很难分辨。现文字直接显示「开/关」。
+        # 自动保存开关：始终挂主栏末尾（不进 layout 自定义；checkable，特殊处理）。
         self._auto_save_action = QAction(self)
         self._auto_save_action.setCheckable(True)
         self._auto_save_action.setChecked(self.auto_save_enabled)
         self._auto_save_action.setToolTip("勾选=输入后自动保存；取消=只在点「保存」按钮时写入")
         self._auto_save_action.toggled.connect(self._on_auto_save_toggled)
         self._update_auto_save_action_text()
-        toolbar.addAction(self._auto_save_action)
+        self._main_toolbar.addSeparator()
+        self._main_toolbar.addAction(self._auto_save_action)
+
+        # 应用辅栏可见性（settings 持久化，默认隐藏）。
+        self._aux_toolbar.setVisible(bool(load_settings().aux_toolbar_visible))
 
         # Workspace bar
         ws_bar = QHBoxLayout()
@@ -1199,10 +1475,13 @@ class SpecimenWindow(QMainWindow):
         self.grid_layout = QGridLayout(self.grid_frame)
         self.grid_layout.setSpacing(10)
         self.grid_frame.setAcceptDrops(True)
-        self.grid_frame.dragEnterEvent = lambda e: (e.acceptProposedAction(), self.grid_frame.setStyleSheet("border: 2px dashed #2a6fbd;")) if e.mimeData().hasUrls() else None
-        self.grid_frame.dragMoveEvent = lambda e: e.acceptProposedAction() if e.mimeData().hasUrls() else None
-        self.grid_frame.dragLeaveEvent = lambda e: self.grid_frame.setStyleSheet("")
-        self.grid_frame.dropEvent = self._on_grid_drop
+        # 规范化软件设计 2026-05 P1 审查修复:
+        # 旧:`grid_frame.dragEnterEvent = lambda e: ...` — Qt C++ 事件 dispatch 不走 Python
+        #    instance attr,lambda 实际不被调,drag 视觉反馈静默失效。
+        # 现:用 installEventFilter + 一个 EventFilter 对象。事件 filter 走 QObject.event 链路,
+        #    Qt 可正确派发到 Python 端。
+        self.grid_frame.installEventFilter(self)
+        self.grid_frame.dropEvent = self._on_grid_drop  # dropEvent 已用 method 引用,Qt 可识别
         self.grid_frame.hide()
         photo_stack.addWidget(self.grid_frame)
 
@@ -1262,7 +1541,9 @@ class SpecimenWindow(QMainWindow):
             btn.setFixedWidth(36)
             btn.setToolTip(label)
             btn.setProperty("grid_count", count)
-            btn.setStyleSheet(_VIEW_BTN_STYLE)
+            # 规范化软件设计 2026-05 P1 优化:用 class 选择器(theme.py APP_QSS 内 QPushButton[class="view-btn"])
+            # 替代 inline _VIEW_BTN_STYLE,5 个按钮共享同一规则省 QSS 解析对象。
+            btn.setProperty("class", "view-btn")
             btn.clicked.connect(lambda checked, c=count: self._set_view_mode(c))
             view_row.addWidget(btn)
             self._view_buttons.append(btn)
@@ -1280,11 +1561,50 @@ class SpecimenWindow(QMainWindow):
         voucher_layout = QVBoxLayout(voucher_content)
         voucher_layout.setContentsMargins(0, 0, 0, 0)
         voucher_layout.setSpacing(2)
-        # 「＋新增入库编号」按钮：原本在顶部工具栏（标签「＋新增标本」），
-        # 按需求改名并移到左侧入库编号面板顶部，更贴近编号列表。
+        # 录入任务指示器行（任务进行中时绿色背景 + 结束按钮，否则显示「开始录入任务」）
+        self._task_indicator = QWidget()
+        self._task_indicator.setObjectName("task_indicator")
+        task_ind_layout = QHBoxLayout(self._task_indicator)
+        task_ind_layout.setContentsMargins(4, 2, 4, 2)
+        task_ind_layout.setSpacing(4)
+        self._task_label = QLabel("未开始录入任务")
+        self._task_label.setStyleSheet("color: #888;")
+        task_ind_layout.addWidget(self._task_label, stretch=1)
+        self._task_start_btn = QPushButton("▶ 开始录入任务")
+        self._task_start_btn.setToolTip("开始录入任务，记录录入人员和工作时长")
+        self._task_start_btn.clicked.connect(self._start_task)
+        task_ind_layout.addWidget(self._task_start_btn)
+        self._task_end_btn = QPushButton("结束任务")
+        self._task_end_btn.setVisible(False)
+        self._task_end_btn.clicked.connect(self._end_task)
+        task_ind_layout.addWidget(self._task_end_btn)
+        voucher_layout.addWidget(self._task_indicator)
+        personnel_btn = QPushButton("查看人员记录")
+        personnel_btn.setToolTip("查看录入工作量汇总，了解各录入人员的任务次数和时长")
+        personnel_btn.clicked.connect(self._open_workload_report)
+        voucher_layout.addWidget(personnel_btn)
+
+        # 「＋新增入库编号」按钮 + 系列选择器行
+        new_voucher_row = QHBoxLayout()
+        new_voucher_row.setSpacing(4)
         self._new_voucher_btn = QPushButton("＋新增入库编号")
+        self._new_voucher_btn.setEnabled(False)
+        self._new_voucher_btn.setToolTip("请先开始录入任务")
         self._new_voucher_btn.clicked.connect(self.new_specimen)
-        voucher_layout.addWidget(self._new_voucher_btn)
+        new_voucher_row.addWidget(self._new_voucher_btn, stretch=1)
+        self._series_selector = QComboBox()
+        self._series_selector.setToolTip("选择入库编号系列（当前系列用于新增编号）")
+        self._series_selector.setMinimumWidth(70)
+        self._series_selector.setMaximumWidth(110)
+        self._refresh_series_selector()
+        self._series_selector.currentIndexChanged.connect(self._on_series_selector_changed)
+        new_voucher_row.addWidget(self._series_selector)
+        manage_series_btn = QPushButton("管理")
+        manage_series_btn.setToolTip("管理入库编号系列（新增/编辑/删除）")
+        manage_series_btn.setFixedWidth(40)
+        manage_series_btn.clicked.connect(self._open_series_manager)
+        new_voucher_row.addWidget(manage_series_btn)
+        voucher_layout.addLayout(new_voucher_row)
         # Search + quick filter
         filter_row = QHBoxLayout()
         self._voucher_search = QLineEdit()
@@ -1301,6 +1621,14 @@ class SpecimenWindow(QMainWindow):
         self._search_scope.setMaximumWidth(96)
         self._search_scope.currentIndexChanged.connect(self._apply_voucher_filter)
         filter_row.addWidget(self._search_scope)
+        # 系列筛选下拉
+        self._series_filter_combo = QComboBox()
+        self._series_filter_combo.setToolTip("按编号系列筛选凭证列表")
+        self._series_filter_combo.setMinimumWidth(56)
+        self._series_filter_combo.setMaximumWidth(90)
+        self._refresh_series_filter_combo()
+        self._series_filter_combo.currentIndexChanged.connect(self._apply_voucher_filter)
+        filter_row.addWidget(self._series_filter_combo)
         # 复选框：显示/隐藏关联照片列
         self._show_photos_checkbox = QCheckBox("照片名")
         self._show_photos_checkbox.setToolTip("在凭证列表中显示关联的照片文件名")
@@ -1314,7 +1642,8 @@ class SpecimenWindow(QMainWindow):
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setFixedHeight(22)
-            btn.setStyleSheet("QPushButton { font-size: 10px; padding: 1px 6px; } QPushButton:checked { background-color: #2a6fbd; color: white; }")
+            # 规范化软件设计 2026-05 P1 优化:class 选择器替代 inline QSS。
+            btn.setProperty("class", "filter-btn")
             btn.clicked.connect(lambda checked, k=key: self._set_voucher_filter(k))
             quick_row.addWidget(btn)
             self._filter_buttons[key] = btn
@@ -1346,13 +1675,18 @@ class SpecimenWindow(QMainWindow):
         self.voucher_table.horizontalHeader().sectionClicked.connect(self._on_voucher_header_clicked)
         self.voucher_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.voucher_table.customContextMenuRequested.connect(self._voucher_context_menu)
-        # Ctrl+A 全选快捷键（Windows 操作习惯）
-        _ = QShortcut(QKeySequence("Ctrl+A"), self.voucher_table, self._select_all_vouchers)
-        # 全局字体缩放快捷键：Ctrl+加 放大、Ctrl+减 缩小、Ctrl+0 复位（类似浏览器）。
-        _ = QShortcut(QKeySequence("Ctrl+="), self, lambda: self._zoom_font(1))
-        _ = QShortcut(QKeySequence("Ctrl++"), self, lambda: self._zoom_font(1))
-        _ = QShortcut(QKeySequence("Ctrl+-"), self, lambda: self._zoom_font(-1))
-        _ = QShortcut(QKeySequence("Ctrl+0"), self, self._zoom_font_reset)
+        # 全局快捷键（规范化软件设计 2026-05 起持引用，支持 settings.custom_shortcuts 热更新）。
+        # 旧：所有 QShortcut 用 `_ = QShortcut(...)` 临时变量；变量丢弃后 Qt 仍持有但无法重绑 keyseq。
+        # 现：保留实例引用 _sc_xxx，启动末尾的 _apply_custom_shortcuts() 可按 settings 改 key。
+        # Ctrl+Shift+Z 是 Ctrl+Y 的同义重做绑定，固定不参与自定义。
+        self._sc_select_all_voucher = QShortcut(QKeySequence("Ctrl+A"), self.voucher_table, self._select_all_vouchers)
+        self._sc_undo = QShortcut(QKeySequence("Ctrl+Z"), self, self.undo)
+        self._sc_redo = QShortcut(QKeySequence("Ctrl+Y"), self, self.redo)
+        self._sc_redo_alt = QShortcut(QKeySequence("Ctrl+Shift+Z"), self, self.redo)  # 同义绑定
+        self._sc_zoom_in = QShortcut(QKeySequence("Ctrl+="), self, self._zoom_font_in)
+        self._sc_zoom_in_alt = QShortcut(QKeySequence("Ctrl++"), self, self._zoom_font_in)  # 同义（按键盘布局）
+        self._sc_zoom_out = QShortcut(QKeySequence("Ctrl+-"), self, self._zoom_font_out)
+        self._sc_zoom_reset = QShortcut(QKeySequence("Ctrl+0"), self, self._zoom_font_reset)
         self._col_filters: dict[int, str] = {}  # col_index -> filter value
         self._col_header_labels = ["入库编号","标本","照片","分类","认领","照片数","关联照片"]
         self._show_photo_names = False
@@ -1521,13 +1855,61 @@ class SpecimenWindow(QMainWindow):
 
         # ---- Menu bar ----
         tools_menu = self.menuBar().addMenu("工具")
+        act_series = QAction("入库编号系列管理…", self)
+        act_series.setToolTip("管理各机构入库编号系列（新增/编辑/删除），查看分发统计")
+        act_series.triggered.connect(self._open_series_manager)
+        tools_menu.addAction(act_series)
+        tools_menu.addSeparator()
         tools_menu.addAction("入库汇总", self.open_ingest_summary)
         tools_menu.addAction("操作记录", self._open_action_log)
+        tools_menu.addAction("入库人员管理…", self._open_persons_manager)
+        tools_menu.addAction("入库人员记录…", self._open_workload_report)
         # 新增：用 Excel 直接打开数据目录里的 xlsx（密码门，复用管理密码）。
         tools_menu.addAction("用 Excel 打开数据文件…", self._open_data_in_excel)
-        # 新增：将工作区数据版本号降回 1.0.0，以便旧版软件可以再次打开（旧：无此功能，升级后锁死）。
+        # 旧（v0.5.0+）：此处有一行 tools_menu.addAction("WoRMS 分类匹配…", self._open_worms_match)，
+        # 同时顶层菜单栏另起一个独立的「WoRMS」菜单。WoRMS 入口三处冗余（工具栏/工具菜单/顶层 WoRMS 菜单）。
+        # 现（规范化软件设计 2026-05）：顶层「WoRMS」菜单删除，WoRMS 三项合入工具菜单底部
+        # （见本文件 _build_ui 末尾的 "WoRMS 物种分类工具" 分隔段）。
+        tools_menu.addSeparator()
+        # M1: 多人协作 — 一键聚合 incoming/ 下所有"含 数据/ 子目录"的文件夹到中心机。
+        # 兼容降级模式：无 manifest 也能合并（等价于 P1 极简方案），用现有 import_workspace 做合并核心。
+        tools_menu.addAction("从收件箱聚合…", self._open_aggregate_incoming)
+        # S2: 批量选多个工作区目录直接合并，省去先复制到 incoming/。
+        tools_menu.addAction("批量导入工作区目录…", self._open_batch_import_sources)
+        # M5: 把旧版工作区贴上多人协作协议标记 + 留段记录，强制 snapshot 可回退。
+        tools_menu.addAction("升级工作区到多人协作格式…", self._upgrade_workspace_to_multi_user)
+        tools_menu.addSeparator()
+        # A1: 把工作区一键导出成 Darwin Core Archive（TDWG/GBIF 通用格式），用于对外发布或与
+        # GBIF/iDigBio 等数据聚合器对接。只读导出，不动工作区。
+        tools_menu.addAction("导出 Darwin Core Archive…", self._export_dwc_archive)
+        # A2: 从照片 EXIF 批量回填缺失的采集日期到 voucher。仅填空字段不覆盖。
+        tools_menu.addAction("从 EXIF 批量回填采集日期…", self._bulk_apply_exif)
         tools_menu.addSeparator()
         tools_menu.addAction("降低工作区兼容版本…", self._downgrade_workspace_schema)
+        tools_menu.addSeparator()
+        # DOC: 用系统默认应用打开合并 / 导入操作示例 markdown。
+        tools_menu.addAction("打开合并/导入操作示例…", self._open_import_examples)
+
+        tools_menu.addSeparator()
+        # WoRMS 物种分类工具（规范化软件设计 2026-05 起，原顶层「WoRMS」菜单合并至此）。
+        # 三项共用单实例 WormsMatchWindow（详见 _open_worms_match/_open_worms_browse/_open_worms_db_manager）。
+        tools_menu.addAction("WoRMS 分类匹配…", self._open_worms_match)
+        tools_menu.addAction("WoRMS 分类浏览…", self._open_worms_browse)
+        tools_menu.addAction("WoRMS 本地数据库管理…", self._open_worms_db_manager)
+
+        # 顶层「编号」菜单：入库编号系列管理 + 批量生成 + 切换活动系列。
+        number_menu = self.menuBar().addMenu("编号")
+        number_menu.addAction("系列管理…", self._open_series_manager)
+        number_menu.addAction("批量生成编号…", self._open_batch_generate)
+        number_menu.addSeparator()
+        self._series_switch_menu = number_menu.addMenu("切换活动系列")
+        # 打开子菜单时动态填充，确保显示最新系列列表。
+        self._series_switch_menu.aboutToShow.connect(self._populate_series_switch_menu)
+
+        # 旧（v0.5.0+）：顶层「WoRMS」菜单（分类匹配/分类浏览/管理本地数据库）独立挂在菜单栏。
+        # 现（规范化软件设计 2026-05）：删除顶层 WoRMS 菜单，三项合入「工具」菜单底部
+        # （上方 "WoRMS 物种分类工具" 分隔段），统一在「工具」菜单层级，避免三处冗余。
+        # 三个 slot 方法 _open_worms_match / _open_worms_browse / _open_worms_db_manager 不变。
 
         view_menu = self.menuBar().addMenu("视图")
         for panel_name, panel_ref in [
@@ -1540,32 +1922,214 @@ class SpecimenWindow(QMainWindow):
             action.toggled.connect(lambda checked, p=panel_ref: p.setVisible(checked))
             view_menu.addAction(action)
         view_menu.addSeparator()
+        # 辅助工具栏可见性切换（规范化软件设计 2026-05 新增）：状态持久化到 settings.aux_toolbar_visible
+        self._aux_toolbar_action = QAction("辅助工具栏", self, checkable=True)
+        self._aux_toolbar_action.setChecked(load_settings().aux_toolbar_visible)
+        self._aux_toolbar_action.toggled.connect(self._on_aux_toolbar_toggled)
+        view_menu.addAction(self._aux_toolbar_action)
+        # 自定义工具栏 / 自定义快捷键入口（D / E）
+        view_menu.addAction("自定义工具栏…", self._open_toolbar_customize)
+        view_menu.addAction("自定义快捷键…", self._open_shortcuts_customize)
+        view_menu.addSeparator()
         reset_layout_action = QAction("重置窗口布局", self)
         reset_layout_action.triggered.connect(self._reset_window_layout)
         view_menu.addAction(reset_layout_action)
+
+        # 顶层「帮助」菜单（规范化软件设计 2026-05 新增）：
+        # 旧：无统一 Help / 关于入口；仅状态栏显示版本号。
+        # 现：菜单栏右端固定「帮助」菜单，下分使用说明 / 字段速查 / 快捷键速查 / 检查更新 /
+        # 打开崩溃日志目录 / 关于。各 slot 详见 _open_user_manual_dialog 等方法。
+        help_menu = self.menuBar().addMenu("帮助")
+        help_menu.addAction("使用说明…", self._open_user_manual_dialog)
+        help_menu.addAction("字段填写说明速查…", self._open_field_help_index)
+        help_menu.addAction("快捷键速查…", self._open_shortcuts_dialog)
+        help_menu.addSeparator()
+        help_menu.addAction("检查更新…", self._check_github_update_from_help)
+        help_menu.addAction("打开崩溃日志目录…", self._open_crash_log_dir)
+        help_menu.addSeparator()
+        help_menu.addAction("关于…", self._open_about_dialog)
 
         # ---- Status bar ----
         self.statusBar().showMessage("就绪")
         self._status_dashboard = QLabel()
         self._status_dashboard.setStyleSheet("color: #1a5faa; font-weight: bold; padding: 0 8px;")
         self.statusBar().addPermanentWidget(self._status_dashboard)
+        # 规范化软件设计 2026-05 新增:内存档位 + 实时 RSS 状态栏 (每 5s 刷新)
+        self._memory_status_label = QLabel()
+        self._memory_status_label.setStyleSheet("color: #59666b; padding: 0 8px;")
+        self._memory_status_label.setToolTip("当前内存档位与进程 RSS;改档位在「设置 → 内存档位」")
+        self.statusBar().addPermanentWidget(self._memory_status_label)
+        # 入库人员管理 2026-05:当前录入员下拉(状态栏)
+        from .widgets_persons import PersonComboBox
+        self._current_recorder_combo = PersonComboBox(allow_manage=True)
+        self._current_recorder_combo.setToolTip(
+            "当前录入员;点开切换或新增。任务进行中切换会弹确认。"
+        )
+        self._current_recorder_combo.setFixedWidth(220)
+        self._current_recorder_combo.member_changed.connect(self._on_current_recorder_changed)
+        # 加载团队库 + 预选 settings.current_recorder
+        try:
+            current = load_settings().current_recorder
+            self._current_recorder_combo.refresh(preselect=current)
+        except Exception:
+            self._current_recorder_combo.refresh()
+        self.statusBar().addPermanentWidget(self._current_recorder_combo)
         self.statusBar().addPermanentWidget(QLabel(f"软件版本：v{__version__}"))
+        # 启动定时器 5s 刷新 RSS;立即刷一次
+        self._memory_status_timer = QTimer(self)
+        self._memory_status_timer.timeout.connect(self._refresh_memory_status)
+        self._memory_status_timer.start(5000)
+        self._refresh_memory_status()
 
         # ---- Keyboard shortcuts ----
-        fit_shortcut = QAction(self)
-        fit_shortcut.setShortcut(QKeySequence("F"))
-        fit_shortcut.triggered.connect(self.fit_image)
-        self.addAction(fit_shortcut)
+        # 规范化软件设计 2026-05 起持引用为 self._sc_fit / self._sc_esc，支持 settings.custom_shortcuts 重绑。
+        self._sc_fit = QAction(self)
+        self._sc_fit.setShortcut(QKeySequence("F"))
+        self._sc_fit.triggered.connect(self.fit_image)
+        self.addAction(self._sc_fit)
 
-        esc_shortcut = QAction(self)
-        esc_shortcut.setShortcut(QKeySequence("Esc"))
-        esc_shortcut.triggered.connect(self.return_to_grid)
-        self.addAction(esc_shortcut)
+        self._sc_esc = QAction(self)
+        self._sc_esc.setShortcut(QKeySequence("Esc"))
+        self._sc_esc.triggered.connect(self.return_to_grid)
+        self.addAction(self._sc_esc)
 
         self._photo_filename_fill_action = QAction("从照片文件名填充标本信息", self)
         self._photo_filename_fill_action.triggered.connect(self.fill_current_photo_from_filename)
         self.addAction(self._photo_filename_fill_action)
         self._apply_photo_filename_fill_shortcut()
+
+        # 应用 settings.custom_shortcuts 到所有可自定义快捷键的 action / shortcut（E 项）。
+        self._apply_custom_shortcuts()
+
+    # ---- 工具栏构建 / 重建（规范化软件设计 2026-05 新增） ----
+
+    def _rebuild_toolbars(self) -> None:
+        """按 settings.toolbar_layout 填充主/辅工具栏。
+
+        - settings 缺/空时回落 TOOLBAR_DEFAULT_LAYOUT。
+        - 同 category 间自动加 separator（按 file/edit/view/tools 顺序）。
+        - 未知 action_id 静默跳过（向后兼容：日后删 action 不会让旧 settings 崩）。
+        - 已挂的 QAction 保留在 self._toolbar_actions（id → QAction），自定义对话框 / 快捷键绑定用。
+
+        本方法可在自定义对话框保存后重复调用，达到热更新。
+        """
+        # 清空两栏（保留 _auto_save_action — 它不在 layout 内，由 _build_ui 另挂）
+        for tb in (self._main_toolbar, self._aux_toolbar):
+            # 备份 _auto_save_action（如果在该栏内）
+            actions_to_remove = [
+                a for a in tb.actions()
+                if a is not getattr(self, "_auto_save_action", None)
+            ]
+            for a in actions_to_remove:
+                tb.removeAction(a)
+        self._toolbar_actions.clear()
+
+        layout = load_settings().toolbar_layout or {}
+        main_ids = layout.get("main") or list(TOOLBAR_DEFAULT_LAYOUT["main"])
+        aux_ids = layout.get("aux") or list(TOOLBAR_DEFAULT_LAYOUT["aux"])
+
+        from PyQt5.QtWidgets import QStyle
+        style = self.style()
+
+        def _add_ids(toolbar: QToolBar, action_ids: list[str]) -> None:
+            last_category = None
+            for action_id in action_ids:
+                spec = TOOLBAR_ACTIONS.get(action_id)
+                if spec is None:
+                    continue  # 未知 id，跳（向后兼容老 settings）
+                slot = getattr(self, spec["slot"], None)
+                if slot is None:
+                    continue  # slot 方法不存在，跳
+                # 同 category 内连排；跨 category 加 separator
+                category = spec.get("category")
+                if last_category is not None and category != last_category:
+                    toolbar.addSeparator()
+                last_category = category
+                action = QAction(spec["label"], self)
+                tip = spec.get("tooltip")
+                if tip:
+                    action.setToolTip(tip)
+                # 给 action 加 Qt 自带 StandardPixmap 图标（零资源依赖、跨平台）。
+                icon_name = spec.get("icon")
+                if icon_name:
+                    pix = getattr(QStyle, icon_name, None)
+                    if pix is not None:
+                        try:
+                            action.setIcon(style.standardIcon(pix))
+                        except Exception:
+                            pass  # 主题不支持时静默跳过
+                action.triggered.connect(slot)
+                toolbar.addAction(action)
+                self._toolbar_actions[action_id] = action
+
+        # _auto_save_action 已在 _build_ui 末尾挂主栏；这里清空时已排除它，重排时它仍在原位
+        # 但顺序可能错乱：先清完再重排时它实际已被 removeAction 排除外，仍在主栏。
+        # 为简化：忽略它的位置，每次重建后 _auto_save_action 会出现在主栏的某处；
+        # 实际更准确的做法是把 _auto_save_action 也 removeAction 再重新 addAction 到末尾。
+        auto_save = getattr(self, "_auto_save_action", None)
+        if auto_save is not None and auto_save in self._main_toolbar.actions():
+            self._main_toolbar.removeAction(auto_save)
+
+        _add_ids(self._main_toolbar, main_ids)
+        _add_ids(self._aux_toolbar, aux_ids)
+
+        if auto_save is not None:
+            self._main_toolbar.addSeparator()
+            self._main_toolbar.addAction(auto_save)
+
+    def _apply_custom_shortcuts(self) -> None:
+        """把 settings.custom_shortcuts 应用到对应的 QShortcut / QAction（E 项）。
+
+        - 仅作用于本注册表内 action_id；未知 id 静默跳过。
+        - 空字符串 keyseq 表示用 SHORTCUTABLE_ACTIONS 默认值；不显式清除已绑的。
+        - 冲突由 ShortcutsCustomizeDialog 在录入阶段保证（不绑重复 keyseq）。
+        """
+        try:
+            custom = (load_settings().custom_shortcuts or {})
+        except Exception:
+            return
+
+        def _seq_for(action_id: str) -> Optional[QKeySequence]:
+            raw = custom.get(action_id)
+            if raw is None:
+                # 未自定义 -> 保持创建时的默认 keyseq，不动
+                return None
+            if not raw.strip():
+                # 空 -> 用注册表 default 还原
+                spec = SHORTCUTABLE_ACTIONS.get(action_id)
+                if spec and spec.get("default"):
+                    return QKeySequence(spec["default"])
+                return QKeySequence()  # 完全清空
+            return QKeySequence(raw)
+
+        # 各 action_id 对应的 setter（QShortcut 用 setKey，QAction 用 setShortcut）。
+        # 缺失引用（未在本类里创建 QShortcut/QAction 的）跳过：日后补绑时只需在此添加分支。
+        setters = {
+            "undo":                lambda ks: self._sc_undo.setKey(ks),
+            "redo":                lambda ks: self._sc_redo.setKey(ks),
+            "select_all_voucher":  lambda ks: self._sc_select_all_voucher.setKey(ks),
+            "fit_image":           lambda ks: self._sc_fit.setShortcut(ks),
+            "return_to_grid":      lambda ks: self._sc_esc.setShortcut(ks),
+            "zoom_in":             lambda ks: self._sc_zoom_in.setKey(ks),
+            "zoom_out":            lambda ks: self._sc_zoom_out.setKey(ks),
+            "zoom_reset":          lambda ks: self._sc_zoom_reset.setKey(ks),
+            "photo_filename_fill": lambda ks: self._photo_filename_fill_action.setShortcut(ks),
+            "ingest_summary":      lambda ks: self._toolbar_actions["ingest_summary"].setShortcut(ks)
+                                       if "ingest_summary" in self._toolbar_actions else None,
+            "batch_export":        lambda ks: self._toolbar_actions["batch_export"].setShortcut(ks)
+                                       if "batch_export" in self._toolbar_actions else None,
+            "worms":               lambda ks: self._toolbar_actions["worms"].setShortcut(ks)
+                                       if "worms" in self._toolbar_actions else None,
+            # user_manual: 帮助菜单内 QAction 暂未持引用 -> 跳过，由 ShortcutsCustomizeDialog 提示
+        }
+        for action_id, setter in setters.items():
+            ks = _seq_for(action_id)
+            if ks is None:
+                continue
+            try:
+                setter(ks)
+            except Exception:
+                pass  # 单个 action 绑定失败不影响其他
 
     def _wrap_field_with_hint(self, field: str, widget: QWidget) -> QWidget:
         """把输入控件包一层，在其**后面**放一个低调的「?」信息按钮（参考专业软件做法）。
@@ -1596,11 +2160,9 @@ class SpecimenWindow(QMainWindow):
         hint.setAutoRaise(True)
         hint.setFixedSize(18, 18)
         hint.setFocusPolicy(Qt.NoFocus)
-        # 低调：灰色细字，hover 才变主题蓝；不抢输入框的视觉重心。
-        hint.setStyleSheet(
-            "QToolButton { color: #9aa4ad; border: none; }"
-            " QToolButton:hover { color: #2a6fbd; }"
-        )
+        # 规范化软件设计 2026-05 P1 优化:用 class 选择器(theme.py APP_QSS 内 QToolButton[class="hint"])
+        # 替代 inline 灰色 + hover 蓝;每个字段一个按钮,N 个字段共享同一规则省 N×160 字节字符串。
+        hint.setProperty("class", "hint")
         hint.setToolTip(tip)
         hint.clicked.connect(
             lambda _=False, f=field, t=tip: QMessageBox.information(self, f"「{f}」填写说明", t)
@@ -1728,6 +2290,21 @@ class SpecimenWindow(QMainWindow):
         updates = {field: value for field, value in updates.items() if field in self.class_widgets}
         if not updates:
             return
+        existing = self.store.get_classification(self.current_voucher) or {}
+        conflicts = {
+            k: (str(existing[k]), v)
+            for k, v in updates.items()
+            if existing.get(k) and str(existing[k]) != v
+        }
+        if conflicts:
+            lines = "\n".join(f"  {k}：{old} → {new}" for k, (old, new) in conflicts.items())
+            reply = QMessageBox.question(
+                self, "确认覆盖",
+                f"以下字段已有内容，确认覆盖？\n{lines}",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
         self._cancel_pending_classification_saves(updates)
         try:
             self.store.set_fields(
@@ -1774,10 +2351,172 @@ class SpecimenWindow(QMainWindow):
         self._all_photo_counts = dict(overview["photo_counts"])
         self._all_tube_numbers = dict(overview["tube_numbers"])
         self._all_photo_filenames = dict(overview["photo_filenames"])
+        self._refresh_series_selector()
+        self._refresh_series_filter_combo()
         self._apply_voucher_filter()
         if current and current in self._all_flags:
             self._select_voucher_in_table(current)
         self._update_dashboard()
+
+    def _refresh_series_selector(self) -> None:
+        """刷新系列选择器下拉（新增入库编号时用）。"""
+        if not hasattr(self, "_series_selector") or self.store is None:
+            return
+        combo = self._series_selector
+        combo.blockSignals(True)
+        combo.clear()
+        active = self.store.get_active_series_name()
+        for name in self.store.get_all_series_names():
+            combo.addItem(name)
+        idx = combo.findText(active)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+
+    def _refresh_series_filter_combo(self) -> None:
+        """刷新系列筛选下拉（凭证列表过滤用）。"""
+        if not hasattr(self, "_series_filter_combo") or self.store is None:
+            return
+        combo = self._series_filter_combo
+        prev_data = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("全部系列", "__all__")
+        for name in self.store.get_all_series_names():
+            combo.addItem(name, name)
+        idx = combo.findData(prev_data)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _on_series_selector_changed(self, index: int) -> None:
+        """切换活跃系列（影响下一个新增入库编号的格式）。"""
+        if self.store is None or not hasattr(self, "_series_selector"):
+            return
+        name = self._series_selector.currentText()
+        if name:
+            self.store.set_active_series(name)
+
+    def _open_series_manager(self) -> None:
+        """打开系列管理对话框。"""
+        if self.store is None:
+            return
+        dlg = AccessionSeriesDialog(self.store, self)
+        dlg.exec_()
+        self._refresh_series_selector()
+        self._refresh_series_filter_combo()
+
+    def _populate_series_switch_menu(self) -> None:
+        """动态填充「切换活动系列」子菜单（每次打开前重建，确保与当前配置一致）。"""
+        menu = self._series_switch_menu
+        menu.clear()
+        if self.store is None:
+            return
+        active = self.store.get_active_series_name()
+        all_names = ["YZZ"] + self.store.get_all_series_names()
+        for name in all_names:
+            act = QAction(name, self, checkable=True)
+            act.setChecked(name == active)
+            act.triggered.connect(lambda checked, n=name: self._switch_active_series(n))
+            menu.addAction(act)
+
+    def _switch_active_series(self, name: str) -> None:
+        """从菜单切换活动系列，同步刷新左侧下拉框。"""
+        if self.store is None:
+            return
+        self.store.set_active_series(name)
+        self._refresh_series_selector()
+
+    # ── 录入任务门控 ──────────────────────────────────────────────────────────
+
+    def _start_task(self) -> None:
+        if self.store is None:
+            return
+        dlg = _StartTaskDialog(self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        import uuid
+        from datetime import datetime as _dt
+        task_id = uuid.uuid4().hex[:12]
+        now = _dt.now().isoformat(timespec="seconds")
+        self._active_task = {
+            "记录ID": task_id,
+            "人员": dlg.person,
+            "用途": dlg.purpose,
+            "备注": dlg.note,
+            "开始时间": now,
+            "新增数量": 0,
+        }
+        self.store.log_alloc_event({
+            "记录ID": task_id,
+            "时间": now,
+            "类型": "任务开始",
+            "人员": dlg.person,
+            "用途": dlg.purpose,
+            "备注": dlg.note,
+        })
+        self._update_task_indicator()
+
+    def _end_task(self) -> None:
+        if self._active_task is None:
+            return
+        from datetime import datetime as _dt
+        self.store.log_alloc_event({
+            "记录ID": self._active_task["记录ID"] + "_end",
+            "时间": _dt.now().isoformat(timespec="seconds"),
+            "类型": "任务结束",
+            "人员": self._active_task["人员"],
+            "数量": str(self._active_task["新增数量"]),
+            "关联任务ID": self._active_task["记录ID"],
+        })
+        self._active_task = None
+        self._update_task_indicator()
+        from .models import ALLOC_LOG_FILE
+        log_path = self.store.data_dir / ALLOC_LOG_FILE
+        self.statusBar().showMessage(f"任务已结束，记录保存至：{log_path}", 8000)
+
+    def _update_task_indicator(self) -> None:
+        if not hasattr(self, "_task_label"):
+            return
+        if self._active_task:
+            person = self._active_task["人员"]
+            purpose = self._active_task["用途"]
+            count = self._active_task["新增数量"]
+            self._task_label.setText(f"● {person} · {purpose} · {count}条")
+            self._task_label.setStyleSheet("color: #1a7a1a; font-weight: bold;")
+            self._task_indicator.setStyleSheet("#task_indicator { background: #d4edda; border-radius: 3px; }")
+            self._task_start_btn.setVisible(False)
+            self._task_end_btn.setVisible(True)
+            self._new_voucher_btn.setEnabled(True)
+            self._new_voucher_btn.setToolTip("")
+        else:
+            self._task_label.setText("未开始录入任务")
+            self._task_label.setStyleSheet("color: #888;")
+            self._task_indicator.setStyleSheet("")
+            self._task_start_btn.setVisible(True)
+            self._task_end_btn.setVisible(False)
+            self._new_voucher_btn.setEnabled(False)
+            self._new_voucher_btn.setToolTip("请先开始录入任务")
+
+    def _open_batch_generate(self) -> None:
+        if self.store is None:
+            return
+        dlg = BatchGenerateDialog(self.store, self)
+        dlg.exec_()
+
+    def _open_workload_report(self) -> None:
+        """工具菜单 → 入库人员记录 = PersonsManagerDialog 默认打开"工作量统计" Tab (Phase 2 复用)。
+
+        旧 WorkloadReportDialog 类仍保留向后兼容,但本入口走 PersonsManagerDialog。
+        优势:统一 UI、复用 SpreadsheetPreviewWidget(排序/筛选/复制/Excel+CSV)、
+        含明细+汇总+编号分发 三 Tab,数据维度也加了照片 / 首次/末次。
+        """
+        if self.store is None:
+            return
+        from .persons_dialog import PersonsManagerDialog
+        # initial_tab=1 → 直接显"工作量统计"
+        dlg = PersonsManagerDialog(self, workspace=self.workspace_root,
+                                   store=self.store, initial_tab=1)
+        dlg.exec_()
 
     def _on_voucher_header_clicked(self, col: int) -> None:
         """Cycle column filter: all -> √ -> × -> all (or all -> 已认领 -> 未认领 -> all for col 4)."""
@@ -1808,6 +2547,15 @@ class SpecimenWindow(QMainWindow):
     def _apply_voucher_filter(self) -> None:
         search = self._voucher_search.text().strip().lower()
         vouchers = self._all_vouchers
+        # Apply series filter
+        series_sel = self._series_filter_combo.currentData() if hasattr(self, "_series_filter_combo") else None
+        if series_sel and series_sel != "__all__":
+            from .parsing import parse_voucher_serial
+            from .accession_series import series_prefix_of
+            if series_sel == "YZZ":
+                vouchers = [v for v in vouchers if parse_voucher_serial(v) is not None]
+            else:
+                vouchers = [v for v in vouchers if series_prefix_of(v) == series_sel]
         # Apply search
         if search:
             scope = self._search_scope.currentText()
@@ -1843,6 +2591,12 @@ class SpecimenWindow(QMainWindow):
                 vouchers = [v for v in vouchers if self._all_flags.get(v) and self._all_flags[v].label()[idx] == val]
         # Paginate
         self._filtered_vouchers = vouchers
+        total = len(self._all_vouchers)
+        shown = len(vouchers)
+        if shown < total:
+            self.statusBar().showMessage(f"筛选中：显示 {shown}/{total} 条", 0)
+        else:
+            self.statusBar().clearMessage()
         total_pages = max(1, (len(vouchers) + self._voucher_page_size - 1) // self._voucher_page_size)
         self._voucher_page = min(self._voucher_page, total_pages - 1)
         start = self._voucher_page * self._voucher_page_size
@@ -1952,6 +2706,85 @@ class SpecimenWindow(QMainWindow):
             self._dashboard_timer.timeout.connect(self._compute_dashboard)
         self._dashboard_timer.start(1000)  # debounce 1s
 
+    def _on_current_recorder_changed(self, name_or_special: str) -> None:
+        """状态栏当前录入员下拉变化:持久化 + 任务活跃时弹确认。"""
+        from .widgets_persons import PersonComboBox
+        # 处理 "+ 管理人员…" 特殊项
+        if name_or_special == PersonComboBox.SPECIAL_MANAGE:
+            self._open_persons_manager()
+            # 刷新自身,保留之前选中
+            try:
+                prev = load_settings().current_recorder
+                self._current_recorder_combo.refresh(preselect=prev)
+            except Exception:
+                self._current_recorder_combo.refresh()
+            return
+        if not name_or_special:
+            return
+        # 任务活跃时弹确认
+        if self._active_task is not None and self._active_task.get("人员") != name_or_special:
+            ret = QMessageBox.question(
+                self, "切换录入员",
+                f"当前任务录入员是「{self._active_task.get('人员')}」。\n"
+                f"切换到「{name_or_special}」会结束当前任务并开始新任务,确认?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if ret != QMessageBox.Yes:
+                # 还原下拉到旧值
+                try:
+                    self._current_recorder_combo.refresh(
+                        preselect=self._active_task.get("人员", "")
+                    )
+                except Exception:
+                    pass
+                return
+            # 结束当前任务 + 开新任务
+            self._end_task()
+            # 自动开始新任务(简化:用相同用途/备注)
+            # TODO:可改弹 _StartTaskDialog 让用户确认用途
+        # 持久化 current_recorder + update last_used_at
+        try:
+            settings = load_settings()
+            settings.current_recorder = name_or_special
+            save_settings(settings)
+            from .persons_store import update_last_used
+            update_last_used(name_or_special, self.workspace_root)
+        except Exception:
+            pass
+
+    def _open_persons_manager(self) -> None:
+        """工具菜单入口 / 状态栏 "管理人员…" 选项 → 打开 PersonsManagerDialog。
+
+        Phase 2 (2026-05): 传 store 让 Tab 2/3/4 显示工作量统计 / 任务明细 / 编号分发。
+        """
+        from .persons_dialog import PersonsManagerDialog
+        dlg = PersonsManagerDialog(self, workspace=self.workspace_root, store=self.store)
+        dlg.exec_()
+        # 关闭后刷新状态栏下拉
+        try:
+            prev = load_settings().current_recorder
+            self._current_recorder_combo.refresh(preselect=prev)
+        except Exception:
+            self._current_recorder_combo.refresh()
+
+    def _refresh_memory_status(self) -> None:
+        """状态栏:档位 + RSS。规范化软件设计 2026-05 新增,每 5s 刷新。"""
+        label = getattr(self, "_memory_status_label", None)
+        if label is None:
+            return
+        try:
+            from .env_detect import current_rss_mb
+            from .app_settings import load_settings, MEMORY_PROFILE_OPTIONS
+            profile = load_settings().memory_profile
+            display_full = MEMORY_PROFILE_OPTIONS.get(profile, profile)
+            # 取首段(空格前) — "极低 / 低 / 自动 / 高 / 极高"
+            display = display_full.split(" ")[0] if display_full else profile
+            rss = current_rss_mb()
+            rss_txt = f"{rss}MB" if rss is not None else "?"
+            label.setText(f"档位:{display} | RSS:{rss_txt}")
+        except Exception:
+            pass
+
     def _compute_dashboard(self) -> None:
         if self.store is None:
             return
@@ -2014,6 +2847,26 @@ class SpecimenWindow(QMainWindow):
         self.statusBar().showMessage(
             "已开启自动保存" if checked else "已关闭自动保存（改动需点「保存」按钮写入）", 3000
         )
+
+    def _on_aux_toolbar_toggled(self, checked: bool) -> None:
+        """视图菜单「辅助工具栏」勾选切换：显示/隐藏辅栏 + 持久化（规范化软件设计 2026-05 新增）。"""
+        if hasattr(self, "_aux_toolbar"):
+            self._aux_toolbar.setVisible(bool(checked))
+        settings = load_settings()
+        settings.aux_toolbar_visible = bool(checked)
+        save_settings(settings)
+
+    def _open_toolbar_customize(self) -> None:
+        """打开「自定义工具栏」对话框（视图菜单入口）。"""
+        from .toolbar_customize import ToolbarCustomizeDialog
+        dlg = ToolbarCustomizeDialog(self)
+        dlg.exec_()
+
+    def _open_shortcuts_customize(self) -> None:
+        """打开「自定义快捷键」对话框（视图菜单入口）。"""
+        from .shortcuts_customize import ShortcutsCustomizeDialog
+        dlg = ShortcutsCustomizeDialog(self)
+        dlg.exec_()
 
     def schedule_save(self, category: str, field: str) -> None:
         if self._loading or not self.current_voucher:
@@ -2135,6 +2988,9 @@ class SpecimenWindow(QMainWindow):
         # 原逻辑：create_specimen() -> refresh_list() -> select_voucher()，新记录字段全空。
         # 现在：新增入库编号时把上一条的标本信息字段（CARRY_OVER_SPECIMEN_FIELDS）
         # 带入新记录，减少重复录入。沿用是本工作模式的固定规则。
+        # 需先「开始录入任务」才能新增编号（门控）。
+        if not self._active_task:
+            return
         try:
             carry: dict[str, str] = {}
             # 旧逻辑：仅当工具栏「沿用上条信息」开关勾选时才沿用。
@@ -2154,6 +3010,9 @@ class SpecimenWindow(QMainWindow):
             voucher = self.store.create_specimen()
             if carry:
                 self.store.set_fields("specimen", voucher, carry)
+            if self._active_task:
+                self._active_task["新增数量"] += 1
+                self._update_task_indicator()
             self.refresh_list()
             self.select_voucher(voucher)
         except Exception as exc:
@@ -2309,6 +3168,149 @@ class SpecimenWindow(QMainWindow):
             "编辑保存后，务必在本程序「重新打开工作区」或重启程序，才能加载最新数据。",
         )
 
+    def _open_worms_match(self) -> None:
+        """工具菜单入口：打开 WoRMS 分类匹配窗口（非模态，单实例）。"""
+        store = getattr(self, "store", None)
+        if store is None:
+            QMessageBox.information(self, "未选择工作区", "请先选择工作区再使用此功能。")
+            return
+        # 缓存守卫(规范化软件设计 2026-05 启动卡死优化):
+        # run_app() 现把 WoRMS bootstrap 延后 3s 后台触发(不阻塞启动)。
+        # 如用户 3s 内就开 WoRMS,这里同步触发一次 ensure_bootstrap_cache —— 幂等,
+        # 已就绪时立刻返回,首次需 ~100ms 解压 188KB sqlite.gz。
+        self._ensure_worms_cache_ready()
+        from .worms_match import WormsMatchWindow
+        # Single-instance: reuse existing visible window or create new one.
+        if self._worms_window is None or not self._worms_window.isVisible():
+            self._worms_window = WormsMatchWindow(self, store)
+        self._worms_window.show()
+        self._worms_window.raise_()
+        self._worms_window.activateWindow()
+
+    def _ensure_worms_cache_ready(self) -> None:
+        """WoRMS slot 守卫:首次调用时同步触发 ensure_bootstrap_cache(幂等)。"""
+        try:
+            from .worms_client import ensure_bootstrap_cache
+            self.statusBar().showMessage("准备 WoRMS 分类数据…", 2000)
+            QApplication.processEvents()  # 让 statusBar 消息可见
+            if ensure_bootstrap_cache():
+                self.statusBar().showMessage("已加载内置 WoRMS 分类缓存", 3000)
+        except Exception:
+            pass  # bootstrap 失败不阻塞 WoRMS 功能(WoRMS REST API 仍可联网用)
+
+    def _open_worms_db_manager(self) -> None:
+        """WoRMS 菜单入口：直接打开本地数据库管理对话框。"""
+        self._ensure_worms_cache_ready()  # 守卫:首启 3s 内点开本入口时同步准备缓存
+        from .worms_match import _DbManagerDialog
+        dlg = _DbManagerDialog(parent=self)
+        # C1: 注册到 WindowManager，让主窗口关闭时能接管 dlg 的后台 worker
+        if self.manager is not None:
+            self.manager.register_dialog_stopper(dlg, dlg._stop_worker)
+        try:
+            dlg.exec_()
+        finally:
+            # exec 返回后注销（dlg 自己也会注销，这里二次保证）
+            if self.manager is not None:
+                self.manager.unregister_dialog_stopper(dlg)
+
+    def _open_worms_browse(self) -> None:
+        """打开 WoRMS 窗口并切换到「分类浏览」Tab（index 1）。"""
+        self._open_worms_match()
+        if self._worms_window:
+            from PyQt5.QtWidgets import QTabWidget
+            for child in self._worms_window.children():
+                if isinstance(child, QTabWidget):
+                    child.setCurrentIndex(1)
+                    break
+
+    # ---------------------------------------------------------------
+    # 帮助菜单 slot 集合（规范化软件设计 2026-05 新增）
+    # ---------------------------------------------------------------
+    def _open_user_manual_dialog(self) -> None:
+        """打开使用说明（单实例 UserManualDialog，QTextBrowser + markdown 渲染）。"""
+        from .help_dialog import UserManualDialog, manual_root
+        if manual_root() is None:
+            QMessageBox.information(
+                self,
+                "用户手册未找到",
+                "未找到 docs/manual/ 目录。若你从源码运行，请确认仓库已拉取完整；\n"
+                "若你从安装包运行，请尝试重新安装或联系管理员。",
+            )
+            return
+        if self._manual_dialog is None or not self._manual_dialog.isVisible():
+            self._manual_dialog = UserManualDialog(self)
+        self._manual_dialog.show()
+        self._manual_dialog.raise_()
+        self._manual_dialog.activateWindow()
+
+    def _open_field_help_index(self) -> None:
+        """打开字段填写说明速查（全字段表格）。"""
+        from .help_dialog import FieldHelpIndexDialog
+        dlg = FieldHelpIndexDialog(self)
+        dlg.exec_()
+
+    def _open_shortcuts_dialog(self) -> None:
+        """打开快捷键速查。"""
+        from .help_dialog import ShortcutsDialog
+        dlg = ShortcutsDialog(self)
+        dlg.exec_()
+
+    def _check_github_update_from_help(self) -> None:
+        """帮助菜单「检查更新…」：仿 VersionManagerDialog._check_github_update。
+        若检测到新版，弹是否打开版本管理对话框下载。
+        """
+        try:
+            from . import updater
+        except Exception as exc:
+            QMessageBox.warning(self, "检查更新失败", f"更新模块加载失败：{exc}")
+            return
+        try:
+            release = updater.check_latest_release()
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "检查更新失败",
+                f"无法连接 GitHub Release：{exc}\n请检查网络后重试。",
+            )
+            return
+        if release is None:
+            QMessageBox.information(self, "检查更新", "未找到可用的发布版本。")
+            return
+        if not updater.is_newer(release.version, __version__):
+            QMessageBox.information(
+                self, "已是最新", f"当前版本 v{__version__} 已是最新。"
+            )
+            return
+        ret = QMessageBox.question(
+            self,
+            "发现新版本",
+            f"GitHub 上有新版 v{release.version}（当前 v{__version__}）。\n"
+            "是否打开「版本管理」对话框查看与下载？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if ret == QMessageBox.Yes:
+            self.open_version_manager()
+
+    def _open_crash_log_dir(self) -> None:
+        """打开崩溃日志目录（~/.specimen_inventory/ 或 %APPDATA%/标本入库管理/）。"""
+        try:
+            from .app_settings import app_config_dir
+            target = app_config_dir()
+        except Exception as exc:
+            QMessageBox.warning(self, "打开失败", f"无法定位崩溃日志目录：{exc}")
+            return
+        if target is None:
+            QMessageBox.warning(self, "打开失败", "未配置崩溃日志目录。")
+            return
+        _open_path(Path(target))
+
+    def _open_about_dialog(self) -> None:
+        """打开关于对话框。"""
+        from .help_dialog import AboutDialog
+        dlg = AboutDialog(self)
+        dlg.exec_()
+
     def _downgrade_workspace_schema(self) -> None:
         """将工作区兼容版本降回 1.0.0，以便旧版软件可以打开此工作区。
 
@@ -2396,7 +3398,7 @@ class SpecimenWindow(QMainWindow):
             return
         answer = QMessageBox.warning(
             self, "确认删除",
-            f"密码验证通过。\n\n确定要永久删除 {voucher} 吗？此操作不可恢复（可撤回）。",
+            f"密码验证通过。\n\n确定要永久删除 {voucher} 吗？\n删除后可通过「撤回」恢复，但超出撤回深度后将永久丢失。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -2434,7 +3436,7 @@ class SpecimenWindow(QMainWindow):
             f"密码验证通过。\n\n确定要永久删除以下 {len(vouchers)} 个入库编号吗？\n"
             + "\n".join(f"  · {v}" for v in vouchers[:20])
             + ("\n  ..." if len(vouchers) > 20 else "")
-            + "\n\n此操作不可恢复（可逐条撤回）。",
+            + "\n\n删除后可通过「撤回」逐条恢复，但超出撤回深度后将永久丢失。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -2454,19 +3456,19 @@ class SpecimenWindow(QMainWindow):
 
     def undo(self) -> None:
         action = self.store.undo_last()
-        if not action:
-            QMessageBox.information(self, "撤回", "没有可撤回的操作。")
-            return
-        self.statusBar().showMessage(f"已撤回：{action}", 3000)
-        self.reload_current()
+        if action:
+            self.statusBar().showMessage(f"已撤回：{action}", 3000)
+            self.reload_current()
+        else:
+            self.statusBar().showMessage("没有可撤回的操作", 2000)
 
     def redo(self) -> None:
         action = self.store.redo_last()
-        if not action:
-            QMessageBox.information(self, "返回", "没有可返回的操作。")
-            return
-        self.statusBar().showMessage(f"已返回：{action}", 3000)
-        self.reload_current()
+        if action:
+            self.statusBar().showMessage(f"已重做：{action}", 3000)
+            self.reload_current()
+        else:
+            self.statusBar().showMessage("没有可重做的操作", 2000)
 
     def _undo_redo_counts(self) -> tuple[int, int]:
         """Return (undo_count, redo_count) for display."""
@@ -3548,6 +4550,10 @@ class SpecimenWindow(QMainWindow):
     def _save_current_photo_view_state(self) -> None:
         key = self._photo_state_key()
         if key:
+            # 防止长时间浏览后字典无限增长：超 500 条时淘汰前半部旧条目。
+            if len(self._photo_view_states) >= 500:
+                for _k in list(self._photo_view_states)[:250]:
+                    del self._photo_view_states[_k]
             self._photo_view_states[key] = (1.0, 0, 0)
 
     def _view_state_for_current_photo(self) -> tuple[float, int, int]:
@@ -3559,24 +4565,419 @@ class SpecimenWindow(QMainWindow):
         source = QFileDialog.getExistingDirectory(self, "选择要导入的旧工作区")
         if not source:
             return
+        # 规范化软件设计 2026-05 P1 审查修复:加 QProgressDialog + processEvents 让 UI 不卡。
+        progress_dlg = QProgressDialog("正在导入工作区…", "", 0, 0, self)
+        progress_dlg.setWindowTitle("导入工作区")
+        progress_dlg.setCancelButton(None)
+        progress_dlg.setMinimumDuration(0)
+        progress_dlg.setModal(True)
+        progress_dlg.show()
+        QApplication.processEvents()
         try:
             result = self.store.import_workspace(source)
-            # 原代码导入后保留旧图片索引；新导入照片或图谱目录需要重新建索引才能被检索到。
+            progress_dlg.close()
+            # 原代码导入后保留旧图片索引;新导入照片或图谱目录需要重新建索引才能被检索到。
             self.search_index = None
             clear_image_index()
             QTimer.singleShot(200, self._build_search_index_background)
-            message = f"导入 {result.imported} 个标本，跳过 {result.skipped} 个重复记录，关联照片 {result.photos_imported} 张。"
+            message = f"导入 {result.imported} 个标本,跳过 {result.skipped} 个重复记录,关联照片 {result.photos_imported} 张。"
             if result.report_path:
-                message += f"\n缺失照片报告：{result.report_path}"
+                message += f"\n缺失照片报告:{result.report_path}"
             QMessageBox.information(self, "导入完成", message)
             self.refresh_list()
         except ImportConflictError as exc:
+            progress_dlg.close()
             detail = str(exc)
             if exc.report_path:
-                detail += f"\n冲突报告：{exc.report_path}"
+                detail += f"\n冲突报告:{exc.report_path}"
             QMessageBox.critical(self, "导入已阻止", detail)
         except Exception as exc:
+            progress_dlg.close()
             QMessageBox.critical(self, "导入失败", str(exc))
+
+    def _open_aggregate_incoming(self) -> None:
+        """工具菜单入口：从 incoming/ 一键聚合所有子目录到中心机（M1 含 P1 降级模式）。
+
+        合并核心走现有 `ExcelStore.import_workspace`，所以指纹冲突 / 编号唯一性 / 照片
+        物理去重 全部沿用已有保护。本入口只是"批量循环 + 分流归档 + 跨机锁"封装。
+        无 `manifest.json` 的子目录同样能被吃（P1 等价：任何含 `数据/` 子目录即合法源）。
+        密码门控复用 ADMIN_PASSWORD，与"用 Excel 打开数据文件…"等管理操作一致。
+        """
+        store = getattr(self, "store", None)
+        if store is None:
+            QMessageBox.information(self, "未选择工作区", "请先选择中心机工作区再使用此功能。")
+            return
+        incoming_dir = QFileDialog.getExistingDirectory(self, "选择收件箱目录（incoming）")
+        if not incoming_dir:
+            return
+        incoming_path = Path(incoming_dir)
+        password, ok = QInputDialog.getText(
+            self, "从收件箱聚合",
+            "本操作会把收件箱里所有「含 数据/ 子目录」的文件夹合并到当前中心机。\n"
+            "合并前会自动创建快照，可一键回退。\n\n"
+            "请输入管理密码以继续：",
+            QLineEdit.Password,
+        )
+        if not ok or not password:
+            return
+        if password != ADMIN_PASSWORD:
+            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
+            return
+        # S7: 先 dry-run 预览,让用户看到预计结果再决定是否真合并
+        # 规范化软件设计 2026-05 P1 审查修复:大工作区预扫可能耗时,加 QProgressDialog 防 UI 冻。
+        preview_dlg = QProgressDialog("正在预扫收件箱…", "", 0, 0, self)
+        preview_dlg.setWindowTitle("预扫")
+        preview_dlg.setCancelButton(None)
+        preview_dlg.setMinimumDuration(0)
+        preview_dlg.setModal(True)
+        preview_dlg.show()
+        QApplication.processEvents()
+        try:
+            preview = preview_aggregate(store, incoming_path)
+        except Exception as exc:
+            preview_dlg.close()
+            QMessageBox.critical(self, "预览失败", f"预扫出错:{exc}")
+            return
+        preview_dlg.close()
+        if preview.total_candidates == 0:
+            QMessageBox.information(
+                self, "预览结果",
+                "在该目录下未发现可合并的子目录（要求子目录含 数据/）。",
+            )
+            return
+        # 拼预览文本（统计 + 头 10 个候选明细）
+        lines = [
+            f"候选子目录：{preview.total_candidates}",
+            "",
+            f"预计新增 voucher：{preview.predicted_new_vouchers}",
+            f"预计重复跳过：{preview.predicted_skipped_vouchers}",
+            f"预计冲突：{preview.predicted_conflicts}",
+            f"预计照片新增：{preview.predicted_photos}",
+            f"预计跨 voucher 同 SHA256 照片：{preview.predicted_cross_voucher_duplicates}",
+            f"预计同名不同内容照片：{preview.predicted_name_conflicts}",
+            "",
+            "明细：",
+        ]
+        for name, outcome, _count, note in preview.candidates[:10]:
+            lines.append(f"  · {name} [{outcome}]: {note}")
+        if len(preview.candidates) > 10:
+            lines.append(f"  …（其余 {len(preview.candidates) - 10} 个省略）")
+        lines.append("")
+        lines.append("以上是只读预览 — 数据未被修改。是否继续真正合并？")
+        answer = QMessageBox.question(
+            self, "合并预览（只读，未动数据）",
+            "\n".join(lines),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        # 规范化软件设计 2026-05 P1 审查修复:
+        # 旧:aggregate_incoming 主线程同步,大工作区合并卡 UI 30s+。
+        # 现:用 QProgressDialog + processEvents,通过 progress_cb 回调让事件循环跑,
+        #    UI 保持响应。完整 QThread 重构留后续(成本高)。
+        progress_dlg = QProgressDialog("正在聚合收件箱…", "", 0, 0, self)
+        progress_dlg.setWindowTitle("从收件箱聚合")
+        progress_dlg.setCancelButton(None)  # 不支持中途取消(底层不可中断)
+        progress_dlg.setMinimumDuration(0)
+        progress_dlg.setModal(True)
+        progress_dlg.show()
+        QApplication.processEvents()
+
+        def _on_progress(stage: str, current: int, total: int) -> None:
+            if total > 0:
+                progress_dlg.setMaximum(total)
+                progress_dlg.setValue(current)
+            progress_dlg.setLabelText(f"{stage}({current}/{total if total > 0 else '?'})")
+            QApplication.processEvents()
+
+        try:
+            # aggregate_incoming 支持 progress_cb;传入让 UI 周期 processEvents
+            try:
+                report = aggregate_incoming(store, incoming_path, progress_cb=_on_progress)
+            except TypeError:
+                # 老版签名无 progress_cb 时回落
+                report = aggregate_incoming(store, incoming_path)
+        except Exception as exc:
+            progress_dlg.close()
+            QMessageBox.critical(self, "聚合失败", f"聚合过程出错:{exc}")
+            return
+        progress_dlg.close()
+        # 导入后旧图片索引可能不再覆盖新照片，刷新主窗口并后台重建索引。
+        self.search_index = None
+        clear_image_index()
+        QTimer.singleShot(200, self._build_search_index_background)
+        self.refresh_list()
+        lines: list[str] = []
+        if not report.processed and not report.conflicted and not report.errored:
+            lines.append("收件箱里没有可合并的子目录（要求子目录含 数据/）。")
+        else:
+            lines.append(
+                f"成功合并：{len(report.processed)} 个子目录 — "
+                f"共 {report.total_imported} 条 voucher、{report.total_photos} 张照片。"
+            )
+        if report.conflicted:
+            lines.append(
+                f"\n冲突待人工处理：{len(report.conflicted)} 个 — 已移至 conflicts/，"
+                "请查看冲突报告 xlsx。"
+            )
+        if report.errored:
+            lines.append(
+                f"出错待排查：{len(report.errored)} 个 — 已移至 errors/，"
+                "请查看 error.log。"
+            )
+        if report.duplicates:
+            lines.append(
+                f"\n跨 voucher 同 SHA256 照片审核：{len(report.duplicates)} 个子目录命中 — "
+                "已写报告到 duplicates/，主管审核后决定是否补登。"
+            )
+        if report.name_conflicts:
+            lines.append(
+                f"\n同名不同内容照片：{len(report.name_conflicts)} 个文件名 — "
+                f"已写报告到 name_conflicts/{report.name_conflicts_report_path.name if report.name_conflicts_report_path else ''}。"
+            )
+        if report.snapshot_path is not None:
+            lines.append(f"\n已自动快照：{report.snapshot_path.name}（可在 工具→数据版本… 回退）")
+        QMessageBox.information(self, "聚合完成", "\n".join(lines))
+
+    def _open_import_examples(self) -> None:
+        """打开合并/导入示例文档 — 4 种合并场景操作示例。
+
+        旧（v0.5.0+）：定位 `docs/import-merge-examples.md`。
+        现（规范化软件设计 2026-05）：docs 重排后路径变 `docs/manual/import-merge.md`；
+        保留旧路径作 fallback 以兼容老安装包（升级前的 release 仍带旧文件名）。
+        多根解析顺序：源 / PyInstaller `_MEIPASS` / `_internal/` / cwd。
+        """
+        import sys as _sys
+        # 主路径（规范化后）；旧路径作 fallback
+        rel_paths = [
+            Path("docs") / "manual" / "import-merge.md",
+            Path("docs") / "import-merge-examples.md",
+        ]
+        candidates: list[Path] = []
+        for rel in rel_paths:
+            # 源代码根（specimen_app/../<rel>）
+            candidates.append(Path(__file__).resolve().parent.parent / rel)
+            # PyInstaller 打包根
+            meipass = getattr(_sys, "_MEIPASS", None)
+            if meipass:
+                candidates.append(Path(meipass) / rel)
+            # onedir frozen
+            if getattr(_sys, "frozen", False):
+                candidates.append(Path(_sys.executable).resolve().parent / "_internal" / rel)
+            # 工作目录
+            candidates.append(Path.cwd() / rel)
+            # 工作区目录（用户放了一份）
+            if getattr(self, "workspace_root", None):
+                candidates.append(Path(self.workspace_root) / rel)
+        for p in candidates:
+            if p.exists():
+                _open_path(p)  # 模块级 helper（不是 self.method）
+                return
+        QMessageBox.information(
+            self, "文档未找到",
+            "未在以下位置找到合并/导入示例：\n" + "\n".join(str(c) for c in candidates),
+        )
+
+    def _open_batch_import_sources(self) -> None:
+        """S2：弹 BatchImportSourcesDialog 让主管多选源工作区目录直接合并。
+
+        与「从收件箱聚合」区别：不需要把源目录先复制到一个统一 incoming/，
+        而是支持在文件管理器里直接逐个选 D:\\ydy\\ 和 D:\\yss\\。源目录原样保留。
+        """
+        store = getattr(self, "store", None)
+        if store is None:
+            QMessageBox.information(self, "未选择工作区", "请先打开中心机工作区再使用此功能。")
+            return
+        dlg = BatchImportSourcesDialog(store, self)
+        dlg.exec_()
+        # 完成后刷新主窗口（dlg 内部有自己的结果弹窗）
+        self.search_index = None
+        clear_image_index()
+        QTimer.singleShot(200, self._build_search_index_background)
+        self.refresh_list()
+
+    def _upgrade_workspace_to_multi_user(self) -> None:
+        """M5：把当前旧版工作区升级到多人协作格式。
+
+        升级范围 = 工作区配置.json 加两个键（`multi_user_protocol_version` /
+        `legacy_yzz_segment`），不动任何 Excel 数据 / 照片 / 已有快照。
+        升级前强制 snapshot，可一键回退（工具菜单 → 操作记录 → 撤销）。
+        升级后旧工作区即可被「从收件箱聚合」吃下，或与新工作区一起合并。
+        """
+        store = getattr(self, "store", None)
+        if store is None:
+            QMessageBox.information(self, "未选择工作区", "请先打开工作区再使用此功能。")
+            return
+        # 已升级则只提示，不重复操作
+        if store.config.get("multi_user_protocol_version"):
+            QMessageBox.information(
+                self, "无需升级",
+                f"该工作区已是多人协作格式（v{store.config.get('multi_user_protocol_version')}）。",
+            )
+            return
+        # 旧工作区 + 含数据 才提示用户升级；空工作区直接帮加标记
+        is_legacy = store.detect_legacy_workspace()
+        if is_legacy:
+            answer = QMessageBox.question(
+                self, "升级到多人协作格式",
+                "将把当前工作区升级到多人协作格式。\n\n"
+                "升级内容：\n"
+                "  · 仅在 工作区配置.json 写入两个标记键（不动任何已有 Excel / 照片）；\n"
+                "  · 自动创建升级前快照，可一键回退；\n"
+                "  · 升级后工作区可用「从收件箱聚合」吃外部子目录，或作为子目录发给主管聚合。\n\n"
+                "是否继续？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if answer != QMessageBox.Yes:
+                return
+        try:
+            summary = store.upgrade_to_multi_user_protocol()
+        except Exception as exc:
+            QMessageBox.critical(self, "升级失败", f"升级出错：{exc}")
+            return
+        if summary.get("already_upgraded"):
+            QMessageBox.information(self, "无需升级", "该工作区已是多人协作格式。")
+            return
+        snap = summary.get("snapshot_path")
+        seg = summary.get("legacy_yzz_segment", [1, 0])
+        QMessageBox.information(
+            self, "升级完成",
+            f"工作区已升级到多人协作格式（v{summary.get('multi_user_protocol_version')}）。\n\n"
+            f"已自动快照：{snap.name if snap else '（无）'}\n"
+            f"历史 YZZ 段范围：[{seg[0]}, {seg[1]}]（升级前已分配的连号区间，便于追溯）\n\n"
+            f"可在「工具 → 操作记录」找到本次 upgrade_to_multi_user_protocol 行。",
+        )
+
+    def _bulk_apply_exif(self) -> None:
+        """A2：扫所有"有照片但采集日期为空"的 voucher，从第一张照片读 EXIF 自动回填。
+
+        - 仅填空字段（已有「采集日期」的 voucher 不动）
+        - 跳过没有照片的 voucher
+        - 照片无 EXIF / EXIF 无 DateTimeOriginal → 跳过该 voucher
+        """
+        store = getattr(self, "store", None)
+        if store is None:
+            QMessageBox.information(self, "未选择工作区", "请先打开工作区再使用此功能。")
+            return
+        # 找候选
+        candidates: list[tuple[str, dict]] = []
+        for voucher in store.list_vouchers():
+            spec = store.get_specimen(voucher) or {}
+            if str(spec.get("采集日期", "") or "").strip():
+                continue
+            photos = store.get_photos(voucher)
+            if not photos:
+                continue
+            candidates.append((voucher, photos[0]))
+        if not candidates:
+            QMessageBox.information(
+                self, "无需回填",
+                "所有 voucher 的采集日期都已填，或没有可用照片。",
+            )
+            return
+        answer = QMessageBox.question(
+            self, "批量回填确认",
+            f"将从照片 EXIF 的 DateTimeOriginal 读取拍摄日期，\n"
+            f"回填到 {len(candidates)} 条 voucher 的「采集日期」字段。\n\n"
+            f"仅填空字段，不覆盖已有值。\n\n是否继续？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        filled = 0
+        no_exif = 0
+        unreachable = 0
+        for voucher, photo_row in candidates:
+            try:
+                photo_path = store.resolve_photo_path(photo_row)
+            except Exception:
+                unreachable += 1
+                continue
+            if not photo_path or not photo_path.exists():
+                unreachable += 1
+                continue
+            try:
+                result = apply_exif_to_specimen(store, voucher, photo_path)
+            except Exception:
+                no_exif += 1
+                continue
+            if "采集日期" in result.get("filled_fields", []):
+                filled += 1
+            else:
+                no_exif += 1
+        self.refresh_list()
+        QMessageBox.information(
+            self, "EXIF 批量回填完成",
+            f"已回填采集日期：{filled} 条\n"
+            f"照片无 EXIF / 无 DateTimeOriginal：{no_exif} 条\n"
+            f"照片无法访问：{unreachable} 条",
+        )
+
+    def _export_dwc_archive(self) -> None:
+        """A1：把当前工作区导出成 Darwin Core Archive (DwC-A) zip。
+
+        DwC-A 是 TDWG/GBIF 通用生物多样性数据交换格式，含 meta.xml + occurrence.txt +
+        multimedia.txt + eml.xml。可直接用 GBIF IPT、iDigBio Validator 验证，或上传到
+        GBIF 节点。**纯只读导出，不动工作区**。
+        """
+        store = getattr(self, "store", None)
+        if store is None:
+            QMessageBox.information(self, "未选择工作区", "请先打开工作区再使用此功能。")
+            return
+        voucher_count = len(store.list_vouchers())
+        if voucher_count == 0:
+            answer = QMessageBox.question(
+                self, "工作区为空",
+                "当前工作区没有任何 voucher 记录。仍要导出空 archive 吗？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+        # 默认文件名带日期与计数
+        from datetime import datetime as _dt
+        default_name = f"dwca_{_dt.now().strftime('%Y%m%d')}_{voucher_count}records.zip"
+        zip_path_str, _ = QFileDialog.getSaveFileName(
+            self, "导出 Darwin Core Archive",
+            default_name,
+            "Darwin Core Archive (*.zip)",
+        )
+        if not zip_path_str:
+            return
+        # 让用户填可选 dataset title / creator（默认用工作区配置）
+        title, ok1 = QInputDialog.getText(
+            self, "数据集标题",
+            "数据集标题（出现在 eml.xml，可空，默认 \"Specimen Inventory Workspace Export\"）：",
+        )
+        if not ok1:
+            return
+        creator, ok2 = QInputDialog.getText(
+            self, "数据集创建者",
+            "数据集创建者（可空）：",
+        )
+        if not ok2:
+            return
+        try:
+            result_path = export_dwc_archive(
+                store, zip_path_str,
+                dataset_title=title.strip() or "Specimen Inventory Workspace Export",
+                dataset_creator=creator.strip(),
+            )
+        except FileExistsError as exc:
+            QMessageBox.warning(self, "目标已存在", str(exc))
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "导出失败", f"DwC 导出出错：{exc}")
+            return
+        QMessageBox.information(
+            self, "导出完成",
+            f"已生成 Darwin Core Archive：\n{result_path}\n\n"
+            f"包含 {voucher_count} 条 occurrence。可用 GBIF IPT / iDigBio Validator 校验，\n"
+            f"或上传到 GBIF / iDigBio 节点。",
+        )
 
     def export_data(self) -> None:
         """原有导出功能：导出全部数据到单个 Excel 文件。"""
@@ -3884,15 +5285,31 @@ class SpecimenWindow(QMainWindow):
             current_settings.ui_font_size = dlg.font_size
             current_settings.cursor_style = dlg.cursor_style
             current_settings.app_icon_variant = dlg.app_icon_variant
+            current_settings.memory_profile = dlg.memory_profile
             save_settings(current_settings)
             self._cached_preview_quality = current_settings.preview_quality
             self._apply_photo_filename_fill_shortcut()
             # 应用全局字体大小并刷新所有窗口的表格字体/列宽。
             apply_app_font_size(current_settings.ui_font_size)
             self._refresh_all_windows_fonts()
-            # 应用趣味光标 + 应用图标变体（对所有已打开窗口即时生效）。
+            # 应用趣味光标 + 应用图标变体(对所有已打开窗口即时生效)。
             apply_app_cursor(current_settings.cursor_style)
             apply_app_icon(current_settings.app_icon_variant)
+            # 规范化软件设计 2026-05 内存档位:即时热应用 ThumbnailCache + _row_cache_maxsize
+            # (ThumbnailWorker.max_workers 由 ThreadPoolExecutor 构造时定,需重启生效)。
+            try:
+                from .env_detect import memory_profile_params
+                params = memory_profile_params(current_settings.memory_profile)
+                if self.thumbnail_cache is not None:
+                    self.thumbnail_cache.memory_limit_bytes = params["thumb_cache_bytes"]
+                if self.store is not None:
+                    self.store._row_cache_maxsize = params["row_cache_maxsize"]
+                    self.store._enforce_row_cache_size()
+            except Exception:
+                pass
+            # 立即刷新状态栏档位显示
+            if hasattr(self, "_refresh_memory_status"):
+                self._refresh_memory_status()
 
     # ---- 全局字体缩放 ----
 
@@ -3934,6 +5351,14 @@ class SpecimenWindow(QMainWindow):
             pass  # 持久化失败不影响本次会话
         self._refresh_all_windows_fonts()
         self.statusBar().showMessage(f"界面字体大小：{new_size} pt", 2000)
+
+    # _zoom_font_in / _zoom_font_out 是 _zoom_font 的零参 wrapper，
+    # 提供给 SHORTCUTABLE_ACTIONS 注册表用稳定 slot 名（规范化软件设计 2026-05 新增）。
+    def _zoom_font_in(self) -> None:
+        self._zoom_font(1)
+
+    def _zoom_font_out(self) -> None:
+        self._zoom_font(-1)
 
     def _zoom_font_reset(self) -> None:
         apply_app_font_size(0)  # 0 -> 恢复系统默认字号
@@ -4456,7 +5881,11 @@ class ImageSearchDialog(QDialog):
         for idx, card in enumerate(self._cards):
             result = self.results[idx] if idx < len(self.results) else None
             is_linked = result.is_linked if result else False
-            bg = self._card_background(idx in self.selected_indices, is_linked)
+            bg = self._card_background(
+                idx in self.selected_indices,
+                is_linked,
+                bool(result.linked_vouchers) if result else False,  # 保持黄标（已入库但非当前标本）
+            )
             card.setStyleSheet(f"QFrame {{ background-color: {bg}; border: 1px solid #ccc; padding: 6px; }}")
         self._update_status()
 
@@ -4563,10 +5992,16 @@ class ImageSearchDialog(QDialog):
             super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:
+        # 规范化软件设计 2026-05 P1 审查修复:无论 wait 是否成功,显式清空 _search_workers 列表,
+        # 防 worker.finished 信号未发(异常路径) 导致 worker 永留 list 内存泄漏。
         self._search_token += 1
         for worker in list(self._search_workers):
-            worker.requestInterruption()
-            worker.wait(3000)
+            try:
+                worker.requestInterruption()
+                worker.wait(3000)
+            except Exception:
+                pass
+        self._search_workers.clear()  # 兜底清空,即使 finished 未触发
         self._thumb_worker.stop()
         super().closeEvent(event)
 
@@ -4711,8 +6146,11 @@ class IngestSummaryDialog(QDialog):
         search_row.addWidget(self.search_edit, stretch=1)
         # 搜索范围选择器：与主凭证列表一致的 4 个选项
         self._search_scope = QComboBox()
-        self._search_scope.addItems(["全部", "入库编号", "管内编号", "照片名"])
-        self._search_scope.setFixedWidth(80)
+        self._search_scope.addItem("全部")
+        for _col in SUMMARY_COLUMNS:
+            self._search_scope.addItem(_col)
+        self._search_scope.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self._search_scope.setMinimumWidth(90)
         self._search_scope.currentIndexChanged.connect(lambda: self._on_search_changed(self.search_edit.text()))
         search_row.addWidget(self._search_scope)
         # 「导入编号列表」：粘贴 / 从 txt·csv·xlsx 载入一份入库编号，汇总表只显示列表内编号。
@@ -4870,20 +6308,15 @@ class IngestSummaryDialog(QDialog):
             if self._voucher_list_filter is not None and voucher not in self._voucher_list_filter:
                 continue
             if query:
-                tube = record.get("管内编号*", "").lower()
-                names = [str(n).lower() for n in record.get("照片文件名", [])]
-                if scope == "入库编号":
-                    ok = query in voucher.lower()
-                elif scope == "管内编号":
-                    ok = query in tube
-                elif scope == "照片名":
-                    ok = any(query in n for n in names)
-                else:  # 全部
-                    ok = (
-                        query in voucher.lower()
-                        or query in tube
-                        or any(query in n for n in names)
+                # 原：硬编码 4 个范围（入库编号/管内编号/照片名/全部）。
+                # 现：下拉含全部 SUMMARY_COLUMNS，统一用 _summary_cell_text 文本化后子串匹配。
+                if scope == "全部":
+                    ok = any(
+                        query in self._summary_cell_text(record.get(col, "")).lower()
+                        for col in SUMMARY_COLUMNS
                     )
+                else:
+                    ok = query in self._summary_cell_text(record.get(scope, "")).lower()
                 if not ok:
                     continue
             # 按列筛选：每个被筛选列的显示值必须落在允许集合内
@@ -4953,6 +6386,17 @@ class IngestSummaryDialog(QDialog):
             self.store, preselected=vouchers, parent=self, photo_focus=True
         )
         dlg.exec_()
+
+    def _open_worms_match_for_vouchers(self, vouchers: list[str]) -> None:
+        """入库汇总右键入口：委托主窗口单实例，预填选中标本，应用后刷新汇总。"""
+        if not vouchers:
+            return
+        # Delegate to the parent SpecimenWindow to keep single-instance guarantee.
+        app = self.app
+        app._open_worms_match()
+        if app._worms_window is not None:
+            app._worms_window.prefill_vouchers(vouchers)
+        self._refresh()
 
     # ---- 导入入库编号列表筛选 ----
 
@@ -5124,6 +6568,10 @@ class IngestSummaryDialog(QDialog):
                 menu.addAction(
                     f"导出选中照片 ({len(sel_vouchers)}个)…",
                     lambda: self._export_selected_photos(sel_vouchers),
+                )
+                menu.addAction(
+                    f"用 WoRMS 更新分类 ({len(sel_vouchers)}个)…",
+                    lambda sv=sel_vouchers: self._open_worms_match_for_vouchers(sv),
                 )
                 menu.addSeparator()
         if 0 <= col_idx < len(SUMMARY_COLUMNS):
@@ -5744,6 +7192,32 @@ class SettingsDialog(QDialog):
         )
         layout.addRow("界面字体大小", self.font_size_spin)
 
+        # 规范化软件设计 2026-05 内存档位:让用户在低内存机锁定"低",大数据汇总锁定"高/极高"。
+        from .app_settings import MEMORY_PROFILE_OPTIONS
+        self.memory_profile_combo = QComboBox()
+        mp_keys = list(MEMORY_PROFILE_OPTIONS.keys())
+        for key in mp_keys:
+            self.memory_profile_combo.addItem(MEMORY_PROFILE_OPTIONS[key], key)
+        mp_idx = (
+            mp_keys.index(current_settings.memory_profile)
+            if current_settings.memory_profile in mp_keys else mp_keys.index("auto")
+        )
+        self.memory_profile_combo.setCurrentIndex(mp_idx)
+        self.memory_profile_combo.setToolTip(
+            "调整缩略图缓存 / Excel 缓存 / 并发解码档位\n"
+            "低档省内存,高档加速大数据汇总"
+        )
+        layout.addRow("内存档位", self.memory_profile_combo)
+        # hint label (灰色小字警告 + 重启提示)
+        mp_hint = QLabel(
+            "调高档位可加速大数据汇总但需要更多内存;\n"
+            "极高档不建议在 < 8GB 机器使用,会触发系统 swap 反而卡顿。\n"
+            "缩略图缓存与 Excel 缓存即时生效;并发解码线程数需重启应用生效。"
+        )
+        mp_hint.setStyleSheet("color: #888; font-size: 11px;")
+        mp_hint.setWordWrap(True)
+        layout.addRow("", mp_hint)
+
         # 趣味光标样式：替代默认箭头，可选卡通食指/手掌/钢笔/爪印/星星。
         from .cursors import CURSOR_STYLE_OPTIONS
         self.cursor_combo = QComboBox()
@@ -5807,6 +7281,12 @@ class SettingsDialog(QDialog):
         self.icon_combo.setCurrentIndex(
             icon_keys.index(defaults.app_icon_variant) if defaults.app_icon_variant in icon_keys else 0
         )
+        # 规范化软件设计 2026-05 内存档位:复位到 "auto"。
+        from .app_settings import MEMORY_PROFILE_OPTIONS
+        mp_keys = list(MEMORY_PROFILE_OPTIONS.keys())
+        self.memory_profile_combo.setCurrentIndex(
+            mp_keys.index(defaults.memory_profile) if defaults.memory_profile in mp_keys else mp_keys.index("auto")
+        )
         # Apply immediately
         self.app.store.set_undo_depth(200)
         save_settings(defaults)
@@ -5860,6 +7340,12 @@ class SettingsDialog(QDialog):
     def font_size(self) -> int:
         return int(self.font_size_spin.value())
 
+    @property
+    def memory_profile(self) -> str:
+        from .app_settings import MEMORY_PROFILE_OPTIONS
+        key = self.memory_profile_combo.currentData()
+        return key if isinstance(key, str) and key in MEMORY_PROFILE_OPTIONS else "auto"
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -5869,6 +7355,10 @@ class WindowManager:
     def __init__(self, app: QApplication):
         self.app = app
         self._windows: dict[Path, SpecimenWindow] = {}
+        # C1: 已注册的子对话框 + 它们的"停止 worker"方法。
+        # 元素 = (dialog, stop_callable) — stop_callable 应在 wait_ms 内完成 graceful stop。
+        # 主窗口 closeEvent 调 stop_all_dialog_workers() 一次性回收。
+        self._dialog_stop_handlers: list[tuple[object, "callable"]] = []
 
     def register(self, window: SpecimenWindow) -> None:
         # 未绑定工作区的窗口（首次启动尚未选工作区）不注册；
@@ -5884,6 +7374,28 @@ class WindowManager:
         key = key.resolve()
         if self._windows.get(key) is window:
             self._windows.pop(key, None)
+
+    def register_dialog_stopper(self, dialog: object, stop_handler) -> None:
+        """C1: 让对话框（如 DbManagerDialog）注册一个"停止后台 worker"回调。
+
+        主窗口 closeEvent 会遍历调用 — `stop_handler(wait_ms: int)`，由 dialog 实现限时
+        优雅停 + terminate fallback。
+        """
+        self._dialog_stop_handlers.append((dialog, stop_handler))
+
+    def unregister_dialog_stopper(self, dialog: object) -> None:
+        self._dialog_stop_handlers = [
+            (d, h) for d, h in self._dialog_stop_handlers if d is not dialog
+        ]
+
+    def stop_all_dialog_workers(self, wait_ms: int = 3000) -> None:
+        """主窗口关闭时调用：让所有注册的对话框停止它们的后台 worker。"""
+        for dialog, handler in list(self._dialog_stop_handlers):
+            try:
+                handler(wait_ms)
+            except Exception as exc:
+                print(f"[WindowManager] stop dialog worker 失败：{exc}", file=sys.stderr)
+        self._dialog_stop_handlers.clear()
 
     def focus_workspace(self, workspace_root: Path | str, exclude: SpecimenWindow | None = None) -> bool:
         key = Path(workspace_root).resolve()
@@ -5911,28 +7423,1093 @@ class WindowManager:
 
 
 def run_app(workspace_root: Path | str | None) -> None:
+    # 规范化软件设计 2026-05 启动卡死优化:
+    # 1. QApplication 先创建,Splash 立刻可见 (无视觉反馈是"卡死"误判主因)
+    # 2. 各启动阶段 splash.show_stage(text, percent) 给用户进度
+    # 3. WoRMS bootstrap / ThumbnailWorker 等延后 (见 _finish_initial_load)
+
+    # E1: 第一时间装异常 hook,让"启动过程中"的崩溃也能写 crash log。
+    from .crash_log import (
+        install_excepthook,
+        mark_app_started,
+        list_recent_crash_logs,
+    )
+    install_excepthook()
+    _last_exit_was_clean = mark_app_started()
+
     if workspace_root is None:
         workspace_root = default_workspace()
     app = QApplication.instance() or QApplication(sys.argv)
-    # 记录系统默认字号，并应用用户保存的全局字体大小（窗口创建前完成，新窗口即继承）。
+    # 记录系统默认字号,并应用用户保存的全局字体大小(窗口创建前完成,新窗口即继承)。
     global _default_app_font_point
     _default_app_font_point = app.font().pointSize()
     apply_app_font_size(load_settings().ui_font_size)
-    # 旧逻辑：无全局样式，外观全靠各处零散 setStyleSheet。现统一应用共享主题
-    # QSS（菜单/按钮/表格/工具栏观感统一）；主题不含 font 规则，不影响字体缩放。
+    # 主题 QSS (主题不含 font 规则,不影响字体缩放)。
     from .theme import apply_app_theme
     apply_app_theme(app)
+    # ---- Splash Screen 立刻可见 (规范化软件设计 2026-05 新增) ----
+    splash = None
+    try:
+        from .splash import SplashScreen
+        splash = SplashScreen()
+        splash.show()
+        app.processEvents()  # 让 splash 实际出现在屏幕上
+        splash.show_stage("初始化…", 5)
+    except Exception:
+        splash = None  # splash 失败不影响启动主流程
+    # ---- 落环境快照到 startup_diag (新增) ----
+    try:
+        from .env_detect import env_snapshot, is_low_memory, is_wsl, is_fast_profile
+        from .startup_diag import mark as _mark
+        _mark(f"env: {env_snapshot()}")
+        if is_low_memory():
+            _mark("env: LOW MEMORY MODE (< 3GB RAM)")
+        if is_wsl():
+            _mark("env: WSL detected, software rendering set in run_app.py")
+        # 规范化软件设计 2026-05 K 章:高档位预 import openpyxl + PIL,后续首次读 Excel /
+        # 缩略图无 lazy 导入延迟。失败不阻断 (try/except 已包,会 fall back lazy 路径)。
+        if is_fast_profile():
+            _mark("env: FAST PROFILE (high/extra_high) — preloading heavy libs")
+            try:
+                from .excel_store import _ensure_openpyxl
+                _ensure_openpyxl()  # 预触发 openpyxl 顶层 import + numpy 阻塞逻辑
+            except Exception:
+                pass
+            try:
+                from PIL import Image  # noqa: F401 — 预加载,Python sys.modules 缓存生效
+            except Exception:
+                pass
+            try:
+                # 同时预触发 ImageOps (batch_export / image_cache 用)
+                from PIL import ImageOps  # noqa: F401
+            except Exception:
+                pass
+            _mark("env: FAST PROFILE preload done")
+    except Exception:
+        pass
+    if splash is not None:
+        splash.show_stage("打开工作区…", 25)
     manager = WindowManager(app)
     window = manager.open_workspace(workspace_root)
-    # 行为变化：首次启动无工作区时 open_workspace 现在返回未绑定窗口（非 None），
+    # 行为变化:首次启动无工作区时 open_workspace 现在返回未绑定窗口(非 None),
     # 不再走此退出分支 —— 窗口已显示并会提示选择工作区。
-    # window is None 现在仅表示真正的启动失败（如 --workspace 指向无效目录，
-    # SpecimenWindow 抛 SystemExit）。
+    # window is None 现在仅表示真正的启动失败(如 --workspace 指向无效目录,
+    # SpecimenWindow 抛 SystemExit)。
     if window is None:
-        QMessageBox.warning(None, "标本入库管理", "工作区无效，程序将退出。")
+        if splash is not None:
+            splash.close()
+        QMessageBox.warning(None, "标本入库管理", "工作区无效,程序将退出。")
         return
-    # 旧逻辑：无此调用，光标始终系统箭头。现按用户设置应用趣味光标（窗口已创建后调用）。
+    if splash is not None:
+        splash.show_stage("加载界面…", 80)
+        app.processEvents()
+    # 旧逻辑:无此调用,光标始终系统箭头。现按用户设置应用趣味光标(窗口已创建后调用)。
     _startup_settings = load_settings()
     apply_app_cursor(_startup_settings.cursor_style)
     apply_app_icon(_startup_settings.app_icon_variant)  # 应用用户选的图标变体
+    if splash is not None:
+        splash.show_stage("准备就绪", 100)
+        app.processEvents()
+        splash.finish(window)  # 主窗口可见后关闭 splash
+    # WoRMS bootstrap 延后 3s 后台触发 (规范化软件设计 2026-05 启动卡死优化):
+    # 旧:run_app() 末尾同步 ensure_bootstrap_cache 解压 sqlite.gz,加 0.5-1s 黑屏。
+    # 现:延后到 app.exec_() 后 3s,首启不阻塞启动。若用户在 3s 内就开 WoRMS 菜单,
+    # _open_worms_match 内部的守卫会触发"同步准备 + 进度条",见 S10。
+    # K 章 高档位快路径 (2026-05):高档位 delay=0,启动后立刻触发,用户开 WoRMS 无等待。
+    def _bootstrap_worms_later() -> None:
+        try:
+            from .worms_client import ensure_bootstrap_cache
+            if ensure_bootstrap_cache():
+                window.statusBar().showMessage("已加载内置 WoRMS 分类缓存", 3000)
+        except Exception:
+            pass  # bootstrap 不可用不阻塞启动
+    try:
+        from .env_detect import is_fast_profile
+        _worms_delay = 0 if is_fast_profile() else 3000
+    except Exception:
+        _worms_delay = 3000
+    QTimer.singleShot(_worms_delay, _bootstrap_worms_later)
+    # WSL / Unix 兼容：注册 SIGINT/SIGTERM 处理，使 Ctrl+C 和终端关闭触发干净退出。
+    # Qt 默认不处理 Python 信号；需要一个空 QTimer 定时让事件循环回到 Python 捡信号。
+    def _handle_os_signal(signum, frame):
+        a = QApplication.instance()
+        if a:
+            a.quit()
+    signal.signal(signal.SIGINT, _handle_os_signal)
+    signal.signal(signal.SIGTERM, _handle_os_signal)
+    _sig_keepalive = QTimer()
+    _sig_keepalive.start(500)
+    _sig_keepalive.timeout.connect(lambda: None)
+
+    # E1: 启动后 ~2s 异步提示用户"上次未正常退出"。延迟以避开启动期繁忙。
+    if not _last_exit_was_clean:
+        def _show_crash_hint() -> None:
+            recent = list_recent_crash_logs(limit=3)
+            if recent:
+                paths_text = "\n".join(f"  · {p.name}" for p in recent)
+                detail = (
+                    f"检测到上次应用未正常退出。最近的崩溃日志：\n{paths_text}\n\n"
+                    f"位置：{recent[0].parent}\n\n"
+                    "如反复出现，请把日志反馈给开发者。"
+                )
+            else:
+                detail = (
+                    "检测到上次应用未正常退出（可能是任务管理器结束 / 强制重启 / 断电）。\n"
+                    "没有崩溃日志说明属于系统级中止，本次启动一切正常。"
+                )
+            try:
+                QMessageBox.information(None, "上次异常退出", detail)
+            except Exception:
+                pass
+
+        QTimer.singleShot(2000, _show_crash_hint)
+
     app.exec_()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 系列管理对话框
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AccessionSeriesDialog(QDialog):
+    """管理入库编号系列：新增 / 编辑起始号 / 删除。YZZ 为系统固定系列，只读展示。"""
+
+    _YZZ_ROW = 0  # YZZ 固定占第 0 行
+
+    def __init__(self, store: "ExcelStore", parent: QWidget | None = None):
+        super().__init__(parent)
+        self.store = store
+        self.setWindowTitle("入库编号系列管理")
+        self.setMinimumWidth(560)
+        self._build_ui()
+        self._refresh()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        # 系列列表：5 列（名称 | 示例编号 | 已分发 | 下一号 | 步长）
+        self._list = QTableWidget(0, 5)
+        self._list.setHorizontalHeaderLabels(["名称", "示例编号", "已分发", "下一号", "步长"])
+        self._list.setSelectionBehavior(QTableWidget.SelectRows)
+        self._list.setSelectionMode(QTableWidget.SingleSelection)
+        self._list.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._list.verticalHeader().setVisible(False)
+        self._list.horizontalHeader().setStretchLastSection(True)
+        self._list.itemSelectionChanged.connect(self._on_selection_changed)
+        layout.addWidget(self._list)
+
+        # 按钮行
+        btn_row = QHBoxLayout()
+        self._add_btn = QPushButton("新增系列…")
+        self._add_btn.clicked.connect(self._add_series)
+        btn_row.addWidget(self._add_btn)
+        self._edit_btn = QPushButton("编辑起始号…")
+        self._edit_btn.clicked.connect(self._edit_counter)
+        btn_row.addWidget(self._edit_btn)
+        self._del_btn = QPushButton("删除")
+        self._del_btn.clicked.connect(self._delete_series)
+        btn_row.addWidget(self._del_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.accept)
+        layout.addWidget(buttons)
+
+    def _refresh(self) -> None:
+        from .accession_series import AccessionSeries, format_series_number
+        from .parsing import format_voucher
+        series_list = self.store.config.get("accession_series", [])
+        # YZZ 固定第 0 行 + 自定义系列
+        self._list.setRowCount(1 + len(series_list))
+
+        # YZZ 行（只读，灰色背景）
+        yzz_next = self.store.config.get("next_serial", 1)
+        yzz_example = format_voucher(yzz_next)
+        yzz_distributed = self.store.count_vouchers_by_series("YZZ")
+        gray = QColor(220, 220, 220)
+        for col, text in enumerate([
+            "YZZ（系统默认，不可删除）",
+            yzz_example,
+            str(yzz_distributed),
+            str(yzz_next),
+            "1",
+        ]):
+            item = QTableWidgetItem(text)
+            item.setBackground(gray)
+            self._list.setItem(self._YZZ_ROW, col, item)
+
+        # 自定义系列行
+        for idx, item_dict in enumerate(series_list):
+            row = idx + 1
+            s = AccessionSeries.from_dict(item_dict)
+            example = format_series_number(s, s.next_counter)
+            distributed = self.store.count_vouchers_by_series(s.name)
+            self._list.setItem(row, 0, QTableWidgetItem(s.name))
+            self._list.setItem(row, 1, QTableWidgetItem(example))
+            self._list.setItem(row, 2, QTableWidgetItem(str(distributed)))
+            self._list.setItem(row, 3, QTableWidgetItem(str(s.next_counter)))
+            self._list.setItem(row, 4, QTableWidgetItem(str(s.step)))
+
+        self._on_selection_changed()
+
+    def _on_selection_changed(self) -> None:
+        """选中 YZZ 行时禁用删除和编辑起始号按钮。"""
+        cur = self._list.currentRow()
+        is_yzz = cur == self._YZZ_ROW
+        has_sel = cur >= 0
+        self._del_btn.setEnabled(has_sel and not is_yzz)
+        self._edit_btn.setEnabled(has_sel and not is_yzz)
+
+    def _selected_name(self) -> str | None:
+        cur = self._list.currentRow()
+        if cur < 0 or cur == self._YZZ_ROW:
+            return None
+        item = self._list.item(cur, 0)
+        return item.text() if item else None
+
+    def _add_series(self) -> None:
+        dlg = _SeriesEditDialog(self.store, parent=self)
+        if dlg.exec_() == QDialog.Accepted and dlg.result_series is not None:
+            self.store.add_series(dlg.result_series)
+            self._refresh()
+
+    def _edit_counter(self) -> None:
+        name = self._selected_name()
+        if not name:
+            QMessageBox.information(self, "提示", "请先选择一个非 YZZ 系列。")
+            return
+        series = self.store._get_series_config(name)
+        if series is None:
+            return
+        val, ok = QInputDialog.getInt(
+            self, "编辑起始号",
+            f"设置「{name}」下一个编号的流水号（跳过已用编号）：",
+            series.next_counter, 1, 999_999_999,
+        )
+        if ok:
+            self.store.update_series_counter(name, val)
+            self._refresh()
+
+    def _delete_series(self) -> None:
+        name = self._selected_name()
+        if not name:
+            QMessageBox.information(self, "提示", "请先选择一个非 YZZ 系列。")
+            return
+        reply = QMessageBox.question(
+            self, "确认删除",
+            f"删除系列「{name}」的配置？\n已录入的编号数据不受影响。",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self.store.remove_series(name)
+            self._refresh()
+
+
+class _SeriesEditDialog(QDialog):
+    """新增或编辑一个入库编号系列配置。"""
+
+    def __init__(self, store: "ExcelStore", series: AccessionSeries | None = None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.store = store
+        self.result_series: AccessionSeries | None = None
+        self._editing = series
+        self.setWindowTitle("新增编号系列" if series is None else "编辑编号系列")
+        self.setMinimumWidth(360)
+        self._build_ui(series)
+
+    def _build_ui(self, series: AccessionSeries | None) -> None:
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        # 预设选择
+        preset_row = QHBoxLayout()
+        self._preset_combo = QComboBox()
+        self._preset_combo.addItem("（自定义）", None)
+        for p in BUILTIN_PRESETS:
+            self._preset_combo.addItem(p["label"], p)
+        self._preset_combo.currentIndexChanged.connect(self._apply_preset)
+        preset_row.addWidget(QLabel("使用预设："))
+        preset_row.addWidget(self._preset_combo, stretch=1)
+        layout.addLayout(preset_row)
+
+        # 表单字段
+        self._name_edit = QLineEdit(series.name if series else "")
+        self._name_edit.setPlaceholderText("如：BMNH 大英自然历史博物馆")
+        form.addRow("系列名称：", self._name_edit)
+
+        self._prefix_edit = QLineEdit(series.prefix if series else "")
+        self._prefix_edit.setPlaceholderText("如：BMNH")
+        form.addRow("前缀：", self._prefix_edit)
+
+        self._digits_spin = QSpinBox()
+        self._digits_spin.setRange(3, 12)
+        self._digits_spin.setValue(series.digits if series else 6)
+        form.addRow("流水号位数：", self._digits_spin)
+
+        self._sep_combo = QComboBox()
+        for label, val in [("横线 -", "-"), ("点 .", "."), ("斜线 /", "/"), ("下划线 _", "_"), ("无分隔", "")]:
+            self._sep_combo.addItem(label, val)
+        if series:
+            idx = self._sep_combo.findData(series.separator)
+            if idx >= 0:
+                self._sep_combo.setCurrentIndex(idx)
+        form.addRow("分隔符：", self._sep_combo)
+
+        self._year_combo = QComboBox()
+        for label, val in [("不含年份", "none"), ("年份在前 (2025-PREFIX-000001)", "before"), ("年份在后 (PREFIX-2025-000001)", "after")]:
+            self._year_combo.addItem(label, val)
+        if series:
+            idx = self._year_combo.findData(series.year_pos)
+            if idx >= 0:
+                self._year_combo.setCurrentIndex(idx)
+        form.addRow("年份位置：", self._year_combo)
+
+        self._counter_spin = QSpinBox()
+        self._counter_spin.setRange(1, 999_999_999)
+        self._counter_spin.setValue(series.next_counter if series else 1)
+        form.addRow("起始流水号：", self._counter_spin)
+
+        self._step_spin = QSpinBox()
+        self._step_spin.setRange(1, 100)
+        self._step_spin.setValue(series.step if series else 1)
+        form.addRow("步长：", self._step_spin)
+
+        layout.addLayout(form)
+
+        # 预览
+        self._preview_label = QLabel()
+        self._preview_label.setStyleSheet("color: #2a6fbd; font-weight: bold;")
+        layout.addWidget(self._preview_label)
+        for w in (self._prefix_edit, self._digits_spin, self._sep_combo, self._year_combo, self._counter_spin, self._step_spin):
+            if hasattr(w, "textChanged"):
+                w.textChanged.connect(self._update_preview)
+            elif hasattr(w, "valueChanged"):
+                w.valueChanged.connect(self._update_preview)
+            elif hasattr(w, "currentIndexChanged"):
+                w.currentIndexChanged.connect(self._update_preview)
+        self._update_preview()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _apply_preset(self, index: int) -> None:
+        preset = self._preset_combo.currentData()
+        if preset is None:
+            return
+        self._prefix_edit.setText(preset.get("prefix", ""))
+        self._digits_spin.setValue(preset.get("digits", 6))
+        sep_idx = self._sep_combo.findData(preset.get("separator", "-"))
+        if sep_idx >= 0:
+            self._sep_combo.setCurrentIndex(sep_idx)
+        year_idx = self._year_combo.findData(preset.get("year_pos", "none"))
+        if year_idx >= 0:
+            self._year_combo.setCurrentIndex(year_idx)
+        if not self._name_edit.text().strip():
+            self._name_edit.setText(preset.get("label", ""))
+
+    def _update_preview(self) -> None:
+        try:
+            s = self._build_series()
+            preview = format_series_number(s, s.next_counter)
+            self._preview_label.setText(f"预览：{preview}")
+        except Exception:
+            self._preview_label.setText("预览：（配置无效）")
+
+    def _build_series(self) -> AccessionSeries:
+        return AccessionSeries(
+            name=self._name_edit.text().strip(),
+            prefix=self._prefix_edit.text().strip().upper(),
+            digits=self._digits_spin.value(),
+            separator=self._sep_combo.currentData() or "",
+            year_pos=self._year_combo.currentData() or "none",
+            next_counter=self._counter_spin.value(),
+            step=self._step_spin.value(),
+        )
+
+    def _accept(self) -> None:
+        series = self._build_series()
+        if not series.name:
+            QMessageBox.warning(self, "提示", "请填写系列名称。")
+            return
+        if not series.prefix:
+            QMessageBox.warning(self, "提示", "请填写前缀。")
+            return
+        if series.prefix.upper() == "YZZ":
+            QMessageBox.warning(self, "提示", "YZZ 系列由系统专属管理，不可在此配置。")
+            return
+        # 检查名称重复（新增时）
+        if self._editing is None:
+            existing = [s.get("name") for s in self.store.config.get("accession_series", [])]
+            if series.name in existing:
+                QMessageBox.warning(self, "提示", f"系列名称「{series.name}」已存在，请换一个名称。")
+                return
+        self.result_series = series
+        self.accept()
+
+
+# ── 录入任务 / 编号分发 对话框 ────────────────────────────────────────────────
+
+
+class _StartTaskDialog(QDialog):
+    """开始录入任务:收集录入人员、用途、备注。
+
+    规范化软件设计 2026-05 入库人员管理:录入人员 QLineEdit → PersonComboBox(智能下拉)。
+    旧:每次手输姓名。现:从团队库选,可"管理人员…"打开 PersonsManagerDialog。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("开始录入任务")
+        self.setMinimumWidth(400)
+
+        # 父窗口的工作区路径 (供 PersonComboBox refresh 用)
+        self._parent_window = parent
+        self._workspace = getattr(parent, "workspace_root", None) if parent is not None else None
+
+        layout = QFormLayout(self)
+
+        # 录入人员:智能下拉
+        from .widgets_persons import PersonComboBox
+        person_row = QHBoxLayout()
+        self._person_combo = PersonComboBox(allow_manage=False)
+        self._person_combo.refresh()  # 加载团队库
+        # 预选 settings.current_recorder
+        try:
+            current_name = load_settings().current_recorder
+            if current_name:
+                self._person_combo.refresh(preselect=current_name)
+        except Exception:
+            pass
+        self._person_combo.member_changed.connect(self._on_person_changed)
+        person_row.addWidget(self._person_combo, 1)
+        self._manage_btn = QPushButton("管理人员…")
+        self._manage_btn.clicked.connect(self._open_manage)
+        person_row.addWidget(self._manage_btn)
+        person_widget = QWidget()
+        person_widget.setLayout(person_row)
+        layout.addRow("录入人员*", person_widget)
+
+        self._purpose_combo = QComboBox()
+        self._purpose_combo.addItems(["入库", "整理", "核查", "其他"])
+        layout.addRow("用途", self._purpose_combo)
+
+        self._note_edit = QLineEdit()
+        self._note_edit.setPlaceholderText("可选")
+        layout.addRow("备注", self._note_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self._ok_btn = buttons.button(QDialogButtonBox.Ok)
+        if self._ok_btn:
+            self._ok_btn.setText("开始任务")
+            self._ok_btn.setEnabled(bool(self._person_combo.current_name()))
+        cancel_btn = buttons.button(QDialogButtonBox.Cancel)
+        if cancel_btn:
+            cancel_btn.setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def _on_person_changed(self, name_or_special: str) -> None:
+        if self._ok_btn:
+            # 仅当选中真人员(非空,非 SPECIAL_MANAGE)时才能开始
+            m = self._person_combo.current_member()
+            self._ok_btn.setEnabled(m is not None)
+        # 若默认用途有,自动切
+        m = self._person_combo.current_member()
+        if m and m.default_purpose:
+            idx = self._purpose_combo.findText(m.default_purpose)
+            if idx >= 0:
+                self._purpose_combo.setCurrentIndex(idx)
+
+    def _open_manage(self) -> None:
+        from .persons_dialog import PersonsManagerDialog
+        store = getattr(self._parent_window, "store", None) if self._parent_window else None
+        dlg = PersonsManagerDialog(self, workspace=self._workspace, store=store)
+        dlg.exec_()
+        # 刷新下拉,保留之前选中
+        prev = self._person_combo.current_name()
+        self._person_combo.refresh(preselect=prev)
+        # 若 prev 被删,_ok_btn 自动 disable (通过 _on_person_changed)
+        self._on_person_changed("")
+
+    def accept(self) -> None:
+        # 选中即写 last_used_at + 持久化 current_recorder
+        name = self.person
+        if not name:
+            return
+        try:
+            from .persons_store import update_last_used
+            update_last_used(name, self._workspace)
+        except Exception:
+            pass
+        try:
+            settings = load_settings()
+            settings.current_recorder = name
+            save_settings(settings)
+        except Exception:
+            pass
+        super().accept()
+
+    @property
+    def person(self) -> str:
+        m = self._person_combo.current_member()
+        return m.name if m else ""
+
+    @property
+    def purpose(self) -> str:
+        return self._purpose_combo.currentText()
+
+    @property
+    def note(self) -> str:
+        return self._note_edit.text().strip()
+
+
+class BatchImportSourcesDialog(QDialog):
+    """S2：批量导入工作区目录 — 主管手动添加多个源目录，一键合并到中心机。"""
+
+    def __init__(self, store, parent=None):
+        super().__init__(parent)
+        self._store = store
+        self.setWindowTitle("批量导入工作区目录")
+        self.setMinimumSize(560, 380)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "选择多个工作区目录（每个必须含 数据/ 子目录），\n"
+            "点「开始合并」一键并入当前中心工作区。源目录原样保留，不会被移动。"
+        ))
+
+        self._list_widget = QListWidget()
+        self._list_widget.setSelectionMode(QListWidget.ExtendedSelection)
+        layout.addWidget(self._list_widget)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("添加目录…")
+        add_btn.clicked.connect(self._add_dir)
+        remove_btn = QPushButton("移除选中")
+        remove_btn.clicked.connect(self._remove_selected)
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(remove_btn)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self._ok_btn = buttons.button(QDialogButtonBox.Ok)
+        if self._ok_btn:
+            self._ok_btn.setText("开始合并")
+            self._ok_btn.setEnabled(False)
+        cancel_btn = buttons.button(QDialogButtonBox.Cancel)
+        if cancel_btn:
+            cancel_btn.setText("取消")
+        buttons.accepted.connect(self._on_confirm)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _add_dir(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "选择工作区目录")
+        if not d:
+            return
+        existing = [self._list_widget.item(i).text() for i in range(self._list_widget.count())]
+        if d in existing:
+            return
+        self._list_widget.addItem(d)
+        if self._ok_btn:
+            self._ok_btn.setEnabled(self._list_widget.count() > 0)
+
+    def _remove_selected(self) -> None:
+        for item in self._list_widget.selectedItems():
+            self._list_widget.takeItem(self._list_widget.row(item))
+        if self._ok_btn:
+            self._ok_btn.setEnabled(self._list_widget.count() > 0)
+
+    def _on_confirm(self) -> None:
+        # 密码门控（与「从收件箱聚合」一致复用 ADMIN_PASSWORD）
+        password, ok = QInputDialog.getText(
+            self, "批量导入工作区",
+            "本操作会合并所选目录到当前中心机。\n合并前自动快照，可一键回退。\n\n请输入管理密码：",
+            QLineEdit.Password,
+        )
+        if not ok or not password:
+            return
+        if password != ADMIN_PASSWORD:
+            QMessageBox.warning(self, "密码错误", "密码不正确。")
+            return
+        sources = [
+            Path(self._list_widget.item(i).text())
+            for i in range(self._list_widget.count())
+        ]
+        # S7 预览：先 dry-run 让用户看预计结果
+        # 复用 preview_aggregate 需要 incoming 形态的目录；这里跳过预览（多选场景下
+        # preview_aggregate 暂不支持 list 输入，留作后续优化）。直接确认即跑。
+        confirm = QMessageBox.question(
+            self, "确认合并",
+            f"将合并 {len(sources)} 个源目录到当前中心工作区。\n继续？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        try:
+            report = aggregate_sources(self._store, sources)
+        except Exception as exc:
+            QMessageBox.critical(self, "合并失败", f"出错：{exc}")
+            return
+        lines: list[str] = []
+        if not report.processed and not report.conflicted and not report.errored:
+            lines.append("未发现可合并的工作区目录（每个源必须含 数据/ 子目录）。")
+        else:
+            lines.append(
+                f"成功合并：{len(report.processed)} 个 — "
+                f"共 {report.total_imported} 条 voucher、{report.total_photos} 张照片。"
+            )
+        if report.conflicted:
+            lines.append(f"\n冲突：{len(report.conflicted)} 个 — 见冲突报告 xlsx。")
+        if report.errored:
+            lines.append(f"出错：{len(report.errored)} 个 — 见 错误描述。")
+        if report.duplicates:
+            lines.append(
+                f"\n跨 voucher 同 SHA256 照片审核：{len(report.duplicates)} 个源命中 — "
+                "报告在中心 数据/duplicates_报告/。"
+            )
+        if report.snapshot_path:
+            lines.append(f"\n已自动快照：{report.snapshot_path.name}")
+        QMessageBox.information(self, "批量合并完成", "\n".join(lines))
+        self.accept()
+
+
+class BatchGenerateDialog(QDialog):
+    """批量预留入库编号，用于打印外贴标签。不创建标本记录。
+
+    M2 新增"录入员独立前缀"开关（前缀分人，避免多人离线同时录入撞号）：
+    - 未勾：走原 YZZ 单系列逻辑（向后兼容，旧调用零变化）
+    - 勾选：自动调 `store.ensure_assignee_series(assignee, prefix)` 取/建该录入员
+      专属系列，再 `batch_reserve_vouchers(n, series_name=该系列)` 预留段。
+    """
+
+    def __init__(self, store, parent=None):
+        super().__init__(parent)
+        self._store = store
+        self.setWindowTitle("批量生成编号")
+        self.setMinimumWidth(440)
+
+        layout = QFormLayout(self)
+
+        note = QLabel("预留连续编号段，不创建标本记录。可导出编号列表用于打印标签。")
+        note.setWordWrap(True)
+        layout.addRow(note)
+
+        self._count_spin = QSpinBox()
+        self._count_spin.setRange(1, 9999)
+        self._count_spin.setValue(100)
+        layout.addRow("生成数量", self._count_spin)
+
+        self._person_edit = QLineEdit()
+        self._person_edit.setPlaceholderText("必填")
+        layout.addRow("领取人*", self._person_edit)
+
+        self._purpose_combo = QComboBox()
+        self._purpose_combo.addItems(["标签打印", "入库", "核查", "其他"])
+        layout.addRow("用途", self._purpose_combo)
+
+        self._note_edit = QLineEdit()
+        self._note_edit.setPlaceholderText("可选")
+        layout.addRow("备注", self._note_edit)
+
+        # M2：为录入员创建独立编号前缀（前缀分人）。默认未勾保持旧行为。
+        self._assignee_series_chk = QCheckBox("为该录入员使用独立编号前缀（多人协作时强烈建议）")
+        self._assignee_series_chk.setToolTip(
+            "勾选后，发给该录入员的编号会使用独立前缀（如 ZS-000001），\n"
+            "与其他录入员的编号互不冲突；离线录入回传时不会撞号。\n"
+            "未勾则沿用原 YZZ 单系列计数。"
+        )
+        layout.addRow(self._assignee_series_chk)
+        self._prefix_edit = QLineEdit()
+        self._prefix_edit.setPlaceholderText("仅 ASCII 字母/数字/横线/下划线，例：ZS-、LS-、A1-")
+        self._prefix_edit.setEnabled(False)
+        layout.addRow("录入员前缀", self._prefix_edit)
+        self._assignee_series_chk.toggled.connect(self._prefix_edit.setEnabled)
+
+        # M3：附带任务包 zip。勾选后 OK 按钮文字变为「生成并打包」，
+        # 不再单独导出编号列表 xlsx，而是直接产出可发给录入员的任务包 zip
+        # （内含空工作区骨架 + 字段模版 + manifest，使录入员可直接打开应用录入）。
+        # 必须先勾「录入员独立前缀」；二者绑定 enable/disable。
+        self._task_package_chk = QCheckBox("同时生成任务包 zip（含空工作区 + manifest，可直接发给录入员）")
+        self._task_package_chk.setToolTip(
+            "勾选后会产出一个 zip，录入员解压即可作为工作区使用。\n"
+            "必须先勾选「录入员独立前缀」，否则任务包没有意义。"
+        )
+        self._task_package_chk.setEnabled(False)
+        layout.addRow(self._task_package_chk)
+        self._assignee_series_chk.toggled.connect(self._task_package_chk.setEnabled)
+        self._assignee_series_chk.toggled.connect(
+            lambda checked: None if checked else self._task_package_chk.setChecked(False)
+        )
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self._ok_btn = buttons.button(QDialogButtonBox.Ok)
+        if self._ok_btn:
+            self._ok_btn.setText("生成并导出")
+            self._ok_btn.setEnabled(False)
+        cancel_btn = buttons.button(QDialogButtonBox.Cancel)
+        if cancel_btn:
+            cancel_btn.setText("取消")
+        buttons.accepted.connect(self._on_confirm)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+        self._person_edit.textChanged.connect(
+            lambda t: self._ok_btn.setEnabled(bool(t.strip())) if self._ok_btn else None
+        )
+
+    def _on_confirm(self) -> None:
+        person = self._person_edit.text().strip()
+        if not person:
+            QMessageBox.warning(self, "提示", "请填写领取人。")
+            return
+        n = self._count_spin.value()
+
+        # M3：勾选「同时生成任务包」走独立分支 — export_task_package 内部已包含
+        # ensure_assignee_series + batch_reserve_vouchers + alloc_log（任务开始行）
+        # + 写工作区骨架 + zip 打包；不再走下面的 batch_reserve_vouchers 通用分支
+        # 避免双重预留。
+        if self._task_package_chk.isChecked() and self._assignee_series_chk.isChecked():
+            prefix = self._prefix_edit.text().strip()
+            if not prefix:
+                QMessageBox.warning(self, "提示", "勾选了「录入员独立前缀」后，请填写前缀。")
+                return
+            zip_path_str, _ = QFileDialog.getSaveFileName(
+                self, "保存任务包",
+                f"任务包_{person}_{n}个_{prefix.rstrip('-_')}.zip",
+                "Zip 文件 (*.zip)",
+            )
+            if not zip_path_str:
+                return
+            try:
+                result_path = export_task_package(
+                    self._store, person, n, prefix,
+                    dest_zip_path=zip_path_str,
+                    purpose=self._purpose_combo.currentText(),
+                    note=self._note_edit.text().strip(),
+                )
+            except ValueError as exc:
+                QMessageBox.warning(self, "导出失败", str(exc))
+                return
+            except FileExistsError as exc:
+                QMessageBox.warning(self, "目标已存在", str(exc))
+                return
+            except Exception as exc:
+                QMessageBox.critical(self, "导出失败", f"任务包导出出错：{exc}")
+                return
+            QMessageBox.information(
+                self, "任务包已生成",
+                f"已为 {person} 生成任务包：\n{result_path}\n\n"
+                f"预留段：{prefix}…（共 {n} 个编号）\n"
+                f"中心机已记录任务开始；录入员可解压后直接打开工作区录入。",
+            )
+            self.accept()
+            return
+
+        # M2：勾选"录入员独立前缀"时先确保系列存在，再用该系列预留。
+        series_name: str | None = None
+        if self._assignee_series_chk.isChecked():
+            prefix = self._prefix_edit.text().strip()
+            if not prefix:
+                QMessageBox.warning(self, "提示", "勾选了「录入员独立前缀」后，请填写前缀。")
+                return
+            try:
+                series_name = self._store.ensure_assignee_series(person, prefix)
+            except ValueError as exc:
+                QMessageBox.warning(self, "前缀错误", str(exc))
+                return
+            except Exception as exc:
+                QMessageBox.critical(self, "错误", f"创建录入员系列失败：{exc}")
+                return
+
+        try:
+            numbers = self._store.batch_reserve_vouchers(n, series_name=series_name)
+        except Exception as exc:
+            QMessageBox.critical(self, "错误", f"生成编号失败：{exc}")
+            return
+
+        from datetime import datetime as _dt
+        import uuid
+        now = _dt.now().isoformat(timespec="seconds")
+        record_id = uuid.uuid4().hex[:12]
+        self._store.log_alloc_event({
+            "记录ID": record_id,
+            "时间": now,
+            "类型": "批量领取",
+            "人员": person,
+            "用途": self._purpose_combo.currentText(),
+            "备注": self._note_edit.text().strip(),
+            # M2：填入"编号系列"列，便于事后审计与 M4 段守护校验。
+            "编号系列": series_name or "YZZ",
+            "编号起始": numbers[0],
+            "编号结束": numbers[-1],
+            "数量": str(n),
+        })
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存编号列表",
+            f"编号列表_{numbers[0]}-{numbers[-1]}.xlsx",
+            "Excel 文件 (*.xlsx);;CSV 文件 (*.csv);;所有文件 (*)",
+        )
+        if path:
+            try:
+                self._export(numbers, person, path)
+            except Exception as exc:
+                QMessageBox.warning(self, "导出失败", str(exc))
+
+        QMessageBox.information(
+            self, "完成",
+            f"已预留 {n} 个编号：{numbers[0]} → {numbers[-1]}\n分发记录已写入操作日志。",
+        )
+        self.accept()
+
+    def _export(self, numbers: list, person: str, path: str) -> None:
+        from datetime import datetime as _dt
+        purpose = self._purpose_combo.currentText()
+        now_str = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows = [[i, num, person, purpose, now_str] for i, num in enumerate(numbers, 1)]
+        header = ["序号", "入库编号", "领取人", "用途", "生成时间"]
+
+        if path.lower().endswith(".csv"):
+            import csv
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                csv.writer(f).writerows([header] + rows)
+        else:
+            from openpyxl import Workbook as _WB
+            wb = _WB()
+            ws = wb.active
+            ws.title = "编号列表"
+            ws.append(header)
+            for row in rows:
+                ws.append(row)
+            wb.save(path)
+            # 同步导出同名 csv
+            csv_path = path[:-5] + ".csv" if path.lower().endswith(".xlsx") else path + ".csv"
+            import csv
+            with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+                csv.writer(f).writerows([header] + rows)
+
+
+class WorkloadReportDialog(QDialog):
+    """录入工作量报告：汇总 + 明细两视图，支持人员/时间段筛选和 Excel 导出。"""
+
+    def __init__(self, store, parent=None):
+        super().__init__(parent)
+        self._store = store
+        self.setWindowTitle("入库人员记录")
+        self.setMinimumSize(640, 480)
+
+        layout = QVBoxLayout(self)
+
+        # 顶部：数据文件路径（让用户知道记录保存在哪里）
+        from .models import ALLOC_LOG_FILE
+        log_path = store.data_dir / ALLOC_LOG_FILE
+        path_label = QLabel(f"数据文件：{log_path}")
+        path_label.setStyleSheet("color: #555;")
+        path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(path_label)
+
+        # ── 筛选栏 ──
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("人员:"))
+        self._person_filter = QComboBox()
+        self._person_filter.addItem("全部")
+        filter_row.addWidget(self._person_filter)
+        filter_row.addSpacing(12)
+        filter_row.addWidget(QLabel("开始日期:"))
+        self._date_from = QLineEdit()
+        self._date_from.setPlaceholderText("YYYY-MM-DD")
+        self._date_from.setFixedWidth(100)
+        filter_row.addWidget(self._date_from)
+        filter_row.addWidget(QLabel("至"))
+        self._date_to = QLineEdit()
+        self._date_to.setPlaceholderText("YYYY-MM-DD")
+        self._date_to.setFixedWidth(100)
+        filter_row.addWidget(self._date_to)
+        refresh_btn = QPushButton("刷新")
+        refresh_btn.clicked.connect(self._refresh)
+        filter_row.addWidget(refresh_btn)
+        filter_row.addStretch()
+        layout.addLayout(filter_row)
+
+        # ── 标签页 ──
+        self._tabs = QTabWidget()
+        self._summary_table = QTableWidget()
+        self._summary_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._summary_table.setAlternatingRowColors(True)
+        self._summary_table.horizontalHeader().setStretchLastSection(True)
+        self._detail_table = QTableWidget()
+        self._detail_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._detail_table.setAlternatingRowColors(True)
+        self._detail_table.horizontalHeader().setStretchLastSection(True)
+        self._tabs.addTab(self._summary_table, "汇总")
+        self._tabs.addTab(self._detail_table, "明细")
+        layout.addWidget(self._tabs)
+
+        # ── 底部按钮 ──
+        btn_row = QHBoxLayout()
+        export_btn = QPushButton("导出 Excel")
+        export_btn.clicked.connect(self._export_excel)
+        btn_row.addWidget(export_btn)
+        btn_row.addStretch()
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.reject)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        self._refresh()
+
+    # ── 数据处理 ──────────────────────────────────────────────────────────────
+
+    def _parse_log(self) -> tuple[list[dict], list[str]]:
+        """配对任务开始/结束记录，返回 (tasks, sorted_persons)。"""
+        from datetime import datetime as _dt
+        rows = self._store.read_alloc_log()
+        starts = {r["记录ID"]: r for r in rows if r.get("类型") == "任务开始"}
+        ends = [r for r in rows if r.get("类型") == "任务结束"]
+
+        tasks = []
+        for end in ends:
+            start_id = end.get("关联任务ID", "")
+            start = starts.get(start_id)
+            if not start:
+                continue
+            try:
+                t0 = _dt.fromisoformat(start["时间"])
+                t1 = _dt.fromisoformat(end["时间"])
+                duration_sec = max(0, int((t1 - t0).total_seconds()))
+            except (ValueError, KeyError):
+                duration_sec = 0
+            tasks.append({
+                "开始时间": start["时间"],
+                "人员": start.get("人员", ""),
+                "用途": start.get("用途", ""),
+                "录入量": int(end.get("数量", 0) or 0),
+                "时长秒": duration_sec,
+            })
+        persons = sorted({t["人员"] for t in tasks})
+        return tasks, persons
+
+    def _apply_filters(self, tasks: list[dict]) -> list[dict]:
+        person = self._person_filter.currentText()
+        date_from = self._date_from.text().strip()
+        date_to = self._date_to.text().strip()
+        result = []
+        for t in tasks:
+            if person != "全部" and t["人员"] != person:
+                continue
+            ts = t["开始时间"]
+            if date_from and ts < date_from:
+                continue
+            if date_to and ts[:10] > date_to:
+                continue
+            result.append(t)
+        return result
+
+    @staticmethod
+    def _fmt_duration(seconds: int) -> str:
+        h, rem = divmod(seconds, 3600)
+        m, _ = divmod(rem, 60)
+        return f"{h}h {m:02d}m" if h else f"{m}m"
+
+    # ── UI 刷新 ───────────────────────────────────────────────────────────────
+
+    def _refresh(self) -> None:
+        tasks, persons = self._parse_log()
+
+        current_person = self._person_filter.currentText()
+        self._person_filter.blockSignals(True)
+        self._person_filter.clear()
+        self._person_filter.addItem("全部")
+        for p in persons:
+            self._person_filter.addItem(p)
+        idx = self._person_filter.findText(current_person)
+        self._person_filter.setCurrentIndex(idx if idx >= 0 else 0)
+        self._person_filter.blockSignals(False)
+
+        filtered = self._apply_filters(tasks)
+        self._fill_summary(filtered)
+        self._fill_detail(filtered)
+
+    def _fill_summary(self, filtered: list[dict]) -> None:
+        from collections import defaultdict
+        summary: dict[str, dict] = defaultdict(lambda: {"任务次数": 0, "录入标本数": 0, "时长秒": 0})
+        for t in filtered:
+            s = summary[t["人员"]]
+            s["任务次数"] += 1
+            s["录入标本数"] += t["录入量"]
+            s["时长秒"] += t["时长秒"]
+
+        headers = ["录入人", "任务次数", "录入标本数", "累计时长"]
+        self._summary_table.setColumnCount(len(headers))
+        self._summary_table.setHorizontalHeaderLabels(headers)
+        rows = sorted(summary.items())
+        self._summary_table.setRowCount(len(rows))
+        for row, (person_name, stats) in enumerate(rows):
+            self._summary_table.setItem(row, 0, QTableWidgetItem(person_name))
+            self._summary_table.setItem(row, 1, QTableWidgetItem(str(stats["任务次数"])))
+            self._summary_table.setItem(row, 2, QTableWidgetItem(str(stats["录入标本数"])))
+            self._summary_table.setItem(row, 3, QTableWidgetItem(self._fmt_duration(stats["时长秒"])))
+        self._summary_table.resizeColumnsToContents()
+
+    def _fill_detail(self, filtered: list[dict]) -> None:
+        headers = ["任务开始时间", "录入人", "用途", "录入量", "时长"]
+        self._detail_table.setColumnCount(len(headers))
+        self._detail_table.setHorizontalHeaderLabels(headers)
+        sorted_tasks = sorted(filtered, key=lambda x: x["开始时间"], reverse=True)
+        self._detail_table.setRowCount(len(sorted_tasks))
+        for row, t in enumerate(sorted_tasks):
+            self._detail_table.setItem(row, 0, QTableWidgetItem(t["开始时间"]))
+            self._detail_table.setItem(row, 1, QTableWidgetItem(t["人员"]))
+            self._detail_table.setItem(row, 2, QTableWidgetItem(t["用途"]))
+            self._detail_table.setItem(row, 3, QTableWidgetItem(str(t["录入量"])))
+            self._detail_table.setItem(row, 4, QTableWidgetItem(self._fmt_duration(t["时长秒"])))
+        self._detail_table.resizeColumnsToContents()
+
+    # ── 导出 ──────────────────────────────────────────────────────────────────
+
+    def _export_excel(self) -> None:
+        from datetime import datetime as _dt
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存工作量报告",
+            f"录入工作量报告_{_dt.now().strftime('%Y%m%d')}.xlsx",
+            "Excel 文件 (*.xlsx)",
+        )
+        if not path:
+            return
+        tasks, _ = self._parse_log()
+        filtered = self._apply_filters(tasks)
+
+        from collections import defaultdict
+        from openpyxl import Workbook as _WB
+        summary: dict[str, dict] = defaultdict(lambda: {"任务次数": 0, "录入标本数": 0, "时长秒": 0})
+        for t in filtered:
+            s = summary[t["人员"]]
+            s["任务次数"] += 1
+            s["录入标本数"] += t["录入量"]
+            s["时长秒"] += t["时长秒"]
+
+        wb = _WB()
+        ws1 = wb.active
+        ws1.title = "汇总"
+        ws1.append(["录入人", "任务次数", "录入标本数", "累计时长"])
+        for person_name, stats in sorted(summary.items()):
+            ws1.append([person_name, stats["任务次数"], stats["录入标本数"],
+                        self._fmt_duration(stats["时长秒"])])
+
+        ws2 = wb.create_sheet("明细")
+        ws2.append(["任务开始时间", "录入人", "用途", "录入量", "时长"])
+        for t in sorted(filtered, key=lambda x: x["开始时间"], reverse=True):
+            ws2.append([t["开始时间"], t["人员"], t["用途"], t["录入量"],
+                        self._fmt_duration(t["时长秒"])])
+
+        wb.save(path)
+        QMessageBox.information(self, "完成", f"已导出：{path}")

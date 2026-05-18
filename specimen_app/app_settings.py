@@ -30,6 +30,16 @@ PHOTO_MANAGEMENT_OPTIONS = {
 
 DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT = "Ctrl+Alt+F"
 
+# 规范化软件设计 2026-05 新增:内存档位选项。
+# 5 档对应不同的缩略图缓存 / 缩略图并发 / Excel _row_cache LRU 上限,详见 env_detect.memory_profile_params。
+MEMORY_PROFILE_OPTIONS: dict[str, str] = {
+    "extra_low": "极低 (≤ 1GB 机器,8MB 缓存,1 并发)",
+    "low": "低 (1-3GB,16MB 缓存,1 并发)",
+    "auto": "自动 (按 RAM 检测,默认)",
+    "high": "高 (8-16GB,128MB 缓存,4 并发)",
+    "extra_high": "极高 (16GB+ 工作站,256MB 缓存,4 并发,适合超大汇总)",
+}
+
 
 @dataclass
 class AppSettings:
@@ -52,6 +62,25 @@ class AppSettings:
     cursor_style: str = "default"  # 趣味光标样式 key（见 cursors.CURSOR_STYLE_OPTIONS）；default=系统箭头
     app_icon_variant: str = "specimen_blue"  # 应用图标变体 key（见 icon.APP_ICON_VARIANTS）
     auto_save_enabled: bool = True  # 录入是否自动保存（输入停 0.5s 自动写）；关时靠手动「保存」按钮
+    # 规范化软件设计 2026-05 新增：工具栏布局 / 辅助工具栏可见性 / 快捷键自定义
+    # toolbar_layout: 主/辅栏的 action_id 顺序列表；空 dict / 缺 key 时回落到 TOOLBAR_DEFAULT_LAYOUT。
+    # action_id 详见 ui.TOOLBAR_ACTIONS。
+    toolbar_layout: dict = field(default_factory=dict)
+    aux_toolbar_visible: bool = False  # 辅助工具栏默认隐藏（视图菜单可勾选打开）
+    # custom_shortcuts: {action_id: keyseq_str}；空 dict 全用默认。
+    # 可绑定的 action_id 详见 ui.SHORTCUTABLE_ACTIONS。
+    custom_shortcuts: dict = field(default_factory=dict)
+    # 规范化软件设计 2026-05 新增:内存档位 (extra_low/low/auto/high/extra_high)
+    # 控制 ThumbnailCache 大小 + ThumbnailWorker 并发 + _row_cache LRU 上限。
+    # 默认 "auto" 按 RAM 检测。详见 MEMORY_PROFILE_OPTIONS。
+    memory_profile: str = "auto"
+    # 入库人员管理 2026-05 新增:全局团队成员库。
+    # 每个 dict 含 name/pinyin/role/starred/pinned/default_purpose/note/created_at/last_used_at/color_hint
+    # 工作区 `数据/入库人员.xlsx` 是真权威,settings 这层是本地缓存,双向同步。
+    # 字段详见 persons_store.TeamMember。
+    team_members: list = field(default_factory=list)
+    # 当前选中的录入员姓名 (状态栏下拉记忆;空 = 未设置)。
+    current_recorder: str = ""
 
 
 def app_config_dir() -> Path:
@@ -123,6 +152,35 @@ def load_settings() -> AppSettings:
     auto_save_enabled = data.get("auto_save_enabled", True)
     if not isinstance(auto_save_enabled, bool):
         auto_save_enabled = True
+    # 工具栏布局（规范化软件设计 2026-05 新增）：dict 失败 -> 空 dict，启动时回落默认。
+    raw_layout = data.get("toolbar_layout", {})
+    toolbar_layout: dict = {}
+    if isinstance(raw_layout, dict):
+        for key in ("main", "aux"):
+            raw_list = raw_layout.get(key, [])
+            if isinstance(raw_list, list):
+                toolbar_layout[key] = [str(x) for x in raw_list if isinstance(x, str)]
+    aux_toolbar_visible = data.get("aux_toolbar_visible", False)
+    if not isinstance(aux_toolbar_visible, bool):
+        aux_toolbar_visible = False
+    raw_shortcuts = data.get("custom_shortcuts", {})
+    custom_shortcuts: dict = {}
+    if isinstance(raw_shortcuts, dict):
+        for k, v in raw_shortcuts.items():
+            if isinstance(k, str) and isinstance(v, str):
+                custom_shortcuts[k] = v
+    # 内存档位:旧 settings.json 无此键 -> "auto";非法值也回落 "auto"。
+    memory_profile = str(data.get("memory_profile", "auto"))
+    if memory_profile not in MEMORY_PROFILE_OPTIONS:
+        memory_profile = "auto"
+    # 入库人员管理 2026-05:旧 settings.json 无此键 -> 空 list。
+    raw_members = data.get("team_members", [])
+    team_members: list = []
+    if isinstance(raw_members, list):
+        for m in raw_members:
+            if isinstance(m, dict) and m.get("name"):
+                team_members.append(m)
+    current_recorder = str(data.get("current_recorder", ""))
     return AppSettings(
         last_workspace=str(data.get("last_workspace", "")),
         recent_workspaces=[str(item) for item in data.get("recent_workspaces", []) if item],
@@ -143,6 +201,12 @@ def load_settings() -> AppSettings:
         cursor_style=cursor_style,
         app_icon_variant=app_icon_variant,
         auto_save_enabled=auto_save_enabled,
+        toolbar_layout=toolbar_layout,
+        aux_toolbar_visible=aux_toolbar_visible,
+        custom_shortcuts=custom_shortcuts,
+        memory_profile=memory_profile,
+        team_members=team_members,
+        current_recorder=current_recorder,
     )
 
 
@@ -169,6 +233,12 @@ def save_settings(settings: AppSettings) -> None:
         "cursor_style": settings.cursor_style,
         "app_icon_variant": settings.app_icon_variant,
         "auto_save_enabled": settings.auto_save_enabled,
+        "toolbar_layout": settings.toolbar_layout,
+        "aux_toolbar_visible": settings.aux_toolbar_visible,
+        "custom_shortcuts": settings.custom_shortcuts,
+        "memory_profile": settings.memory_profile,
+        "team_members": settings.team_members,
+        "current_recorder": settings.current_recorder,
     }
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)

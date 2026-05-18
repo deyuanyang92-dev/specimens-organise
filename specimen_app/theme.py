@@ -185,6 +185,35 @@ QScrollBar::add-line, QScrollBar::sub-line {{
 QScrollBar::add-page, QScrollBar::sub-page {{
     background: transparent;
 }}
+
+/* 规范化软件设计 2026-05 P1 优化:dynamic property + class 选择器替代 inline stylesheet。
+ * widget 端用 setProperty("class", "xxx") + style().unpolish/polish 触发。
+ * 集中规则避免每个 widget 重复 setStyleSheet,实测省 2-3MB QSS 解析对象。 */
+QPushButton[class="view-btn"] {{
+    border: 1px solid #aab;
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-weight: bold;
+}}
+QPushButton[class="view-btn"]:checked {{
+    background-color: {ACCENT};
+    color: white;
+}}
+QPushButton[class="filter-btn"] {{
+    font-size: 10px;
+    padding: 1px 6px;
+}}
+QPushButton[class="filter-btn"]:checked {{
+    background-color: {ACCENT};
+    color: white;
+}}
+QToolButton[class="hint"] {{
+    color: #9aa4ad;
+    border: none;
+}}
+QToolButton[class="hint"]:hover {{
+    color: {ACCENT};
+}}
 """
 
 

@@ -2,3 +2,5 @@ openpyxl>=3.1
 Pillow>=10.0
 tifffile>=2024.8
 PyQt5>=5.15
+markdown>=3.4
+psutil>=5.9
