@@ -47,7 +47,14 @@ jobs:
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
+          generate_release_notes: true
           body: |
+            ## 本次更新
+
+            ${{ github.event.head_commit.message }}
+
+            ---
+
             ## 下载说明
 
             | 操作系统 | 下载文件 | 使用方式 |
