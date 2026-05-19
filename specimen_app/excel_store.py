@@ -64,6 +64,7 @@ from .models import (
     DATA_VERSION_LOG_FILE,
     DATA_VERSION_LOG_HEADERS,
     DISPLAY_CATEGORY_NAMES,
+    DuplicateVoucherError,
     INDEX_FILE,
     INDEX_HEADERS,
     ImportConflictError,
@@ -112,11 +113,18 @@ DEFAULT_CONFIG = {
 
 
 class ExcelStore:
-    def __init__(self, workspace_root: Path | str, lock: bool = False, create_if_missing: bool = True):
+    def __init__(self, workspace_root: Path | str, lock: bool = False,
+                 create_if_missing: bool = True, read_only: bool = False):
+        """初始化 ExcelStore。
+
+        规范化软件设计 2026-05 多窗口支持:read_only=True 时跳过 lock_workspace,
+        允同工作区多只读副本窗口同时存在;所有写操作 raise PermissionError。
+        """
         self.root = Path(workspace_root).resolve()
         self.data_dir = self.root / "数据"
         self.lock_file = self.data_dir / ".workspace.lock"
         self._locked = False
+        self._read_only = bool(read_only)
         self._create_if_missing = create_if_missing
         # 规范化软件设计 2026-05 P1 审查修复:_row_cache 加 LRU 上限。
         # 2026-05 内存档位扩展:maxsize 由 memory_profile 驱动 (3/4/6/12/20)。
@@ -139,12 +147,17 @@ class ExcelStore:
         if not create_if_missing and not self._has_workspace_seed_files():
             raise WorkspaceNotInitializedError(f"该工作目录尚未初始化，缺少数据文件：{self.data_dir}")
         self.config = self._load_or_create_config()
-        if lock:
+        # 只读模式跳锁:同工作区多只读副本可共存,主写窗口仍持锁
+        if lock and not self._read_only:
             self.acquire_lock()
             import atexit
             # C2: 限时执行 release_lock，防 SMB/NAS 网络锁挂死导致进程无法退出。
             # 用守护线程 + Event 超时：3 秒内释放即正常；卡住则放弃（10min stale 自愈兜底）。
             atexit.register(self._release_lock_with_timeout, 3.0)
+
+        # 只读模式守卫:覆盖所有写入 API
+        if self._read_only:
+            self._install_readonly_guards()
         # 启动诊断埋点：逐子步骤打点，定位"启动死机"卡在哪一步。
         self.ensure_files()
         _startup_mark("ExcelStore.ensure_files")
@@ -162,6 +175,30 @@ class ExcelStore:
         `__init__` 已注册 atexit 钩子，但显式调用更可靠。
         """
         self.release_lock()
+
+    def _install_readonly_guards(self) -> None:
+        """规范化软件设计 2026-05 多窗口:只读模式覆盖所有写方法。
+
+        覆盖 write API → raise PermissionError;只读副本窗口禁所有数据变更。
+        读 API (read_rows / get_specimen / read_alloc_log / workspace_overview 等) 不动。
+        """
+        def _ro(name):
+            def _denied(*args, **kwargs):
+                raise PermissionError(
+                    f"只读模式禁止写入 ({name})。请在主窗口操作或关闭只读副本。"
+                )
+            return _denied
+        write_methods = [
+            "create_specimen", "set_fields", "import_workspace",
+            "create_data_snapshot", "restore_data_snapshot",
+            "undo_last", "redo_last", "set_undo_depth",
+            "downgrade_schema_version", "batch_reserve_vouchers",
+            "log_alloc_event", "set_active_series",
+            "ensure_assignee_series", "upgrade_to_multi_user_protocol",
+        ]
+        for name in write_methods:
+            if hasattr(self, name):
+                setattr(self, name, _ro(name))
 
     def acquire_lock(self) -> None:
         if self._locked:
@@ -547,6 +584,37 @@ class ExcelStore:
             # 非 YZZ 系列：推进该系列的 next_counter
             self._advance_series_counter(active)
         self._save_config()
+        return voucher
+
+    def create_specimen_with_voucher(self, voucher: str) -> str:
+        """规范化软件设计 2026-05 Phase 5:手动指定 voucher 创建 specimen。
+
+        跳过 next_serial 自增,直接用 voucher 字串。校验:
+        - 不能为空 / 全空格
+        - 不能与已存在 voucher 重复 (检 编号索引)
+
+        与 create_specimen 一致流程:写 specimen / index / summary / action_log。
+        不更新 next_serial (手动添加视为外部预留,不参与自增体系)。
+
+        返回 voucher 字串。重复时 raise DuplicateVoucherError。
+        """
+        voucher = (voucher or "").strip()
+        if not voucher:
+            raise ValueError("voucher 不能为空")
+        # 重复检测:走编号索引 (跟现有 next_voucher 重复保护一致)。注意 INDEX 表用 "入库编号" 列名(无 *)。
+        index_rows = self._read_plain_rows(self.data_dir / INDEX_FILE, INDEX_HEADERS)
+        for row in index_rows:
+            if self._value(row, "入库编号") == voucher:
+                raise DuplicateVoucherError(f"入库编号 {voucher} 已存在")
+        now = self._now()
+        row = {header: "" for header in SPECIMEN_HEADERS}
+        row["入库编号*"] = voucher
+        row["入库日期"] = datetime.now().date().isoformat()
+        self._append_row("specimen", row)
+        self._append_index(voucher, now, "", "", self.record_fingerprint(voucher, specimen_override=row))
+        self._ensure_summary_row(voucher, created_at=now)
+        self._record_action("create_specimen_manual", voucher, "specimen", "", {}, row)
+        # 不推 next_serial — 用户既然手填,自增体系由他自管
         return voucher
 
     def delete_specimen(self, voucher: str) -> None:

@@ -449,9 +449,44 @@ TOOLBAR_ACTIONS: dict[str, dict] = {
     "settings":          {"label": "设置",       "slot": "open_settings",          "category": "tools",
                           "icon": "SP_ComputerIcon",
                           "tooltip": "应用设置（界面字体、光标样式、自动保存等）"},
-    "worms":             {"label": "WoRMS",      "slot": "_open_worms_match",      "category": "tools",
+    "worms":             {"label": "WoRMS",      "slot": "_open_worms_match",      "category": "worms",
                           "icon": "SP_TitleBarShadeButton",
                           "tooltip": "WoRMS 物种分类匹配窗口（单实例）"},
+    # 规范化软件设计 2026-05 Phase 4 (P4) 扩展:WoRMS / 入库 / 视图 子功能可拖入工具栏
+    "worms_browse":      {"label": "WoRMS 查询", "slot": "_open_worms_browse",     "category": "worms",
+                          "icon": "SP_FileDialogContentsView",
+                          "tooltip": "WoRMS 查询(按学名搜索;原 分类浏览)"},
+    "worms_db":          {"label": "WoRMS 数据库","slot": "_open_worms_db_manager", "category": "worms",
+                          "icon": "SP_DriveHDIcon",
+                          "tooltip": "WoRMS 本地数据库管理(导入/统计/清空)"},
+    "persons_manager":   {"label": "入库人员管理","slot": "_open_persons_manager",  "category": "ingest",
+                          "icon": "SP_DialogYesButton",
+                          "tooltip": "入库人员库 + 工作量统计 + 任务明细 + 编号分发"},
+    "workload_report":   {"label": "入库人员记录","slot": "_open_workload_report",  "category": "ingest",
+                          "icon": "SP_FileDialogDetailedView",
+                          "tooltip": "入库人员工作量统计 (PersonsManagerDialog Tab 2)"},
+    "series_manager":    {"label": "编号系列",   "slot": "_open_series_manager",   "category": "ingest",
+                          "icon": "SP_DialogApplyButton",
+                          "tooltip": "入库编号系列管理(新增/编辑/删除)"},
+    "batch_generate":    {"label": "批量生成编号","slot": "_open_batch_generate",   "category": "edit",
+                          "icon": "SP_ArrowRight",
+                          "tooltip": "批量预留入库编号段 + 导出 xlsx/csv"},
+    "new_window":        {"label": "新建工作区窗口","slot": "_open_new_workspace_window", "category": "view",
+                          "icon": "SP_FileDialogNewFolder",
+                          "tooltip": "选另一工作区开新窗口(各自有锁)"},
+    "readonly_clone":    {"label": "只读副本",   "slot": "_open_readonly_clone",   "category": "view",
+                          "icon": "SP_DialogCancelButton",
+                          "tooltip": "本工作区只读副本(允多个同时打开,不抢锁)"},
+    "data_snapshot":     {"label": "数据快照",   "slot": "open_version_manager",   "category": "tools",
+                          "icon": "SP_DialogSaveAllButton",
+                          "tooltip": "数据版本管理 + 检查 GitHub 更新"},
+    "excel_open":        {"label": "Excel 打开数据","slot": "_open_data_in_excel",  "category": "tools",
+                          "icon": "SP_FileDialogStart",
+                          "tooltip": "用 Excel 打开工作区数据文件(密码门控)"},
+    # Phase 5: 手动添加入库编号 + 规则推断 + 批量生成
+    "manual_voucher":    {"label": "手动添加编号", "slot": "_open_manual_voucher",  "category": "edit",
+                          "icon": "SP_FileDialogNewFolder",
+                          "tooltip": "手动输入入库编号(单/多条);≥2 个自动识别规则可批量生成"},
 }
 
 # 默认布局：用户未自定义时（settings.toolbar_layout 为空）用此。
@@ -972,10 +1007,18 @@ class SpecimenWindow(QMainWindow):
     _VOUCHER_COL_BASE_WIDTHS = (85, 36, 36, 36, 52, 42)
     _VOUCHER_TABLE_BASE_PT = 10
 
-    def __init__(self, workspace_root: Path | str | None, manager: "WindowManager | None" = None):
+    def __init__(self, workspace_root: Path | str | None, manager: "WindowManager | None" = None,
+                 read_only: bool = False):
+        """初始化主窗口。
+
+        规范化软件设计 2026-05 多窗口:read_only=True 时 ExcelStore 也走 read_only,
+        标题加"(只读)",禁所有写入 UI(新增/编辑/删除/任务/导入)。
+        """
         super().__init__()
         self.manager = manager
-        self.setWindowTitle("标本入库管理")
+        self.read_only = bool(read_only)
+        title = "标本入库管理(只读副本)" if self.read_only else "标本入库管理"
+        self.setWindowTitle(title)
         # 旧：get_app_icon() 永远用程序生成图标。现按用户选的图标变体加载。
         self.setWindowIcon(get_app_icon(load_settings().app_icon_variant))
         self.resize(1320, 820)
@@ -994,12 +1037,17 @@ class SpecimenWindow(QMainWindow):
             self.matcher = None
         else:
             self.workspace_root, create_workspace_files = prepared
-            if self.manager is not None and self.manager.focus_workspace(self.workspace_root):
+            # 只读副本不抢已存在的主窗口焦点(允许同工作区多只读副本共存)
+            if not self.read_only and self.manager is not None and self.manager.focus_workspace(self.workspace_root):
                 self.close()
                 raise SystemExit
 
             try:
-                self.store = ExcelStore(self.workspace_root, lock=True, create_if_missing=create_workspace_files)
+                # 只读副本不锁工作区(不抢锁)
+                lock_flag = not self.read_only
+                self.store = ExcelStore(self.workspace_root, lock=lock_flag,
+                                        create_if_missing=create_workspace_files,
+                                        read_only=self.read_only)
             except WorkspaceLockedError as exc:
                 lock_path = self.workspace_root / "数据" / ".workspace.lock"
                 msg = f'{exc}\n\n如果软件已退出但仍然被占用，可以点击"强制解锁"。'
@@ -1007,7 +1055,9 @@ class SpecimenWindow(QMainWindow):
                 if btn == QMessageBox.Retry and lock_path.exists():
                     try:
                         lock_path.unlink()
-                        self.store = ExcelStore(self.workspace_root, lock=True, create_if_missing=create_workspace_files)
+                        self.store = ExcelStore(self.workspace_root, lock=True,
+                                                create_if_missing=create_workspace_files,
+                                                read_only=self.read_only)
                     except Exception:
                         self.close()
                         raise SystemExit
@@ -1111,16 +1161,36 @@ class SpecimenWindow(QMainWindow):
             QTimer.singleShot(0, self._prompt_initial_workspace)
 
     def _finish_initial_load(self) -> None:
-        if self._is_closing:
-            return
-        if self.store is None:
+        """启动后初始加载。拆 3 步 + QTimer.singleShot(0) 让事件循环穿插,UI 点击立即响应。
+
+        规范化软件设计 2026-05 Phase 4 修:
+        旧:单方法同步链 ~200-500ms 阻塞事件循环 → crash hint QMessageBox 按钮 / 主窗口 click
+            响应延迟。
+        现:Step1 refresh_list → yield → Step2 select_voucher → yield → Step3 后续 timer。
+            每 yield 让 Qt 事件循环跑一次,处理 pending click / QMessageBox 交互。
+        """
+        if self._is_closing or self.store is None:
             return
         self.refresh_list()
         _startup_mark("_finish_initial_load: refresh_list")
+        if self.read_only:
+            self._apply_read_only_ui()
+        # yield 事件循环 → step2
+        QTimer.singleShot(0, self._finish_initial_load_step2)
+
+    def _finish_initial_load_step2(self) -> None:
+        if self._is_closing or self.store is None:
+            return
         vouchers = self._all_vouchers
         if vouchers:
             self.select_voucher(vouchers[0], defer_preview=True)
         _startup_mark("_finish_initial_load: first voucher selected")
+        # yield 事件循环 → step3
+        QTimer.singleShot(0, self._finish_initial_load_step3)
+
+    def _finish_initial_load_step3(self) -> None:
+        if self._is_closing or self.store is None:
+            return
         self.statusBar().showMessage("工作区已加载", 2000)
         # 分类预设缺失时显示持久黄色警告条（旧：8 秒状态栏消息，极易错过）。
         if self.matcher is not None and not list(self.matcher.all_rows()):
@@ -1148,6 +1218,60 @@ class SpecimenWindow(QMainWindow):
             _startup_mark("fast profile: scheduling preheat + search index prebuild")
             QTimer.singleShot(500, self._preheat_caches)
             QTimer.singleShot(1200, self._build_search_index_background)
+
+    def _apply_read_only_ui(self) -> None:
+        """规范化软件设计 2026-05 多窗口:只读副本禁所有写入 UI。
+
+        - 任务相关按钮 disabled
+        - "新增入库编号" disabled
+        - 标本/分类/照片面板 输入控件 setReadOnly
+        - 工具栏写按钮 disabled (撤回/返回/清除照片关联/导入工作区/导入数据)
+        - 自动保存切 off (避免误触发)
+        - 状态栏永久 banner 提示
+        """
+        # 标题已加 (只读),保险再设
+        self.setWindowTitle(f"标本入库管理 (只读) — {self.workspace_root}")
+        # 禁任务按钮
+        for attr in ("_task_start_btn", "_task_end_btn", "_new_voucher_btn"):
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                btn.setEnabled(False)
+                btn.setToolTip("只读副本:禁用写入操作。请在主窗口操作。")
+        # 禁工具栏写 action(按 id 索引)
+        write_action_ids = {"import_workspace", "import_data", "export_data",
+                            "batch_export", "switch_workspace", "undo", "redo",
+                            "clear_photos", "version_manager", "settings"}
+        for aid, action in getattr(self, "_toolbar_actions", {}).items():
+            if aid in write_action_ids:
+                action.setEnabled(False)
+                action.setToolTip("只读副本:禁用")
+        # 自动保存切 off + 禁切换
+        auto = getattr(self, "_auto_save_action", None)
+        if auto is not None:
+            auto.setChecked(False)
+            auto.setEnabled(False)
+        self.auto_save_enabled = False
+        # 标本/分类/照片 input setReadOnly
+        for w_dict_name in ("specimen_widgets", "class_widgets", "photo_widgets"):
+            w_dict = getattr(self, w_dict_name, {})
+            for w in w_dict.values():
+                if hasattr(w, "setReadOnly"):
+                    try:
+                        w.setReadOnly(True)
+                    except Exception:
+                        pass
+                if hasattr(w, "setEditable"):
+                    try:
+                        w.setEditable(False)
+                    except Exception:
+                        pass
+        # 状态栏永久横幅
+        try:
+            ro_label = QLabel("🔒 只读副本 — 禁所有写入操作")
+            ro_label.setStyleSheet("color: #c14d4d; font-weight: bold; padding: 0 8px;")
+            self.statusBar().addPermanentWidget(ro_label)
+        except Exception:
+            pass
 
     def _preheat_caches(self) -> None:
         """规范化软件设计 2026-05 K 章高档位快路径:把 specimen/classification/photo 三表
@@ -1387,13 +1511,15 @@ class SpecimenWindow(QMainWindow):
         self._toolbar_actions: dict[str, QAction] = {}  # action_id -> QAction，供自定义对话框 / 快捷键绑定用
         # 两条工具栏都设 ToolButtonTextBesideIcon：图标提供视觉锚点 + 中文 label 保留可读性。
         # icon 大小 18px：兼顾紧凑度与可识别（Qt 默认 24 偏大，跟标准字号搭配会显胖）。
-        self._main_toolbar = QToolBar("主工具栏")
+        # Phase 5: DraggableToolBar 支持 action inline 拖换位 + 跨栏拖
+        from .widgets_toolbar import DraggableToolBar
+        self._main_toolbar = DraggableToolBar("主工具栏", slot="main", parent=self)
         self._main_toolbar.setObjectName("main_toolbar")
         self._main_toolbar.setMovable(True)
         self._main_toolbar.setIconSize(QSize(18, 18))
         self._main_toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.addToolBar(self._main_toolbar)
-        self._aux_toolbar = QToolBar("辅助工具栏")
+        self._aux_toolbar = DraggableToolBar("辅助工具栏", slot="aux", parent=self)
         self._aux_toolbar.setObjectName("aux_toolbar")
         self._aux_toolbar.setMovable(True)
         self._aux_toolbar.setIconSize(QSize(18, 18))
@@ -1854,64 +1980,69 @@ class SpecimenWindow(QMainWindow):
             self.restoreGeometry(QByteArray.fromBase64(saved.window_geometry.encode()))
 
         # ---- Menu bar ----
-        tools_menu = self.menuBar().addMenu("工具")
-        act_series = QAction("入库编号系列管理…", self)
-        act_series.setToolTip("管理各机构入库编号系列（新增/编辑/删除），查看分发统计")
-        act_series.triggered.connect(self._open_series_manager)
-        tools_menu.addAction(act_series)
-        tools_menu.addSeparator()
-        tools_menu.addAction("入库汇总", self.open_ingest_summary)
-        tools_menu.addAction("操作记录", self._open_action_log)
-        tools_menu.addAction("入库人员管理…", self._open_persons_manager)
-        tools_menu.addAction("入库人员记录…", self._open_workload_report)
-        # 新增：用 Excel 直接打开数据目录里的 xlsx（密码门，复用管理密码）。
-        tools_menu.addAction("用 Excel 打开数据文件…", self._open_data_in_excel)
-        # 旧（v0.5.0+）：此处有一行 tools_menu.addAction("WoRMS 分类匹配…", self._open_worms_match)，
-        # 同时顶层菜单栏另起一个独立的「WoRMS」菜单。WoRMS 入口三处冗余（工具栏/工具菜单/顶层 WoRMS 菜单）。
-        # 现（规范化软件设计 2026-05）：顶层「WoRMS」菜单删除，WoRMS 三项合入工具菜单底部
-        # （见本文件 _build_ui 末尾的 "WoRMS 物种分类工具" 分隔段）。
-        tools_menu.addSeparator()
-        # M1: 多人协作 — 一键聚合 incoming/ 下所有"含 数据/ 子目录"的文件夹到中心机。
-        # 兼容降级模式：无 manifest 也能合并（等价于 P1 极简方案），用现有 import_workspace 做合并核心。
-        tools_menu.addAction("从收件箱聚合…", self._open_aggregate_incoming)
-        # S2: 批量选多个工作区目录直接合并，省去先复制到 incoming/。
-        tools_menu.addAction("批量导入工作区目录…", self._open_batch_import_sources)
-        # M5: 把旧版工作区贴上多人协作协议标记 + 留段记录，强制 snapshot 可回退。
-        tools_menu.addAction("升级工作区到多人协作格式…", self._upgrade_workspace_to_multi_user)
-        tools_menu.addSeparator()
-        # A1: 把工作区一键导出成 Darwin Core Archive（TDWG/GBIF 通用格式），用于对外发布或与
-        # GBIF/iDigBio 等数据聚合器对接。只读导出，不动工作区。
-        tools_menu.addAction("导出 Darwin Core Archive…", self._export_dwc_archive)
-        # A2: 从照片 EXIF 批量回填缺失的采集日期到 voucher。仅填空字段不覆盖。
-        tools_menu.addAction("从 EXIF 批量回填采集日期…", self._bulk_apply_exif)
-        tools_menu.addSeparator()
-        tools_menu.addAction("降低工作区兼容版本…", self._downgrade_workspace_schema)
-        tools_menu.addSeparator()
-        # DOC: 用系统默认应用打开合并 / 导入操作示例 markdown。
-        tools_menu.addAction("打开合并/导入操作示例…", self._open_import_examples)
+        # 规范化软件设计 2026-05 Phase 4:顶层菜单 4 → 6 (入库/编号/WoRMS/工具/视图/帮助)
+        # Phase 5:菜单项右键弹"加到工具栏"小菜单 (ToolbarAwareMenu);
+        # 每项 QAction.setData(action_id) 关联 TOOLBAR_ACTIONS 注册表。
+        from .widgets_toolbar import ToolbarAwareMenu
 
-        tools_menu.addSeparator()
-        # WoRMS 物种分类工具（规范化软件设计 2026-05 起，原顶层「WoRMS」菜单合并至此）。
-        # 三项共用单实例 WormsMatchWindow（详见 _open_worms_match/_open_worms_browse/_open_worms_db_manager）。
-        tools_menu.addAction("WoRMS 分类匹配…", self._open_worms_match)
-        tools_menu.addAction("WoRMS 分类浏览…", self._open_worms_browse)
-        tools_menu.addAction("WoRMS 本地数据库管理…", self._open_worms_db_manager)
+        def _make_menu(title: str) -> ToolbarAwareMenu:
+            m = ToolbarAwareMenu(title, self)
+            self.menuBar().addMenu(m)
+            return m
 
-        # 顶层「编号」菜单：入库编号系列管理 + 批量生成 + 切换活动系列。
-        number_menu = self.menuBar().addMenu("编号")
-        number_menu.addAction("系列管理…", self._open_series_manager)
-        number_menu.addAction("批量生成编号…", self._open_batch_generate)
+        def _add(menu, text: str, slot, action_id: str = ""):
+            """加菜单项,可选 action_id(关联 TOOLBAR_ACTIONS;右键可加到工具栏)。"""
+            act = QAction(text, self)
+            act.triggered.connect(slot)
+            if action_id:
+                act.setData(action_id)
+            menu.addAction(act)
+            return act
+
+        # 顶层「入库」菜单
+        ingest_menu = _make_menu("入库")
+        _add(ingest_menu, "入库汇总", self.open_ingest_summary, "ingest_summary")
+        _add(ingest_menu, "入库编号系列管理…", self._open_series_manager, "series_manager")
+        ingest_menu.addSeparator()
+        _add(ingest_menu, "入库人员管理…", self._open_persons_manager, "persons_manager")
+        _add(ingest_menu, "入库人员记录…", self._open_workload_report, "workload_report")
+
+        # 顶层「编号」菜单
+        number_menu = _make_menu("编号")
+        _add(number_menu, "批量生成编号…", self._open_batch_generate, "batch_generate")
+        _add(number_menu, "手动添加入库编号…", self._open_manual_voucher, "manual_voucher")
         number_menu.addSeparator()
         self._series_switch_menu = number_menu.addMenu("切换活动系列")
-        # 打开子菜单时动态填充，确保显示最新系列列表。
         self._series_switch_menu.aboutToShow.connect(self._populate_series_switch_menu)
 
-        # 旧（v0.5.0+）：顶层「WoRMS」菜单（分类匹配/分类浏览/管理本地数据库）独立挂在菜单栏。
-        # 现（规范化软件设计 2026-05）：删除顶层 WoRMS 菜单，三项合入「工具」菜单底部
-        # （上方 "WoRMS 物种分类工具" 分隔段），统一在「工具」菜单层级，避免三处冗余。
-        # 三个 slot 方法 _open_worms_match / _open_worms_browse / _open_worms_db_manager 不变。
+        # 顶层「WoRMS」菜单
+        worms_menu = _make_menu("WoRMS")
+        _add(worms_menu, "分类匹配…", self._open_worms_match, "worms")
+        _add(worms_menu, "查询…", self._open_worms_browse, "worms_browse")
+        worms_menu.addSeparator()
+        _add(worms_menu, "本地数据库管理…", self._open_worms_db_manager, "worms_db")
 
-        view_menu = self.menuBar().addMenu("视图")
+        # 顶层「工具」菜单
+        tools_menu = _make_menu("工具")
+        _add(tools_menu, "操作记录", self._open_action_log)
+        _add(tools_menu, "用 Excel 打开数据文件…", self._open_data_in_excel, "excel_open")
+        tools_menu.addSeparator()
+        _add(tools_menu, "从收件箱聚合…", self._open_aggregate_incoming)
+        _add(tools_menu, "批量导入工作区目录…", self._open_batch_import_sources)
+        _add(tools_menu, "升级工作区到多人协作格式…", self._upgrade_workspace_to_multi_user)
+        tools_menu.addSeparator()
+        _add(tools_menu, "导出 Darwin Core Archive…", self._export_dwc_archive)
+        _add(tools_menu, "从 EXIF 批量回填采集日期…", self._bulk_apply_exif)
+        tools_menu.addSeparator()
+        _add(tools_menu, "降低工作区兼容版本…", self._downgrade_workspace_schema)
+        tools_menu.addSeparator()
+        _add(tools_menu, "打开合并/导入操作示例…", self._open_import_examples)
+        tools_menu.addSeparator()
+        _add(tools_menu, "新建工作区窗口…", self._open_new_workspace_window, "new_window")
+        if not getattr(self, "read_only", False):
+            _add(tools_menu, "新建本工作区只读副本", self._open_readonly_clone, "readonly_clone")
+
+        view_menu = _make_menu("视图")
         for panel_name, panel_ref in [
             ("入库编号", self.voucher_panel),
             ("标本信息", self.specimen_panel),
@@ -1939,7 +2070,7 @@ class SpecimenWindow(QMainWindow):
         # 旧：无统一 Help / 关于入口；仅状态栏显示版本号。
         # 现：菜单栏右端固定「帮助」菜单，下分使用说明 / 字段速查 / 快捷键速查 / 检查更新 /
         # 打开崩溃日志目录 / 关于。各 slot 详见 _open_user_manual_dialog 等方法。
-        help_menu = self.menuBar().addMenu("帮助")
+        help_menu = _make_menu("帮助")
         help_menu.addAction("使用说明…", self._open_user_manual_dialog)
         help_menu.addAction("字段填写说明速查…", self._open_field_help_index)
         help_menu.addAction("快捷键速查…", self._open_shortcuts_dialog)
@@ -2046,6 +2177,8 @@ class SpecimenWindow(QMainWindow):
                     toolbar.addSeparator()
                 last_category = category
                 action = QAction(spec["label"], self)
+                # Phase 5: 关联 action_id 供 DraggableToolBar drag mime + 菜单右键加快捷
+                action.setData(action_id)
                 tip = spec.get("tooltip")
                 if tip:
                     action.setToolTip(tip)
@@ -2503,6 +2636,15 @@ class SpecimenWindow(QMainWindow):
         dlg = BatchGenerateDialog(self.store, self)
         dlg.exec_()
 
+    def _open_manual_voucher(self) -> None:
+        """Phase 5: 手动添加入库编号 + 规则推断 + 批量生成。"""
+        if self.store is None:
+            QMessageBox.information(self, "未选择工作区", "请先选择工作区。")
+            return
+        from .manual_voucher_dialog import ManualVoucherDialog
+        dlg = ManualVoucherDialog(self.store, self)
+        dlg.exec_()
+
     def _open_workload_report(self) -> None:
         """工具菜单 → 入库人员记录 = PersonsManagerDialog 默认打开"工作量统计" Tab (Phase 2 复用)。
 
@@ -2751,6 +2893,26 @@ class SpecimenWindow(QMainWindow):
             update_last_used(name_or_special, self.workspace_root)
         except Exception:
             pass
+
+    def _open_new_workspace_window(self) -> None:
+        """规范化软件设计 2026-05 多窗口:选不同工作区开新窗口(可写)。
+
+        同工作区已开则 focus 现有,不新开 (WindowManager 内置)。
+        """
+        if self.manager is None:
+            QMessageBox.information(self, "不支持", "无法新建窗口。")
+            return
+        directory = QFileDialog.getExistingDirectory(self, "选择要打开的工作区")
+        if not directory:
+            return
+        self.manager.open_workspace(Path(directory), read_only=False)
+
+    def _open_readonly_clone(self) -> None:
+        """规范化软件设计 2026-05 多窗口:本工作区只读副本(可同时多个,不抢锁)。"""
+        if self.manager is None or self.workspace_root is None:
+            QMessageBox.information(self, "不支持", "尚未选择工作区。")
+            return
+        self.manager.open_workspace(self.workspace_root, read_only=True)
 
     def _open_persons_manager(self) -> None:
         """工具菜单入口 / 状态栏 "管理人员…" 选项 → 打开 PersonsManagerDialog。
@@ -7355,12 +7517,18 @@ class WindowManager:
     def __init__(self, app: QApplication):
         self.app = app
         self._windows: dict[Path, SpecimenWindow] = {}
+        # 规范化软件设计 2026-05 多窗口:只读副本不进 _windows dict (允许同工作区多副本),
+        # 但需 keep_alive 持引用防 GC,放 _ro_windows list。
+        self._ro_windows: list[SpecimenWindow] = []
         # C1: 已注册的子对话框 + 它们的"停止 worker"方法。
-        # 元素 = (dialog, stop_callable) — stop_callable 应在 wait_ms 内完成 graceful stop。
-        # 主窗口 closeEvent 调 stop_all_dialog_workers() 一次性回收。
         self._dialog_stop_handlers: list[tuple[object, "callable"]] = []
 
     def register(self, window: SpecimenWindow) -> None:
+        # 只读副本不入主 dict (允许同工作区多副本共存),改入 _ro_windows
+        if getattr(window, "read_only", False):
+            if window not in self._ro_windows:
+                self._ro_windows.append(window)
+            return
         # 未绑定工作区的窗口（首次启动尚未选工作区）不注册；
         # 载入工作区时 _load_workspace_into_window 会再次调用 register。
         if getattr(window, "workspace_root", None) is None:
@@ -7368,6 +7536,13 @@ class WindowManager:
         self._windows[window.workspace_root.resolve()] = window
 
     def unregister(self, window: SpecimenWindow) -> None:
+        # 只读副本从 _ro_windows 移除
+        if getattr(window, "read_only", False):
+            try:
+                self._ro_windows.remove(window)
+            except ValueError:
+                pass
+            return
         key = getattr(window, "workspace_root", None)
         if key is None:
             return
@@ -7407,11 +7582,18 @@ class WindowManager:
         window.activateWindow()
         return True
 
-    def open_workspace(self, workspace_root: Path | str | None) -> SpecimenWindow | None:
-        if workspace_root is not None and self.focus_workspace(workspace_root):
+    def open_workspace(self, workspace_root: Path | str | None,
+                       read_only: bool = False) -> SpecimenWindow | None:
+        """打开工作区窗口。
+
+        规范化软件设计 2026-05 多窗口:
+        - read_only=False (默认): 若同工作区主窗口已开 → focus 现有不新建
+        - read_only=True: 直接新建只读副本,允许同工作区多副本共存
+        """
+        if not read_only and workspace_root is not None and self.focus_workspace(workspace_root):
             return self._windows.get(Path(workspace_root).resolve())
         try:
-            window = SpecimenWindow(workspace_root, manager=self)
+            window = SpecimenWindow(workspace_root, manager=self, read_only=read_only)
         except SystemExit:
             return None
         except Exception as exc:
