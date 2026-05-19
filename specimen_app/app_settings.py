@@ -30,6 +30,18 @@ PHOTO_MANAGEMENT_OPTIONS = {
 
 DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT = "Ctrl+Alt+F"
 
+# 升级中心 (D3 / D12 / D18) 选项常量。
+AUTO_UPDATE_MODE_OPTIONS: dict[str, str] = {
+    "off": "关闭（不自动检查）",
+    "notify": "仅通知（启动时检查，发现新版用顶部黄条提示）",
+    "download": "后台下载（下完后下次启动询问是否安装）",
+    "install": "自动下载并在下次启动时安装（仍弹确认）",
+}
+AUTO_UPDATE_CHANNEL_OPTIONS: dict[str, str] = {
+    "stable": "稳定版",
+    "prerelease": "预发布（抢先体验）",
+}
+
 # 规范化软件设计 2026-05 新增:内存档位选项。
 # 5 档对应不同的缩略图缓存 / 缩略图并发 / Excel _row_cache LRU 上限,详见 env_detect.memory_profile_params。
 MEMORY_PROFILE_OPTIONS: dict[str, str] = {
@@ -81,6 +93,20 @@ class AppSettings:
     team_members: list = field(default_factory=list)
     # 当前选中的录入员姓名 (状态栏下拉记忆;空 = 未设置)。
     current_recorder: str = ""
+    # 升级中心 v0.8.0 (D3 / D11 / D12 / D18):自动升级状态机 + Sparkle 风跳过此版本 +
+    # Claude Code 风 channel 切换。旧 check_updates_on_startup=True 会在 load_settings()
+    # 里一次性迁到 auto_update_mode="notify"。
+    auto_update_mode: str = "off"
+    auto_update_interval_hours: int = 24
+    auto_update_pending_version: str = ""
+    auto_update_install_dir: str = ""
+    auto_update_keep_versions: int = 2
+    auto_update_pinned_versions: list[str] = field(default_factory=list)
+    auto_update_skipped_versions: list[str] = field(default_factory=list)
+    auto_update_channel: str = "stable"
+    upgrade_last_distribution_dir: str = ""
+    # D10 引导黄条:用户点过"不再提示"后置 True,跳过 frozen-direct 引导提示。
+    upgrade_skip_current_init: bool = False
 
 
 def app_config_dir() -> Path:
@@ -181,6 +207,34 @@ def load_settings() -> AppSettings:
             if isinstance(m, dict) and m.get("name"):
                 team_members.append(m)
     current_recorder = str(data.get("current_recorder", ""))
+    # 升级中心 v0.8.0:解析新字段 + 兼容迁移。
+    auto_update_mode = str(data.get("auto_update_mode", ""))
+    if auto_update_mode not in AUTO_UPDATE_MODE_OPTIONS:
+        # 迁移:旧 check_updates_on_startup=True → notify;否则 off。
+        auto_update_mode = "notify" if check_updates_on_startup else "off"
+    auto_update_interval_hours = data.get("auto_update_interval_hours", 24)
+    if not isinstance(auto_update_interval_hours, int) or isinstance(auto_update_interval_hours, bool):
+        auto_update_interval_hours = 24
+    auto_update_interval_hours = max(1, min(24 * 30, int(auto_update_interval_hours)))
+    auto_update_pending_version = str(data.get("auto_update_pending_version", ""))
+    auto_update_install_dir = str(data.get("auto_update_install_dir", ""))
+    auto_update_keep_versions = data.get("auto_update_keep_versions", 2)
+    if not isinstance(auto_update_keep_versions, int) or isinstance(auto_update_keep_versions, bool):
+        auto_update_keep_versions = 2
+    auto_update_keep_versions = max(1, min(10, int(auto_update_keep_versions)))
+    raw_pinned = data.get("auto_update_pinned_versions", [])
+    auto_update_pinned_versions = [str(v) for v in raw_pinned if isinstance(v, str)] \
+        if isinstance(raw_pinned, list) else []
+    raw_skipped = data.get("auto_update_skipped_versions", [])
+    auto_update_skipped_versions = [str(v) for v in raw_skipped if isinstance(v, str)] \
+        if isinstance(raw_skipped, list) else []
+    auto_update_channel = str(data.get("auto_update_channel", "stable"))
+    if auto_update_channel not in AUTO_UPDATE_CHANNEL_OPTIONS:
+        auto_update_channel = "stable"
+    upgrade_last_distribution_dir = str(data.get("upgrade_last_distribution_dir", ""))
+    upgrade_skip_current_init = data.get("upgrade_skip_current_init", False)
+    if not isinstance(upgrade_skip_current_init, bool):
+        upgrade_skip_current_init = False
     return AppSettings(
         last_workspace=str(data.get("last_workspace", "")),
         recent_workspaces=[str(item) for item in data.get("recent_workspaces", []) if item],
@@ -207,6 +261,16 @@ def load_settings() -> AppSettings:
         memory_profile=memory_profile,
         team_members=team_members,
         current_recorder=current_recorder,
+        auto_update_mode=auto_update_mode,
+        auto_update_interval_hours=auto_update_interval_hours,
+        auto_update_pending_version=auto_update_pending_version,
+        auto_update_install_dir=auto_update_install_dir,
+        auto_update_keep_versions=auto_update_keep_versions,
+        auto_update_pinned_versions=auto_update_pinned_versions,
+        auto_update_skipped_versions=auto_update_skipped_versions,
+        auto_update_channel=auto_update_channel,
+        upgrade_last_distribution_dir=upgrade_last_distribution_dir,
+        upgrade_skip_current_init=upgrade_skip_current_init,
     )
 
 
@@ -239,6 +303,16 @@ def save_settings(settings: AppSettings) -> None:
         "memory_profile": settings.memory_profile,
         "team_members": settings.team_members,
         "current_recorder": settings.current_recorder,
+        "auto_update_mode": settings.auto_update_mode,
+        "auto_update_interval_hours": settings.auto_update_interval_hours,
+        "auto_update_pending_version": settings.auto_update_pending_version,
+        "auto_update_install_dir": settings.auto_update_install_dir,
+        "auto_update_keep_versions": settings.auto_update_keep_versions,
+        "auto_update_pinned_versions": settings.auto_update_pinned_versions[:20],
+        "auto_update_skipped_versions": settings.auto_update_skipped_versions[:50],
+        "auto_update_channel": settings.auto_update_channel,
+        "upgrade_last_distribution_dir": settings.upgrade_last_distribution_dir,
+        "upgrade_skip_current_init": settings.upgrade_skip_current_init,
     }
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)

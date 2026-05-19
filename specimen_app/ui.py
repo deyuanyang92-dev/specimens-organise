@@ -487,6 +487,38 @@ TOOLBAR_ACTIONS: dict[str, dict] = {
     "manual_voucher":    {"label": "手动添加编号", "slot": "_open_manual_voucher",  "category": "edit",
                           "icon": "SP_FileDialogNewFolder",
                           "tooltip": "手动输入入库编号(单/多条);≥2 个自动识别规则可批量生成"},
+    # 升级中心 v0.8.0 (D1-D20):一级 升级 菜单 + 升级中心 dialog 7 tab。
+    # 顶层 5 项(主流对齐 Claude Code/VSCode 简洁风),其余 6 项进 高级 子菜单。
+    "oneclick_upgrade":  {"label": "立即升级", "slot": "_oneclick_upgrade_now", "category": "upgrade",
+                          "icon": "SP_ArrowUp",
+                          "tooltip": "一键升级:后台 check + download + 弹窗问重启 → 一气呵成"},
+    "check_update_now":  {"label": "检查更新", "slot": "_check_update_now", "category": "upgrade",
+                          "icon": "SP_BrowserReload",
+                          "tooltip": "检查 GitHub 最新版本，发现新版打开升级中心"},
+    "upgrade_settings":  {"label": "自动更新设置", "slot": "_open_upgrade_settings", "category": "upgrade",
+                          "icon": "SP_ComputerIcon",
+                          "tooltip": "自动升级模式 / channel / 间隔 / 保留版本数"},
+    "upgrade_about":     {"label": "关于当前版本", "slot": "_open_upgrade_about", "category": "upgrade",
+                          "icon": "SP_DialogHelpButton",
+                          "tooltip": "当前版本号、安装方式、构建信息"},
+    "upgrade_center":    {"label": "升级中心", "slot": "_open_upgrade_center", "category": "upgrade",
+                          "icon": "SP_ArrowUp",
+                          "tooltip": "升级中心:检查/下载/导入/历史/设置一站式 dialog"},
+    "install_from_zip":  {"label": "从本地文件安装更新", "slot": "_install_from_zip", "category": "upgrade",
+                          "icon": "SP_DirOpenIcon",
+                          "tooltip": "选 zip 文件离线安装(同事 U 盘转运场景)"},
+    "download_installer": {"label": "下载安装包供分发", "slot": "_download_installer", "category": "upgrade",
+                          "icon": "SP_DialogSaveButton",
+                          "tooltip": "下载 Windows/Linux 安装包到指定文件夹,不安装"},
+    "upgrade_history":   {"label": "历史版本管理", "slot": "_open_upgrade_history", "category": "upgrade",
+                          "icon": "SP_FileDialogDetailedView",
+                          "tooltip": "已安装的旧版本列表 + 设为当前(回滚)"},
+    "upgrade_build_remote": {"label": "远程触发 GitHub 构建", "slot": "_open_upgrade_build_remote", "category": "upgrade",
+                          "icon": "SP_ArrowForward",
+                          "tooltip": "通过 GitHub Actions workflow_dispatch 远程构建(v0.8.1)"},
+    "upgrade_build_local": {"label": "本地重新打包并安装", "slot": "_open_upgrade_build_local", "category": "upgrade",
+                          "icon": "SP_FileDialogContentsView",
+                          "tooltip": "(开发者模式) 本地 PyInstaller 重打包 + 自动 debug(v0.8.1)"},
 }
 
 # 默认布局：用户未自定义时（settings.toolbar_layout 为空）用此。
@@ -1201,6 +1233,14 @@ class SpecimenWindow(QMainWindow):
         # 首次打开时 dlg 自带后台 worker 建索引。本启动钩子改为仅触发 gc.collect()
         # 强制回收 openpyxl 读 Excel 用的临时对象（zip / xml DOM 等），实测可省 10–30MB。
         QTimer.singleShot(200, self._post_load_gc)
+        # D3+D11+D19 升级中心启动钩子链:
+        # 1. arm sentinel 清除定时器(新版活过 30s 视为健康,清掉 sentinel)
+        # 2. 1.5s: 检 pending_update 弹"立即安装并重启?"
+        # 3. 2s:   检 post_update_sentinel 残留弹"上次启动失败,回退?"
+        # 4. 2.5s: 4 档自动检查 GitHub 更新
+        self._arm_post_update_sentinel()
+        QTimer.singleShot(1500, self._apply_pending_update_on_startup)
+        QTimer.singleShot(2000, self._check_post_update_sentinel_on_startup)
         QTimer.singleShot(2500, self._maybe_check_updates_on_startup)
         # 规范化软件设计 2026-05 K 章:高档位快路径检测
         try:
@@ -1582,6 +1622,32 @@ class SpecimenWindow(QMainWindow):
         )
         self._preset_warning_banner.hide()
         central_layout.addWidget(self._preset_warning_banner)
+
+        # D19 升级 banner:notify 模式发现新版时显示,三按钮 [立即升级] [稍后] [跳过此版]。
+        self._update_banner_release = None
+        self._update_banner = QFrame()
+        self._update_banner.setObjectName("_update_banner")
+        self._update_banner.setStyleSheet(
+            "QFrame#_update_banner { background-color: #fff3cd; color: #856404; "
+            "border-bottom: 1px solid #ffc107; }"
+        )
+        _ub_layout = QHBoxLayout(self._update_banner)
+        _ub_layout.setContentsMargins(12, 6, 12, 6)
+        _ub_text = QLabel("发现新版")
+        _ub_text.setObjectName("_update_banner_text")
+        _ub_text.setStyleSheet("color: #856404;")
+        _ub_layout.addWidget(_ub_text, stretch=1)
+        _ub_install = QPushButton("立即升级")
+        _ub_install.clicked.connect(self._upgrade_banner_install)
+        _ub_layout.addWidget(_ub_install)
+        _ub_later = QPushButton("稍后")
+        _ub_later.clicked.connect(self._upgrade_banner_later)
+        _ub_layout.addWidget(_ub_later)
+        _ub_skip = QPushButton("跳过此版")
+        _ub_skip.clicked.connect(self._upgrade_banner_skip)
+        _ub_layout.addWidget(_ub_skip)
+        self._update_banner.hide()
+        central_layout.addWidget(self._update_banner)
 
         # Stacked: graphics view (single) + grid frame (grid)
         self._photo_stack_container = QWidget()
@@ -2041,6 +2107,50 @@ class SpecimenWindow(QMainWindow):
         _add(tools_menu, "新建工作区窗口…", self._open_new_workspace_window, "new_window")
         if not getattr(self, "read_only", False):
             _add(tools_menu, "新建本工作区只读副本", self._open_readonly_clone, "readonly_clone")
+
+        # 升级中心 v0.8.0 (D1-D20):一级 升级 菜单。主流对齐 Claude Code/VSCode,
+        # 顶层 5 项,其余功能藏 高级 子菜单 + 升级中心 dialog tab。
+        upgrade_menu = _make_menu("升级")
+        _add(upgrade_menu, "立即升级到最新版", self._oneclick_upgrade_now, "oneclick_upgrade")
+        upgrade_menu.addSeparator()
+        _add(upgrade_menu, "检查更新…", self._check_update_now, "check_update_now")
+        _add(upgrade_menu, "自动更新设置…", self._open_upgrade_settings, "upgrade_settings")
+        _add(upgrade_menu, "关于当前版本…", self._open_upgrade_about, "upgrade_about")
+        upgrade_advanced = upgrade_menu.addMenu("高级")
+        upgrade_advanced.setToolTipsVisible(True)
+        _adv_center = QAction("升级中心…", self)
+        _adv_center.triggered.connect(self._open_upgrade_center)
+        _adv_center.setData("upgrade_center")
+        upgrade_advanced.addAction(_adv_center)
+        upgrade_advanced.addSeparator()
+        _adv_import = QAction("从本地文件安装更新…", self)
+        _adv_import.triggered.connect(self._install_from_zip)
+        _adv_import.setData("install_from_zip")
+        upgrade_advanced.addAction(_adv_import)
+        _adv_dl = QAction("下载安装包供分发…", self)
+        _adv_dl.triggered.connect(self._download_installer)
+        _adv_dl.setData("download_installer")
+        upgrade_advanced.addAction(_adv_dl)
+        upgrade_advanced.addSeparator()
+        _adv_hist = QAction("历史版本管理…", self)
+        _adv_hist.triggered.connect(self._open_upgrade_history)
+        _adv_hist.setData("upgrade_history")
+        upgrade_advanced.addAction(_adv_hist)
+        upgrade_advanced.addSeparator()
+        _adv_remote = QAction("远程触发 GitHub 构建…", self)
+        _adv_remote.triggered.connect(self._open_upgrade_build_remote)
+        _adv_remote.setData("upgrade_build_remote")
+        upgrade_advanced.addAction(_adv_remote)
+        # 本地重打包仅 dev 模式可见 (D6)。
+        try:
+            from .install_kind import installation_kind
+            if installation_kind() == "source":
+                _adv_local = QAction("本地重新打包并安装…", self)
+                _adv_local.triggered.connect(self._open_upgrade_build_local)
+                _adv_local.setData("upgrade_build_local")
+                upgrade_advanced.addAction(_adv_local)
+        except Exception:
+            pass
 
         view_menu = _make_menu("视图")
         for panel_name, panel_ref in [
@@ -2644,6 +2754,107 @@ class SpecimenWindow(QMainWindow):
         from .manual_voucher_dialog import ManualVoucherDialog
         dlg = ManualVoucherDialog(self.store, self)
         dlg.exec_()
+
+    # ----------------------------------------------------------------- #
+    # 升级中心 v0.8.0 (D1-D20) slot 占位实现。
+    # T10/T11/T12 会把这些 stub 替换成 UpgradeCenterDialog 7 tab 接线。
+    # 现阶段先让菜单可点 + 显示 "WIP" 提示,方便用户验证菜单生效。
+    # ----------------------------------------------------------------- #
+
+    def _open_upgrade_center(self) -> None:
+        try:
+            from .ui_upgrade import UpgradeCenterDialog
+        except ImportError:
+            self._upgrade_wip("升级中心")
+            return
+        dlg = UpgradeCenterDialog(self, initial_tab="overview")
+        dlg.exec_()
+
+    def _check_update_now(self) -> None:
+        try:
+            from .ui_upgrade import UpgradeCenterDialog
+        except ImportError:
+            self._upgrade_wip("检查更新")
+            return
+        dlg = UpgradeCenterDialog(self, initial_tab="check")
+        dlg.exec_()
+
+    def _open_upgrade_settings(self) -> None:
+        try:
+            from .ui_upgrade import UpgradeCenterDialog
+        except ImportError:
+            self._upgrade_wip("自动更新设置")
+            return
+        dlg = UpgradeCenterDialog(self, initial_tab="settings")
+        dlg.exec_()
+
+    def _open_upgrade_about(self) -> None:
+        try:
+            from .ui_upgrade import open_about_dialog
+        except ImportError:
+            self._upgrade_about_fallback()
+            return
+        open_about_dialog(self)
+
+    def _install_from_zip(self) -> None:
+        try:
+            from .ui_upgrade import UpgradeCenterDialog
+        except ImportError:
+            self._upgrade_wip("从本地文件安装更新")
+            return
+        dlg = UpgradeCenterDialog(self, initial_tab="import")
+        dlg.exec_()
+
+    def _download_installer(self) -> None:
+        try:
+            from .ui_upgrade import UpgradeCenterDialog
+        except ImportError:
+            self._upgrade_wip("下载安装包供分发")
+            return
+        dlg = UpgradeCenterDialog(self, initial_tab="distribute")
+        dlg.exec_()
+
+    def _open_upgrade_history(self) -> None:
+        try:
+            from .ui_upgrade import UpgradeCenterDialog
+        except ImportError:
+            self._upgrade_wip("历史版本管理")
+            return
+        dlg = UpgradeCenterDialog(self, initial_tab="history")
+        dlg.exec_()
+
+    def _open_upgrade_build_remote(self) -> None:
+        QMessageBox.information(
+            self, "升级 → 远程触发 GitHub 构建",
+            "远程触发构建预计在 v0.8.1 上线。\n\n"
+            "现阶段构建走 push tag v00N 自动触发 GitHub Actions release.yml。",
+        )
+
+    def _open_upgrade_build_local(self) -> None:
+        QMessageBox.information(
+            self, "升级 → 本地重新打包并安装",
+            "本地重新打包 + 自动 debug 预计在 v0.8.1 上线。\n\n"
+            "现阶段开发者请直接跑 build_release.py:\n"
+            "python build_release.py --version 0.8.0",
+        )
+
+    def _upgrade_wip(self, label: str) -> None:
+        QMessageBox.information(
+            self, label,
+            f"{label} 功能正在开发中（v0.8.0 进行中）。\n\n"
+            f"模块 ui_upgrade.py 尚未实现,菜单已就位但 dialog 待填充。",
+        )
+
+    def _upgrade_about_fallback(self) -> None:
+        from . import __version__
+        from .install_kind import installation_kind, kind_description, upgrade_advice
+        kind = installation_kind()
+        QMessageBox.information(
+            self, "关于当前版本",
+            f"标本入库管理 v{__version__}\n\n"
+            f"安装方式：{kind_description(kind)}\n"
+            f"{upgrade_advice(kind)}",
+        )
 
     def _open_workload_report(self) -> None:
         """工具菜单 → 入库人员记录 = PersonsManagerDialog 默认打开"工作量统计" Tab (Phase 2 复用)。
@@ -5396,24 +5607,39 @@ class SpecimenWindow(QMainWindow):
     # ---- Startup update check ----
 
     def _maybe_check_updates_on_startup(self) -> None:
-        """启动后静默检查 GitHub 更新（需在设置中开启，且距上次检查超过 1 天）。"""
+        """启动后根据 auto_update_mode 4 档执行检查。
+
+        - off:      不检查
+        - notify:   后台查 → 有新版用顶部黄条提示（D19 banner）
+        - download: 后台查 → 有新版自动下载到 releases/ + write pending
+        - install:  同 download(swap 仍仅在下次启动应用，避免会话中切版本)
+
+        所有模式都受 ``auto_update_interval_hours`` 限频。
+        """
         if self._is_closing:
             return
         settings = load_settings()
-        if not settings.check_updates_on_startup:
+        mode = (settings.auto_update_mode or "off").lower()
+        if mode == "off":
             return
         last = settings.last_update_check
         if last:
             try:
                 from datetime import datetime
-                if (datetime.now() - datetime.fromisoformat(last)).total_seconds() < 86400:
+                interval_s = max(1, int(settings.auto_update_interval_hours or 24)) * 3600
+                if (datetime.now() - datetime.fromisoformat(last)).total_seconds() < interval_s:
                     return
             except ValueError:
                 pass  # 时间戳损坏则照常检查
-        worker = UpdateCheckWorker(self)
+        # Channel-aware check goes through ui_upgrade._ChannelCheckWorker
+        from .ui_upgrade import _ChannelCheckWorker
+        worker = _ChannelCheckWorker(
+            channel=settings.auto_update_channel or "stable",
+            parent=self,
+        )
         worker.finished_check.connect(self._on_startup_update_checked)
         worker.finished.connect(lambda: setattr(self, "_startup_update_worker", None))
-        self._startup_update_worker = worker  # 持引用，防止 QThread 被 GC
+        self._startup_update_worker = worker
         worker.start()
 
     def _on_startup_update_checked(self, release, error) -> None:
@@ -5423,10 +5649,423 @@ class SpecimenWindow(QMainWindow):
         save_settings(settings)
         if error is not None or release is None:
             return  # 启动检查失败保持静默，不打扰用户
-        if is_newer(release.version):
+        if not is_newer(release.version):
+            return
+        # 已跳过该版本 → 静默
+        if release.version in (settings.auto_update_skipped_versions or []):
+            return
+        mode = (settings.auto_update_mode or "off").lower()
+        if mode == "notify":
+            self._show_update_banner(release)
+        elif mode in ("download", "install"):
+            self._show_update_banner(release)
+            self._start_background_download_for_pending(release)
+
+    def _show_update_banner(self, release) -> None:
+        """D19 启动 banner:notify 模式有新版时主窗口顶部黄条提示。
+
+        Banner widget 在 _build_ui 阶段已挂到 central_layout 中,默认 hide。
+        """
+        banner = getattr(self, "_update_banner", None)
+        if banner is None:
+            # banner widget 未注册(向后兼容):退回状态栏短消息
             self.statusBar().showMessage(
-                f'发现新版本 v{release.version}，可在"版本管理"中下载更新', 10000
+                f'发现新版本 v{release.version},可在"升级"菜单中下载更新', 15000
             )
+            return
+        self._update_banner_release = release
+        label = banner.findChild(QLabel, "_update_banner_text")
+        if label is not None:
+            label.setText(
+                f"🔔 发现新版 v{release.version}（当前 v{__version__}）"
+            )
+        banner.show()
+
+    def _start_background_download_for_pending(self, release) -> None:
+        """download/install 模式:启动后台下载,写 pending,下次启动安装。"""
+        from .ui_upgrade import _locate_bundle
+        from .updater_pending import PendingUpdate, now_iso, write_pending
+        workspace = getattr(self, "workspace_root", None)
+        dest_root = default_download_root(workspace) if workspace else Path.cwd() / "releases"
+        local_roots = release_roots(workspace) if workspace else []
+
+        def _done(target_dir, incremental, error):
+            self._bg_download_worker = None
+            if error is not None or target_dir is None:
+                return
+            bundle_dir, exe_name = _locate_bundle(Path(target_dir))
+            if bundle_dir is None or not exe_name:
+                return
+            pending = PendingUpdate(
+                version=release.version,
+                bundle_dir=str(bundle_dir),
+                exe_name=exe_name,
+                from_version=__version__,
+                staged_at=now_iso(),
+                incremental=bool(incremental),
+                workspace=str(workspace or ""),
+            )
+            write_pending(pending)
+            self.statusBar().showMessage(
+                f"v{release.version} 已下载,下次启动时弹窗确认安装", 15000
+            )
+
+        worker = UpdateDownloadWorker(release, dest_root, local_roots, parent=self)
+        worker.finished_download.connect(_done)
+        self._bg_download_worker = worker
+        worker.start()
+
+    def _upgrade_banner_install(self) -> None:
+        """Banner 按钮:一键升级流程 — 后台 check + download + 问重启 + swap。
+
+        相当于 VSCode "Restart to Update" / Chrome 静默后台升级用户视角的"一键"。
+        失败时回落开升级中心对话框让用户手动操作。
+        """
+        self._oneclick_upgrade_now(source="banner")
+
+    def _oneclick_upgrade_now(self, *, source: str = "menu") -> None:
+        """一键升级:静默 check → 静默 download → "立即重启升级?" 弹窗 → swap。
+
+        所有阶段在后台 worker 跑,主窗口仅一条 statusBar 进度提示。
+        失败任一步 → 提示并打开升级中心让用户接手。
+        """
+        if getattr(self, "_oneclick_in_progress", False):
+            self.statusBar().showMessage("一键升级已在进行中…", 5000)
+            return
+        self._oneclick_in_progress = True
+
+        # Hide banner immediately so user doesn't double-click.
+        banner = getattr(self, "_update_banner", None)
+        if banner is not None:
+            banner.hide()
+
+        settings = load_settings()
+        channel = settings.auto_update_channel or "stable"
+        self.statusBar().showMessage(f"一键升级:正在查询最新版本（{channel}）…", 0)
+
+        from .ui_upgrade import _ChannelCheckWorker
+        check = _ChannelCheckWorker(channel=channel, parent=self)
+        check.finished_check.connect(
+            lambda release, error: self._oneclick_after_check(release, error)
+        )
+        self._oneclick_check_worker = check
+        check.start()
+
+    def _oneclick_after_check(self, release, error) -> None:
+        if error is not None:
+            self._oneclick_in_progress = False
+            self.statusBar().clearMessage()
+            QMessageBox.warning(
+                self, "一键升级失败",
+                f"检查更新失败：{error}\n\n请稍后重试。",
+            )
+            return
+        if release is None or not is_newer(release.version):
+            self._oneclick_in_progress = False
+            self.statusBar().clearMessage()
+            QMessageBox.information(
+                self, "已是最新",
+                f"当前 v{__version__} 已是该 channel 最新版本。",
+            )
+            return
+        # 已下载的 pending 直接重用,不重复下。
+        from .updater_pending import read_pending
+        pending = read_pending()
+        if pending and not pending.is_stale() and pending.version == release.version:
+            self._oneclick_in_progress = False
+            self.statusBar().clearMessage()
+            self._launch_pending_swap_with_confirm(pending)
+            return
+        # 启动下载。
+        from pathlib import Path as _P
+        workspace = getattr(self, "workspace_root", None)
+        dest_root = default_download_root(workspace) if workspace else _P.cwd() / "releases"
+        local_roots = release_roots(workspace) if workspace else []
+
+        self.statusBar().showMessage(
+            f"一键升级:正在下载 v{release.version} … 0%", 0
+        )
+
+        worker = UpdateDownloadWorker(release, dest_root, local_roots, parent=self)
+        worker.progress.connect(
+            lambda pct, ver=release.version: self.statusBar().showMessage(
+                f"一键升级:正在下载 v{ver} … {pct}%", 0
+            )
+        )
+        worker.finished_download.connect(
+            lambda target, inc, err, rel=release: self._oneclick_after_download(rel, target, inc, err)
+        )
+        self._oneclick_dl_worker = worker
+        worker.start()
+
+    def _oneclick_after_download(self, release, target_dir, incremental, error) -> None:
+        self._oneclick_in_progress = False
+        if error is not None:
+            self.statusBar().clearMessage()
+            QMessageBox.warning(
+                self, "下载失败",
+                f"v{release.version} 下载失败：{error}",
+            )
+            return
+        if target_dir is None:
+            self.statusBar().clearMessage()
+            return
+        from pathlib import Path as _P
+        from .ui_upgrade import _locate_bundle
+        from .updater_pending import PendingUpdate, now_iso, write_pending
+        bundle_dir, exe_name = _locate_bundle(_P(target_dir))
+        if bundle_dir is None or not exe_name:
+            self.statusBar().clearMessage()
+            QMessageBox.warning(
+                self, "下载完成但未识别 bundle",
+                f"下载到 {target_dir},但未在其中找到可执行文件。",
+            )
+            return
+        pending = PendingUpdate(
+            version=release.version,
+            bundle_dir=str(bundle_dir),
+            exe_name=exe_name,
+            from_version=__version__,
+            staged_at=now_iso(),
+            incremental=bool(incremental),
+            workspace=str(getattr(self, "workspace_root", "") or ""),
+        )
+        write_pending(pending)
+        # VSCode 风一键升级:下完直接走 swap,不二次确认。snapshot 在 _launch_pending_swap
+        # 内部强制创建,数据安全。statusBar 短倒计时让用户最后一秒能 Ctrl+C 终止。
+        self._auto_swap_countdown = 3
+        self._auto_swap_pending = pending
+        self._auto_swap_release = release
+        self.statusBar().showMessage(
+            f"✅ v{release.version} 已下载完成,3 秒后自动重启升级 …", 0
+        )
+        from PyQt5.QtCore import QTimer
+        self._auto_swap_timer = QTimer(self)
+        self._auto_swap_timer.timeout.connect(self._auto_swap_tick)
+        self._auto_swap_timer.start(1000)
+
+    def _arm_auto_swap_countdown(self, pending, release=None) -> None:
+        """让其他来源 (UpgradeCenterDialog 检查/导入 tab) 走相同的 3 秒倒计时
+        → swap 流水。pending 必填,release 可选(没有就用 pending.version 显示)。
+        """
+        from PyQt5.QtCore import QTimer as _QT
+        self._auto_swap_pending = pending
+        # 没有 release 对象时构造一个最小占位,只用它的 .version 属性。
+        class _RelStub:
+            def __init__(self, version):
+                self.version = version
+        self._auto_swap_release = release or _RelStub(pending.version)
+        self._auto_swap_countdown = 3
+        self.statusBar().showMessage(
+            f"✅ v{self._auto_swap_release.version} 准备就绪,3 秒后自动重启升级 …", 0
+        )
+        timer = _QT(self)
+        timer.timeout.connect(self._auto_swap_tick)
+        self._auto_swap_timer = timer
+        timer.start(1000)
+
+    def _auto_swap_tick(self) -> None:
+        self._auto_swap_countdown -= 1
+        if self._auto_swap_countdown <= 0:
+            self._auto_swap_timer.stop()
+            pending = self._auto_swap_pending
+            self.statusBar().showMessage("正在准备升级:创建数据快照 + 释放工作区锁 …", 0)
+            self._launch_pending_swap(pending)
+            return
+        release = self._auto_swap_release
+        self.statusBar().showMessage(
+            f"✅ v{release.version} 已下载完成,{self._auto_swap_countdown} 秒后自动重启升级 …", 0
+        )
+
+    def _launch_pending_swap_with_confirm(self, pending) -> None:
+        """统一确认 + 走 _launch_pending_swap。给一键升级 / banner / oneclick 复用。"""
+        kind = self._install_kind_safe()
+        msg = (
+            f"✅ v{pending.version} 已下载完成。\n\n"
+            f"位置：{pending.bundle_dir}\n\n"
+            "立即关闭并安装新版？\n"
+            "（升级会先创建数据快照；新版仅在重启后生效。）"
+        )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("准备升级")
+        box.setText(msg)
+        btn_now = box.addButton("立即升级（重启）", QMessageBox.YesRole)
+        box.addButton("稍后", QMessageBox.NoRole)
+        box.exec_()
+        if box.clickedButton() is btn_now:
+            self._launch_pending_swap(pending)
+
+    def _upgrade_banner_later(self) -> None:
+        banner = getattr(self, "_update_banner", None)
+        if banner is not None:
+            banner.hide()
+
+    def _upgrade_banner_skip(self) -> None:
+        release = getattr(self, "_update_banner_release", None)
+        banner = getattr(self, "_update_banner", None)
+        if release is not None:
+            settings = load_settings()
+            if release.version not in settings.auto_update_skipped_versions:
+                settings.auto_update_skipped_versions = list(
+                    settings.auto_update_skipped_versions
+                ) + [release.version]
+                save_settings(settings)
+        if banner is not None:
+            banner.hide()
+
+    # ---- D3+D11 启动入口:apply pending + sentinel 健康检查 ----
+
+    def _apply_pending_update_on_startup(self) -> None:
+        """启动时检测 pending_update.json,有就弹"立即安装并重启?"三选。"""
+        from .updater_pending import clear_pending, read_pending
+        pending = read_pending()
+        if pending is None:
+            return
+        if pending.is_stale():
+            clear_pending()
+            return
+        kind = self._install_kind_safe()
+        if kind not in ("frozen-current", "frozen-direct"):
+            # source / appimage / system-package — pending state is meaningless here.
+            # Don't clear — user might be testing; just note it.
+            self.statusBar().showMessage(
+                f"已下载 v{pending.version} 但当前运行模式 ({kind}) 不支持自动应用,请手动启动", 12000
+            )
+            return
+        msg = (
+            f"已下载新版 v{pending.version}（从 v{pending.from_version}）。\n\n"
+            f"位置：{pending.bundle_dir}\n\n"
+            "是否立即关闭软件并安装？\n"
+            "（升级会先创建数据快照；新版仅在重启后生效。）"
+        )
+        btn_install = QMessageBox.Yes
+        btn_later = QMessageBox.No
+        btn_discard = QMessageBox.Discard
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("已下载更新")
+        box.setText(msg)
+        box.addButton("立即安装并重启", QMessageBox.YesRole)
+        box.addButton("稍后", QMessageBox.NoRole)
+        box.addButton("丢弃此次更新", QMessageBox.DestructiveRole)
+        ret = box.exec_()
+        clicked = box.clickedButton()
+        if clicked is None:
+            return
+        role = box.buttonRole(clicked)
+        if role == QMessageBox.YesRole:
+            self._launch_pending_swap(pending)
+        elif role == QMessageBox.DestructiveRole:
+            clear_pending()
+            self.statusBar().showMessage(f"已丢弃待安装 v{pending.version}", 5000)
+        # NoRole: keep pending for next launch
+
+    def _install_kind_safe(self) -> str:
+        try:
+            from .install_kind import installation_kind
+            return installation_kind()
+        except Exception:
+            return "unknown"
+
+    def _launch_pending_swap(self, pending) -> None:
+        """走 D2 swap 脚本:snapshot → 释锁 → detached swap → quit。
+
+        Only the ``frozen-current`` path can do a real junction swap. For
+        ``frozen-direct`` we still launch the new exe and let the user
+        decide whether to manually enable ``current/`` later.
+        """
+        import os
+        from pathlib import Path as _P
+        from .updater_pending import clear_pending
+        from .release_manager import current_install_root
+
+        # Flush any debounced auto-saves so in-progress edits are persisted
+        # before snapshot. _flush_pending_saves is a no-op when no saves
+        # are pending — safe to call unconditionally.
+        try:
+            flusher = getattr(self, "_flush_pending_saves", None)
+            if callable(flusher):
+                flusher()
+        except Exception:
+            pass
+
+        # Mandatory pre-swap snapshot (D9 default — strict; opt-in skip later).
+        try:
+            if self.store is not None:
+                self.store.create_data_snapshot(
+                    "自动更新前快照",
+                    f"v{pending.from_version}→v{pending.version}",
+                )
+        except Exception:
+            pass
+
+        # Release the workspace lock before swap so the new process can acquire it.
+        try:
+            if self.store is not None:
+                self.store.release_lock()
+        except Exception:
+            pass
+
+        # Pick the current/ junction location.
+        install_root = current_install_root()
+        bundle_dir = _P(pending.bundle_dir)
+        if install_root is None:
+            install_root = bundle_dir.parent.parent  # releases/v0.8.0/ → releases → parent
+        current_link = install_root / "current"
+
+        try:
+            from .updater_swap import launch_swap_detached
+            launch_swap_detached(
+                pid=os.getpid(),
+                new_bundle=bundle_dir,
+                current_link=current_link,
+                new_exe_name=pending.exe_name,
+                workspace=_P(pending.workspace) if pending.workspace else None,
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "启动 swap 失败",
+                f"无法启动升级脚本：{exc}\n\n"
+                f"请手动启动 {bundle_dir / pending.exe_name}",
+            )
+            return
+
+        clear_pending()
+        # Quit the current process so the swap script can take over.
+        QApplication.instance().quit()
+
+    def _check_post_update_sentinel_on_startup(self) -> None:
+        """D11 健康回滚:若上次启动留下 sentinel(说明 30s 内挂了)弹回退。"""
+        from .updater_pending import (
+            clear_post_update_sentinel,
+            read_post_update_sentinel,
+        )
+        sentinel = read_post_update_sentinel()
+        if sentinel is None:
+            return
+        # If the sentinel was written by an earlier successful run that
+        # _did_ clear at the 30 s mark, it's gone — so any sentinel found
+        # at startup means the previous launch did not survive 30 s.
+        reply = QMessageBox.warning(
+            self, "升级后启动失败",
+            f"上次启动 v{sentinel.current_version} 似乎在 30 秒内异常退出。\n"
+            f"是否回退到 v{sentinel.from_version}？",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            # Best-effort reverse swap — actual swap-back wiring deferred to v0.8.1.
+            QMessageBox.information(
+                self, "回退",
+                "回退流程将在 v0.8.1 完整实现。\n"
+                f"请在 升级 → 高级 → 历史版本管理 选 v{sentinel.from_version} 手动启动。",
+            )
+        clear_post_update_sentinel()
+
+    def _arm_post_update_sentinel(self) -> None:
+        """新版启动 30s 内未崩 → 清 sentinel。配合 D11 健康回滚机制。"""
+        from .updater_pending import clear_post_update_sentinel
+        QTimer.singleShot(30000, clear_post_update_sentinel)
 
     # ---- Settings ----
 

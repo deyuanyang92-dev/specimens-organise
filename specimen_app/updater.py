@@ -15,6 +15,8 @@ import platform
 import re
 import shutil
 import ssl
+import subprocess
+import sys
 import tempfile
 import urllib.error
 import urllib.parse
@@ -170,12 +172,40 @@ def _platform_key() -> str:
     return "linux"
 
 
-def check_latest_release(timeout: int = _TIMEOUT) -> LatestRelease | None:
-    """查询仓库最新 release。无可用 release 返回 None，网络/解析错误抛 UpdateError。"""
+def check_latest_release(
+    timeout: int = _TIMEOUT,
+    *,
+    platform_override: str | None = None,
+    channel: str = "stable",
+) -> LatestRelease | None:
+    """查询仓库最新 release。无可用 release 返回 None，网络/解析错误抛 UpdateError。
+
+    platform_override: D5 跨平台分发 — 强制选 ``"windows"`` / ``"linux"`` /
+        ``"macos"`` 的包，不按当前 ``sys.platform`` 自动选。
+    channel: D18 Claude Code 风 channel 切换 — ``"stable"`` 取
+        ``/releases/latest`` (默认), ``"prerelease"`` 改成 ``/releases`` 列表
+        过滤 ``prerelease: true`` 最新一项。
+    """
+    if channel == "prerelease":
+        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=20"
+    else:
+        api_url = _API_LATEST
     try:
-        payload = json.loads(_http_get(_API_LATEST, timeout=timeout).decode("utf-8"))
+        raw = _http_get(api_url, timeout=timeout).decode("utf-8")
+        payload = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise UpdateError(f"无法解析 GitHub 返回内容：{exc}") from exc
+
+    if channel == "prerelease":
+        if not isinstance(payload, list):
+            return None
+        candidates = [
+            entry for entry in payload
+            if isinstance(entry, dict) and entry.get("prerelease") is True
+        ]
+        if not candidates:
+            return None
+        payload = candidates[0]
 
     tag = str(payload.get("tag_name", "") or "").strip()
     if not tag:
@@ -183,7 +213,9 @@ def check_latest_release(timeout: int = _TIMEOUT) -> LatestRelease | None:
     version = tag[1:] if tag.lower().startswith("v") else tag
 
     assets = payload.get("assets") or []
-    plat = _platform_key()
+    plat = (platform_override or _platform_key()).lower()
+    if plat not in ("windows", "linux", "macos"):
+        raise UpdateError(f"不支持的平台：{plat}")
     zip_url = zip_name = ""
     for asset in assets:
         name = str(asset.get("name", "") or "")
@@ -498,3 +530,329 @@ def download_update(
         return target_dir, incremental
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# D1 stable-entry helpers: current/ junction (Windows) / symlink (Linux)
+# --------------------------------------------------------------------------- #
+
+
+def make_current_symlink(install_root: Path, bundle_dir: Path) -> bool:
+    """Atomically (re)point ``install_root/current`` at ``bundle_dir`` via
+    a POSIX symlink.
+
+    Returns True on success. Returns False (and leaves the existing link
+    untouched) when the underlying filesystem doesn't support symlinks
+    (e.g. FAT/exFAT) — the caller should fall back to a rename swap.
+    """
+    install_root = Path(install_root)
+    bundle_dir = Path(bundle_dir).resolve()
+    if not bundle_dir.is_dir():
+        raise UpdateError(f"bundle directory not found: {bundle_dir}")
+    install_root.mkdir(parents=True, exist_ok=True)
+    current_link = install_root / "current"
+    tmp_link = install_root / f".current.{os.getpid()}.tmp"
+    if tmp_link.exists() or tmp_link.is_symlink():
+        tmp_link.unlink()
+    try:
+        os.symlink(bundle_dir, tmp_link)
+    except (OSError, NotImplementedError):
+        return False
+    try:
+        os.replace(tmp_link, current_link)
+    except OSError:
+        # Some filesystems refuse to replace a non-symlink directory with a
+        # symlink via os.replace; remove and retry.
+        if current_link.exists() or current_link.is_symlink():
+            try:
+                if current_link.is_symlink() or current_link.is_file():
+                    current_link.unlink()
+                else:
+                    shutil.rmtree(current_link)
+            except OSError:
+                tmp_link.unlink(missing_ok=True)
+                return False
+        try:
+            os.replace(tmp_link, current_link)
+        except OSError:
+            tmp_link.unlink(missing_ok=True)
+            return False
+    return True
+
+
+def make_current_junction(install_root: Path, bundle_dir: Path) -> bool:
+    """(Re)point ``install_root\\current`` at ``bundle_dir`` via a Windows
+    NTFS directory junction.
+
+    Junctions are local-only and require no admin rights; they work for any
+    NTFS volume. Returns True on success, False when the FS doesn't support
+    junctions (FAT/exFAT) — caller should fall back to rename swap.
+    """
+    install_root = Path(install_root)
+    bundle_dir = Path(bundle_dir).resolve()
+    if not bundle_dir.is_dir():
+        raise UpdateError(f"bundle directory not found: {bundle_dir}")
+    install_root.mkdir(parents=True, exist_ok=True)
+    current_link = install_root / "current"
+
+    # mklink /J refuses to overwrite — remove first. Use rmdir (safe for
+    # junctions: removes the link itself, not the target).
+    if current_link.exists() or current_link.is_symlink():
+        try:
+            if current_link.is_dir() and not current_link.is_symlink():
+                # Plain directory (no prior junction) — remove via rmtree.
+                # Caller should have already moved any content of value out.
+                subprocess.run(
+                    ["cmd", "/c", "rmdir", "/S", "/Q", str(current_link)],
+                    check=True, capture_output=True,
+                )
+            else:
+                subprocess.run(
+                    ["cmd", "/c", "rmdir", str(current_link)],
+                    check=True, capture_output=True,
+                )
+        except subprocess.CalledProcessError:
+            return False
+
+    try:
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(current_link), str(bundle_dir)],
+            check=True, capture_output=True,
+        )
+    except subprocess.CalledProcessError:
+        return False
+    return True
+
+
+def repoint_current(install_root: Path, bundle_dir: Path) -> bool:
+    """Cross-platform atomic ``current/`` repoint dispatcher.
+
+    Returns True on success. False return signals the caller to fall back
+    to the rename-swap strategy (rename old bundle → .bak, move new bundle
+    to a stable name).
+    """
+    if sys.platform == "win32":
+        return make_current_junction(install_root, bundle_dir)
+    return make_current_symlink(install_root, bundle_dir)
+
+
+# --------------------------------------------------------------------------- #
+# D4 local-zip probe + import
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class ZipProbe:
+    """Result of inspecting a downloaded / sneaker-netted update zip."""
+    kind: str            # "full" | "app-only" | "unknown"
+    version: str         # parsed from the bundle dir name, "" if unknown
+    platform: str        # "windows" | "linux" | "macos" | "" if unknown
+    runtime_hash: str    # 12-char hash for app-only zips, "" otherwise
+    bundle_dir_name: str  # top-level dir name inside the zip, "" if flat
+
+
+def _probe_zip_filename_platform(name: str) -> str:
+    """Best-effort platform guess from a zip filename like
+    ``setup_v0.7.0_windows.zip`` or ``app_v0.7.0_linux.zip``.
+    """
+    lower = name.lower()
+    if "windows" in lower:
+        return "windows"
+    if "linux" in lower:
+        return "linux"
+    if "macos" in lower or "darwin" in lower:
+        return "macos"
+    return ""
+
+
+def _probe_zip_filename_version(name: str) -> str:
+    """Extract X.Y.Z from a zip filename like ``setup_v0.7.0_windows.zip``."""
+    m = re.search(r"v?(\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?)", name)
+    return m.group(1) if m else ""
+
+
+def probe_zip(zip_path: Path | str) -> ZipProbe:
+    """Inspect ``zip_path`` and classify it as a full setup bundle, an
+    app-only delta, or unknown. Does not extract.
+
+    Detection rules:
+    - Full bundle: contains a top-level dir ``<APP_NAME>_v*`` with an exe
+      directly inside.
+    - App-only: contains a top-level dir ``<APP_NAME>_v*`` with
+      ``.update_meta.json`` listing ``app_files`` but missing any
+      ``_internal/PyQt5`` / ``_internal/python`` runtime markers.
+    - Anything else: ``"unknown"``.
+
+    Filename hints (``setup_*_<platform>.zip`` / ``app_*_<platform>.zip``)
+    populate the platform / version best-effort even when the zip is
+    malformed enough that members can't be read.
+    """
+    zip_path = Path(zip_path)
+    if not zip_path.is_file():
+        raise UpdateError(f"未找到 zip 文件：{zip_path}")
+    plat = _probe_zip_filename_platform(zip_path.name)
+    version = _probe_zip_filename_version(zip_path.name)
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            names = zf.namelist()
+            if not names:
+                return ZipProbe("unknown", version, plat, "", "")
+            top = names[0].split("/", 1)[0]
+            bundle_prefix = f"{APP_NAME}_v"
+            looks_bundled = top.startswith(bundle_prefix)
+            has_meta = any(n.endswith(f"{top}/.update_meta.json") for n in names)
+            has_exe_at_top = any(
+                n == f"{top}/{top}.exe" or n == f"{top}/{top}"
+                or (n.startswith(f"{top}/{APP_NAME}") and "/" not in n[len(top) + 1:])
+                for n in names
+            )
+            has_runtime = any(
+                f"{top}/_internal/PyQt5" in n or f"{top}/_internal/python" in n
+                for n in names
+            )
+            runtime_hash = ""
+            if has_meta:
+                try:
+                    with zf.open(f"{top}/.update_meta.json") as fh:
+                        meta = json.loads(fh.read().decode("utf-8"))
+                    runtime_hash = str(meta.get("runtime_hash", "") or "")
+                    if not version:
+                        version = str(meta.get("version", "") or "")
+                except (KeyError, json.JSONDecodeError, UnicodeDecodeError):
+                    pass
+
+            if looks_bundled and has_exe_at_top and has_runtime:
+                return ZipProbe("full", version, plat, runtime_hash, top)
+            if looks_bundled and has_meta and not has_runtime:
+                return ZipProbe("app-only", version, plat, runtime_hash, top)
+            return ZipProbe("unknown", version, plat, runtime_hash, top)
+    except zipfile.BadZipFile as exc:
+        raise UpdateError(f"zip 文件已损坏：{exc}") from exc
+
+
+def import_local_zip(
+    zip_path: Path | str,
+    dest_root: Path | str,
+    *,
+    expected_platform: str | None = None,
+    sha256_path: Path | str | None = None,
+    progress_cb: Callable[[int], None] | None = None,
+) -> tuple[Path, ZipProbe]:
+    """Install an update from a local zip without going through GitHub.
+
+    Used by D4 "从本地文件安装更新" — same security model as
+    :func:`download_release`: sha256 (when supplied) is verified, zip-slip
+    is blocked, extraction goes to a temp dir first then atomic-moves
+    into ``dest_root / v{version}/``.
+
+    ``expected_platform`` (``"windows"`` / ``"linux"`` / ``"macos"``) lets
+    the caller reject a wrong-OS zip up front.
+
+    Returns ``(target_dir, probe)``. Raises :class:`UpdateError` for any
+    mismatch or extraction failure.
+    """
+    zip_path = Path(zip_path)
+    probe = probe_zip(zip_path)
+    if probe.kind == "unknown":
+        raise UpdateError(
+            "无法识别该 zip 类型。请确认是 标本入库管理 的完整安装包（setup_v*.zip）"
+            "或应用增量包（app_v*.zip）。"
+        )
+    if probe.kind == "app-only":
+        raise UpdateError(
+            "导入应用增量包 (app_v*.zip) 暂不支持。v0.8.0 仅接受完整安装包"
+            " (setup_v*.zip)。"
+        )
+    if expected_platform and probe.platform and probe.platform != expected_platform:
+        raise UpdateError(
+            f"平台不匹配：zip 是 {probe.platform},当前系统是 {expected_platform}。"
+        )
+    if sha256_path:
+        sha256_path = Path(sha256_path)
+        if not sha256_path.is_file():
+            raise UpdateError(f"未找到 sha256 校验文件：{sha256_path}")
+        expected_hash = _extract_expected_hash(
+            sha256_path.read_text(encoding="utf-8"), zip_path.name
+        )
+        if not expected_hash:
+            raise UpdateError(f"sha256 文件 {sha256_path.name} 内未找到对应条目。")
+        _verify_sha256(zip_path, expected_hash)
+
+    dest_root = Path(dest_root)
+    dest_root.mkdir(parents=True, exist_ok=True)
+    version = probe.version or "unknown"
+    target_dir = dest_root / f"v{version}"
+    if target_dir.exists():
+        raise UpdateError(f"目标目录已存在：{target_dir}。请先删除或选其他位置。")
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="specimen_import_"))
+    try:
+        if progress_cb:
+            progress_cb(20)
+        _safe_extract(zip_path, tmp_dir)
+        if progress_cb:
+            progress_cb(85)
+        staging = tmp_dir / probe.bundle_dir_name
+        if not staging.exists():
+            raise UpdateError("zip 解压结果与探测不符,可能已损坏。")
+        # mirror download_release: move the bundle dir under target_dir.
+        target_dir.mkdir(parents=True, exist_ok=False)
+        for item in staging.iterdir():
+            shutil.move(str(item), str(target_dir / item.name))
+        if progress_cb:
+            progress_cb(100)
+        return target_dir, probe
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# D5 cross-platform installer download (for sneaker-net distribution)
+# --------------------------------------------------------------------------- #
+
+
+def download_assets_for_distribution(
+    release: LatestRelease,
+    dest_dir: Path | str,
+    *,
+    include_sha256: bool = True,
+    include_manifest: bool = True,
+    progress_cb: Callable[[int], None] | None = None,
+) -> list[Path]:
+    """Download the GitHub release's full setup zip (and optionally its
+    sha256 / manifest) into ``dest_dir`` without extracting.
+
+    Used by D5 "下载安装包供分发": admin on a Windows box wants the Linux
+    setup zip to USB-stick over to an offline Linux machine.
+    """
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+
+    zip_dest = dest_dir / release.zip_name
+    if progress_cb:
+        progress_cb(0)
+    _download_to(release.zip_url, zip_dest, _scaled_cb(progress_cb, 0, 80))
+    written.append(zip_dest)
+
+    if include_sha256 and release.sha256_url:
+        sha_dest = dest_dir / f"{release.zip_name}.sha256"
+        _download_to(release.sha256_url, sha_dest, _scaled_cb(progress_cb, 80, 90))
+        written.append(sha_dest)
+        # belt-and-braces: verify what we just wrote.
+        expected = _extract_expected_hash(
+            sha_dest.read_text(encoding="utf-8"), release.zip_name
+        )
+        if expected:
+            _verify_sha256(zip_dest, expected)
+
+    if include_manifest and release.manifest_url:
+        manifest_dest = dest_dir / Path(
+            urllib.parse.urlparse(release.manifest_url).path
+        ).name
+        _download_to(release.manifest_url, manifest_dest, _scaled_cb(progress_cb, 90, 100))
+        written.append(manifest_dest)
+
+    if progress_cb:
+        progress_cb(100)
+    return written

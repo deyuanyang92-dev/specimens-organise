@@ -51,6 +51,25 @@ def _find_executable(directory: Path) -> Path | None:
     return None
 
 
+def current_install_root() -> Path | None:
+    """Return the install root above the ``current/`` junction when the
+    running process is launched through it. ``None`` otherwise.
+
+    Used by the D1 upgrade-swap mechanism to locate where the junction
+    should be repointed.
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    exe = Path(sys.executable)
+    if exe.parent.name != "current":
+        return None
+    return exe.parent.parent
+
+
+def is_running_from_current_link() -> bool:
+    return current_install_root() is not None
+
+
 def list_releases(workspace_root: Path | str) -> list[ReleaseInfo]:
     releases: list[ReleaseInfo] = []
     for releases_root in release_roots(workspace_root):

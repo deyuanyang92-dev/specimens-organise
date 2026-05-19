@@ -246,6 +246,12 @@ def build_release(version: str, project_root: Path, icon_path: Path | None = Non
 
     # update_manifest_{platform}.json：release 级资产，客户端据此决定增量/完整下载。
     # 按平台命名，避免多平台 CI 互相覆盖。
+    # v0.8.0 新增 D14 强制升级 + D17 数据 schema 迁移闸字段;
+    # 老版本客户端缺这俩字段时按"不限制"+"不升 schema"对待,保留向后兼容。
+    try:
+        from specimen_app.models import CURRENT_DATA_SCHEMA_VERSION as _SCHEMA_TARGET
+    except Exception:
+        _SCHEMA_TARGET = "1.0.0"
     manifest_name = f"update_manifest_{platform_tag}.json"
     (release_dir / manifest_name).write_text(
         json.dumps(
@@ -258,6 +264,14 @@ def build_release(version: str, project_root: Path, icon_path: Path | None = Non
                 "runtime_sha256": runtime_zip_digest,
                 "runtime_hash": runtime_hash,
                 "app_files": app_files,
+                # D14 强制升级 — v0.8.0 默认普通版本,后续 release 可改 mandatory/criticality
+                # 或加 min_app_version 来标安全补丁强制升级
+                "mandatory": False,
+                "min_app_version": "",
+                "criticality": "normal",
+                # D17 数据 schema 迁移闸 — 客户端 swap 前比对工作区 data_schema_version
+                "data_schema_version_required": "1.0.0",
+                "data_schema_version_target": _SCHEMA_TARGET,
             },
             ensure_ascii=False, indent=2,
         ),
