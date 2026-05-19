@@ -227,8 +227,9 @@ def check_latest_release(
                 and not nl.startswith("app_") and not nl.startswith("runtime_")):
             zip_url, zip_name = url, name
             break
-    if not zip_url:
-        raise UpdateError(f"该版本未提供适用于当前系统（{plat}）的下载包。")
+    # v0.8.0 修:不再在缺包时直接 raise。返回 LatestRelease 让调用方先比版本号 ——
+    # 若当前 == 最新即"已是最新"(常见正常路径),不应误报"下载错误"。
+    # 仅当调用方真要下载且 zip_url 为空时,download_release / download_update 抛 UpdateError。
 
     sha256_url: str | None = None
     manifest_url: str | None = None
@@ -318,6 +319,13 @@ def download_release(
 
     全程在临时目录操作，sha256 校验通过后才移入正式位置；失败则清理临时文件。
     """
+    if not release.zip_url:
+        # v0.8.0 修:check_latest_release 不再在缺包时 raise(以便 is_newer 比较先走)。
+        # 真要下载时若 zip_url 仍为空 → 多半 CI 构建未完成,给可执行错误。
+        raise UpdateError(
+            f"v{release.version} 的安装包尚未就绪（GitHub Release 中未找到对应平台的 zip 资产）。\n"
+            "可能是 GitHub Actions 构建未完成；请稍后重试。"
+        )
     _validate_url(release.zip_url)
     dest_root = Path(dest_root)
     target_dir = dest_root / f"v{release.version}"

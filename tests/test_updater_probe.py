@@ -167,5 +167,43 @@ class ImportLocalZipTests(unittest.TestCase):
         self.assertIn("目标目录已存在", str(cm.exception))
 
 
+class CheckLatestReleaseNoAssetTests(unittest.TestCase):
+    """v0.8.0 修:check_latest_release 看到 tag 但缺平台 zip → 仍返回 LatestRelease
+    (zip_url 空),让 is_newer 比较优先。download_release 真要下载时才报"包未就绪"。
+    避免 已是最新 误报"下载错误"。
+    """
+
+    def test_returns_release_with_empty_zip_url_when_no_asset(self):
+        from unittest import mock
+        from specimen_app import updater
+        fake_payload = {
+            "tag_name": "v0.8.0",
+            "body": "stub notes",
+            "assets": [
+                # 仅一个非匹配平台的 zip
+                {"name": "setup_v0.8.0_macos.zip",
+                 "browser_download_url": "https://github.com/foo/bar/releases/download/v0.8.0/setup_v0.8.0_macos.zip"},
+            ],
+        }
+        with mock.patch.object(updater, "_http_get",
+                                return_value=json.dumps(fake_payload).encode("utf-8")):
+            release = updater.check_latest_release(platform_override="linux")
+        self.assertIsNotNone(release)
+        self.assertEqual(release.version, "0.8.0")
+        self.assertEqual(release.zip_url, "")  # 关键:不再 raise,zip_url 空字串
+
+    def test_download_release_raises_helpful_error_when_zip_url_empty(self):
+        import tempfile
+        from specimen_app import updater
+        empty_release = updater.LatestRelease(
+            version="0.8.0", tag="v0.8.0",
+            zip_url="", zip_name="", sha256_url=None, notes="", manifest_url=None,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(updater.UpdateError) as cm:
+                updater.download_release(empty_release, Path(tmp))
+        self.assertIn("尚未就绪", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
