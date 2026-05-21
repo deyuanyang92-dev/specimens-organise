@@ -464,9 +464,9 @@ TOOLBAR_ACTIONS: dict[str, dict] = {
     "workload_report":   {"label": "入库人员记录","slot": "_open_workload_report",  "category": "ingest",
                           "icon": "SP_FileDialogDetailedView",
                           "tooltip": "入库人员工作量统计 (PersonsManagerDialog Tab 2)"},
-    "series_manager":    {"label": "编号系列",   "slot": "_open_series_manager",   "category": "ingest",
+    "series_manager":    {"label": "编号系列管理", "slot": "_open_series_manager",  "category": "ingest",
                           "icon": "SP_DialogApplyButton",
-                          "tooltip": "入库编号系列管理(新增/编辑/删除)"},
+                          "tooltip": "编号系列管理(新增/编辑/删除)"},
     "batch_generate":    {"label": "批量生成编号","slot": "_open_batch_generate",   "category": "edit",
                           "icon": "SP_ArrowRight",
                           "tooltip": "批量预留入库编号段 + 导出 xlsx/csv"},
@@ -1798,7 +1798,7 @@ class SpecimenWindow(QMainWindow):
         self._series_selector.currentIndexChanged.connect(self._on_series_selector_changed)
         series_row.addWidget(self._series_selector, stretch=1)
         manage_series_btn = QPushButton("管理")
-        manage_series_btn.setToolTip("管理入库编号系列（新增/编辑/删除）")
+        manage_series_btn.setToolTip("编号系列管理（新增/编辑/删除）")
         manage_series_btn.setFixedWidth(44)
         manage_series_btn.clicked.connect(self._open_series_manager)
         series_row.addWidget(manage_series_btn)
@@ -2097,21 +2097,21 @@ class SpecimenWindow(QMainWindow):
             menu.addAction(act)
             return act
 
-        # 顶层「入库」菜单
+        # 顶层「入库」菜单 — 只留汇总 + 人员（编号相关功能全部归「编号」菜单）。
         ingest_menu = _make_menu("入库")
         _add(ingest_menu, "入库汇总", self.open_ingest_summary, "ingest_summary")
-        _add(ingest_menu, "入库编号系列管理…", self._open_series_manager, "series_manager")
         ingest_menu.addSeparator()
         _add(ingest_menu, "入库人员管理…", self._open_persons_manager, "persons_manager")
         _add(ingest_menu, "入库人员记录…", self._open_workload_report, "workload_report")
 
-        # 顶层「编号」菜单
+        # 顶层「编号」菜单 — 收齐所有编号功能：系列管理 / 切换系列 / 批量生成 / 手动添加。
         number_menu = _make_menu("编号")
-        _add(number_menu, "批量生成编号…", self._open_batch_generate, "batch_generate")
-        _add(number_menu, "手动添加入库编号…", self._open_manual_voucher, "manual_voucher")
-        number_menu.addSeparator()
+        _add(number_menu, "编号系列管理…", self._open_series_manager, "series_manager")
         self._series_switch_menu = number_menu.addMenu("切换活动系列")
         self._series_switch_menu.aboutToShow.connect(self._populate_series_switch_menu)
+        number_menu.addSeparator()
+        _add(number_menu, "批量生成编号…", self._open_batch_generate, "batch_generate")
+        _add(number_menu, "手动添加编号…", self._open_manual_voucher, "manual_voucher")
 
         # 顶层「WoRMS」菜单
         worms_menu = _make_menu("WoRMS")
@@ -8461,7 +8461,7 @@ class AccessionSeriesDialog(QDialog):
     def __init__(self, store: "ExcelStore", parent: QWidget | None = None):
         super().__init__(parent)
         self.store = store
-        self.setWindowTitle("入库编号系列管理")
+        self.setWindowTitle("编号系列管理")
         self.setMinimumWidth(560)
         self._build_ui()
         self._refresh()
