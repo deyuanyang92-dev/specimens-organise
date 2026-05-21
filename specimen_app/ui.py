@@ -42,6 +42,7 @@ from PyQt5.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QStatusBar,
@@ -1787,21 +1788,27 @@ class SpecimenWindow(QMainWindow):
         self._new_voucher_btn.setToolTip("请先开始录入任务")
         self._new_voucher_btn.clicked.connect(self.new_specimen)
         voucher_layout.addWidget(self._new_voucher_btn)
-        # 行2：编号系列 下拉 + 管理
+        # 行2：编号系列 下拉 + 管理。
+        # 关键:下拉框 hard-cap maxWidth + 无 stretch + 末尾 addStretch —— 三者合力让
+        # 下拉框不会无限拉伸,「管理」按钮永远紧挨下拉框、不被挤走。
+        # (旧:下拉 stretch=1 无 maxWidth → 吞掉整行宽度,把管理按钮顶到面板边缘。)
         series_row = QHBoxLayout()
         series_row.setSpacing(4)
         series_row.addWidget(QLabel("编号系列"))
         self._series_selector = QComboBox()
         self._series_selector.setToolTip("选择入库编号系列（当前系列用于新增编号）")
-        self._series_selector.setMinimumWidth(70)
+        self._series_selector.setMinimumWidth(90)
+        self._series_selector.setMaximumWidth(160)
+        self._series_selector.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         self._refresh_series_selector()
         self._series_selector.currentIndexChanged.connect(self._on_series_selector_changed)
-        series_row.addWidget(self._series_selector, stretch=1)
+        series_row.addWidget(self._series_selector)
         manage_series_btn = QPushButton("管理")
         manage_series_btn.setToolTip("编号系列管理（新增/编辑/删除）")
         manage_series_btn.setFixedWidth(44)
         manage_series_btn.clicked.connect(self._open_series_manager)
         series_row.addWidget(manage_series_btn)
+        series_row.addStretch(1)
         voucher_layout.addLayout(series_row)
         # Search + quick filter
         filter_row = QHBoxLayout()
