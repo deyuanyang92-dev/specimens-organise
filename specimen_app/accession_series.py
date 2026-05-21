@@ -22,6 +22,14 @@ class AccessionSeries:
     def from_dict(cls, data: dict[str, Any]) -> AccessionSeries:
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
+    def is_custom(self) -> bool:
+        """前缀为空 → 完全自定义系列：不自动生成编号，新增时手动输入。
+
+        用户可建一个前缀/流水号留空的系列，表示"这批编号我自己手输"。
+        激活这种系列后点「＋ 新增编号」会弹手动输入，而非自增。
+        """
+        return not (self.prefix or "").strip()
+
 
 def format_series_number(series: AccessionSeries, counter: int | None = None) -> str:
     """生成一个编号字符串，逻辑同 accession_number_tool.py:build_number()。"""
@@ -37,6 +45,8 @@ def format_series_number(series: AccessionSeries, counter: int | None = None) ->
     else:
         parts = [series.prefix, num]
 
+    # 过滤空段:前缀留空(完全自定义系列)时不产生悬空分隔符。
+    parts = [p for p in parts if p]
     if sep:
         return sep.join(parts)
     return "".join(parts)

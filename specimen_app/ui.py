@@ -3389,6 +3389,17 @@ class SpecimenWindow(QMainWindow):
     #     except Exception:
     #         pass  # 持久化失败不影响本次会话内的开关状态
 
+    def _active_series_is_custom(self) -> bool:
+        """当前激活的编号系列是否为"完全自定义"（前缀留空 → 手动输入编号）。"""
+        try:
+            active = self.store.get_active_series_name()
+            if active == "YZZ":
+                return False
+            series = self.store._get_series_config(active)
+            return series is not None and series.is_custom()
+        except Exception:
+            return False
+
     def new_specimen(self) -> None:
         # 原逻辑：create_specimen() -> refresh_list() -> select_voucher()，新记录字段全空。
         # 现在：新增入库编号时把上一条的标本信息字段（CARRY_OVER_SPECIMEN_FIELDS）
@@ -3412,7 +3423,21 @@ class SpecimenWindow(QMainWindow):
                     for field in CARRY_OVER_SPECIMEN_FIELDS
                     if str(prev.get(field, "")).strip()
                 }
-            voucher = self.store.create_specimen()
+            # 完全自定义系列(前缀留空)→ 手动输入编号,不走自增;否则按系列规则自动生成。
+            if self._active_series_is_custom():
+                text, ok = QInputDialog.getText(
+                    self, "新增入库编号",
+                    "当前为完全自定义系列，请输入入库编号：",
+                )
+                if not ok:
+                    return
+                text = text.strip()
+                if not text:
+                    QMessageBox.information(self, "新增入库编号", "入库编号不能为空。")
+                    return
+                voucher = self.store.create_specimen_with_voucher(text)
+            else:
+                voucher = self.store.create_specimen()
             if carry:
                 self.store.set_fields("specimen", voucher, carry)
             if self._active_task:
@@ -8526,13 +8551,18 @@ class AccessionSeriesDialog(QDialog):
         for idx, item_dict in enumerate(series_list):
             row = idx + 1
             s = AccessionSeries.from_dict(item_dict)
-            example = format_series_number(s, s.next_counter)
             distributed = self.store.count_vouchers_by_series(s.name)
+            if s.is_custom():
+                # 完全自定义系列:无自增规则,示例/下一号/步长以占位文字表示。
+                example, next_text, step_text = "（手动输入）", "—", "—"
+            else:
+                example = format_series_number(s, s.next_counter)
+                next_text, step_text = str(s.next_counter), str(s.step)
             self._list.setItem(row, 0, QTableWidgetItem(s.name))
             self._list.setItem(row, 1, QTableWidgetItem(example))
             self._list.setItem(row, 2, QTableWidgetItem(str(distributed)))
-            self._list.setItem(row, 3, QTableWidgetItem(str(s.next_counter)))
-            self._list.setItem(row, 4, QTableWidgetItem(str(s.step)))
+            self._list.setItem(row, 3, QTableWidgetItem(next_text))
+            self._list.setItem(row, 4, QTableWidgetItem(step_text))
 
         self._on_selection_changed()
 
@@ -8623,7 +8653,11 @@ class _SeriesEditDialog(QDialog):
         form.addRow("系列名称：", self._name_edit)
 
         self._prefix_edit = QLineEdit(series.prefix if series else "")
-        self._prefix_edit.setPlaceholderText("如：BMNH")
+        self._prefix_edit.setPlaceholderText("如：BMNH（留空 = 完全自定义，新增时手动输入）")
+        self._prefix_edit.setToolTip(
+            "前缀留空 → 完全自定义系列：激活后点「＋ 新增编号」会弹手动输入框，\n"
+            "不自动生成编号。适合编号规则不固定、需要逐条手输的场景。"
+        )
         form.addRow("前缀：", self._prefix_edit)
 
         self._digits_spin = QSpinBox()
@@ -8697,6 +8731,9 @@ class _SeriesEditDialog(QDialog):
     def _update_preview(self) -> None:
         try:
             s = self._build_series()
+            if s.is_custom():
+                self._preview_label.setText("预览：完全自定义系列 — 新增编号时手动输入")
+                return
             preview = format_series_number(s, s.next_counter)
             self._preview_label.setText(f"预览：{preview}")
         except Exception:
@@ -8718,9 +8755,7 @@ class _SeriesEditDialog(QDialog):
         if not series.name:
             QMessageBox.warning(self, "提示", "请填写系列名称。")
             return
-        if not series.prefix:
-            QMessageBox.warning(self, "提示", "请填写前缀。")
-            return
+        # 前缀可留空 —— 留空即"完全自定义系列",新增编号时手动输入(见 AccessionSeries.is_custom)。
         if series.prefix.upper() == "YZZ":
             QMessageBox.warning(self, "提示", "YZZ 系列由系统专属管理，不可在此配置。")
             return
