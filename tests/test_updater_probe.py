@@ -197,12 +197,39 @@ class CheckLatestReleaseNoAssetTests(unittest.TestCase):
         from specimen_app import updater
         empty_release = updater.LatestRelease(
             version="0.8.0", tag="v0.8.0",
-            zip_url="", zip_name="", sha256_url=None, notes="", manifest_url=None,
+            zip_url="", zip_name="", sha256_url=None, notes="",
         )
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(updater.UpdateError) as cm:
                 updater.download_release(empty_release, Path(tmp))
         self.assertIn("尚未就绪", str(cm.exception))
+
+    def test_picks_setup_zip_skips_update_only_assets(self):
+        """check_latest_release 必须选 setup_*,跳过 update-only_app/runtime 增量包。
+
+        增量包不含 Python 运行时,误选会让用户下到无法运行的包。
+        """
+        from unittest import mock
+        from specimen_app import updater
+        fake_payload = {
+            "tag_name": "v0.9.0",
+            "body": "notes",
+            "assets": [
+                # 增量包排在前面 — 旧黑名单逻辑改名后会失效,必须靠 setup_ 白名单
+                {"name": "update-only_app_v0.9.0_windows.zip",
+                 "browser_download_url": "https://github.com/foo/bar/x/update-only_app_v0.9.0_windows.zip"},
+                {"name": "update-only_runtime_windows_abc123.zip",
+                 "browser_download_url": "https://github.com/foo/bar/x/update-only_runtime_windows_abc123.zip"},
+                {"name": "setup_v0.9.0_windows.zip",
+                 "browser_download_url": "https://github.com/foo/bar/x/setup_v0.9.0_windows.zip"},
+            ],
+        }
+        with mock.patch.object(updater, "_http_get",
+                                return_value=json.dumps(fake_payload).encode("utf-8")):
+            release = updater.check_latest_release(platform_override="windows")
+        self.assertIsNotNone(release)
+        self.assertEqual(release.zip_name, "setup_v0.9.0_windows.zip")
+        self.assertTrue(release.zip_url.endswith("setup_v0.9.0_windows.zip"))
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from hashlib import sha256
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Callable
 
 from . import __version__
@@ -36,8 +36,6 @@ _API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 _USER_AGENT = f"specimen-inventory-updater/{__version__}"
 _TIMEOUT = 10
 _ALLOWED_HOSTS = ("github.com", "githubusercontent.com")
-# 增量更新：bundle 目录内的元数据文件名，与 build_release.py 的 APP_META_FILE 保持一致。
-APP_META_FILE = ".update_meta.json"
 
 
 class UpdateError(Exception):
@@ -52,22 +50,6 @@ class LatestRelease:
     zip_name: str         # 完整下载包文件名
     sha256_url: str | None  # 对应的 sha256 校验文件 URL（可能为 None）
     notes: str            # release 说明正文
-    manifest_url: str | None = None  # 增量更新清单 update_manifest_{plat}.json 的 URL（老 release 为 None）
-
-
-@dataclass(frozen=True)
-class UpdatePlan:
-    """从 update_manifest_{plat}.json 解析出的增量更新计划。"""
-    version: str
-    platform: str
-    app_zip_url: str
-    app_zip_name: str
-    app_sha256: str
-    runtime_zip_url: str
-    runtime_zip_name: str
-    runtime_sha256: str
-    runtime_hash: str
-    app_files: tuple[str, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -220,26 +202,22 @@ def check_latest_release(
     for asset in assets:
         name = str(asset.get("name", "") or "")
         url = str(asset.get("browser_download_url", "") or "")
-        # 旧：第一个含平台名的 .zip 就选中。新版 release 有 app_*、runtime_* 增量包，
-        # 如果它们排在前面会被误选为全量 fallback 包。明确跳过增量包前缀。
+        # 完整安装包永远是 setup_v{ver}_{plat}.zip。用白名单(startswith setup_)精确匹配,
+        # 不再用黑名单跳过 app_/runtime_ —— 增量包已改 update-only_ 前缀,黑名单会失效。
         nl = name.lower()
-        if (nl.endswith(".zip") and plat in nl
-                and not nl.startswith("app_") and not nl.startswith("runtime_")):
+        if nl.startswith("setup_") and nl.endswith(".zip") and plat in nl:
             zip_url, zip_name = url, name
             break
     # v0.8.0 修:不再在缺包时直接 raise。返回 LatestRelease 让调用方先比版本号 ——
     # 若当前 == 最新即"已是最新"(常见正常路径),不应误报"下载错误"。
-    # 仅当调用方真要下载且 zip_url 为空时,download_release / download_update 抛 UpdateError。
+    # 仅当调用方真要下载且 zip_url 为空时,download_release 抛 UpdateError。
 
     sha256_url: str | None = None
-    manifest_url: str | None = None
-    manifest_name = f"update_manifest_{plat}.json"
     for asset in assets:
         name = str(asset.get("name", "") or "")
         if name == f"{zip_name}.sha256":
             sha256_url = str(asset.get("browser_download_url", "") or "")
-        elif name == manifest_name:
-            manifest_url = str(asset.get("browser_download_url", "") or "")
+            break
 
     return LatestRelease(
         version=version,
@@ -248,7 +226,6 @@ def check_latest_release(
         zip_name=zip_name,
         sha256_url=sha256_url,
         notes=str(payload.get("body", "") or ""),
-        manifest_url=manifest_url,
     )
 
 
@@ -374,16 +351,9 @@ def _asset_url(tag: str, name: str) -> str:
     )
 
 
-def _validate_rel_path(rel: str) -> None:
-    """校验 bundle 内相对路径不逃逸（防止 .. / 绝对路径）。"""
-    p = PurePosixPath(rel)
-    if not rel.strip() or p.is_absolute() or ".." in p.parts:
-        raise UpdateError(f"非法的文件路径，已中止：{rel}")
-
-
 def _verify_sha256(path: Path, expected: str) -> None:
     if not expected:
-        return  # manifest 正常都会带摘要；缺失时不阻断（与 download_release 容错一致）
+        return  # 缺摘要时不阻断（与 download_release 容错一致）
     actual = _file_sha256(path)
     if actual.lower() != expected.lower():
         raise UpdateError(
@@ -397,147 +367,6 @@ def _scaled_cb(progress_cb: Callable[[int], None] | None, lo: int, hi: int):
     if progress_cb is None:
         return None
     return lambda pct: progress_cb(lo + (hi - lo) * pct // 100)
-
-
-def _fetch_update_plan(release: LatestRelease) -> UpdatePlan:
-    """下载并解析 update_manifest_{plat}.json。"""
-    assert release.manifest_url is not None
-    _validate_url(release.manifest_url)
-    try:
-        data = json.loads(_http_get(release.manifest_url).decode("utf-8"))
-        app_zip = str(data["app_zip"])
-        runtime_zip = str(data["runtime_zip"])
-        return UpdatePlan(
-            version=str(data.get("version", release.version)),
-            platform=str(data.get("platform", "")),
-            app_zip_url=_asset_url(release.tag, app_zip),
-            app_zip_name=app_zip,
-            app_sha256=str(data.get("app_sha256", "")),
-            runtime_zip_url=_asset_url(release.tag, runtime_zip),
-            runtime_zip_name=runtime_zip,
-            runtime_sha256=str(data.get("runtime_sha256", "")),
-            runtime_hash=str(data.get("runtime_hash", "")),
-            app_files=tuple(str(p) for p in data.get("app_files", [])),
-        )
-    except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError) as exc:
-        raise UpdateError(f"无法解析更新清单：{exc}") from exc
-
-
-def _find_reusable_runtime(
-    local_roots: list[Path] | None, runtime_hash: str
-) -> tuple[Path, dict] | None:
-    """在本地已装版本里找运行时 hash 匹配的 bundle 目录，作为运行时复用源。
-
-    返回 (bundle_dir, meta)；找不到返回 None。
-    """
-    if not runtime_hash or not local_roots:
-        return None
-    for root in local_roots:
-        root = Path(root)
-        if not root.exists():
-            continue
-        for vdir in sorted(root.iterdir(), reverse=True):
-            if not vdir.is_dir() or not vdir.name.startswith("v"):
-                continue
-            for meta_path in vdir.rglob(APP_META_FILE):
-                try:
-                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    continue
-                if str(meta.get("runtime_hash", "")) == runtime_hash:
-                    return meta_path.parent, meta
-    return None
-
-
-def _copy_runtime_files(src_bundle: Path, src_meta: dict, dst_bundle: Path) -> None:
-    """把复用源 bundle 里的运行时分区文件（= 非应用分区、非元数据）拷到目标 bundle。"""
-    app_set = {str(p) for p in src_meta.get("app_files", [])}
-    for path in src_bundle.rglob("*"):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(src_bundle).as_posix()
-        if rel in app_set or rel == APP_META_FILE:
-            continue  # 应用分区文件不复用，由下载的应用包提供
-        _validate_rel_path(rel)
-        target = dst_bundle / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, target)
-
-
-def download_update(
-    release: LatestRelease,
-    dest_root: Path | str,
-    local_roots: list[Path] | None = None,
-    progress_cb: Callable[[int], None] | None = None,
-) -> tuple[Path, bool]:
-    """增量更新入口：尽量只下载应用包，运行时从本地复用。
-
-    返回 ``(target_dir, incremental)``：``incremental`` 为 True 表示走了增量路径（只下应用包）。
-    老 release（无 update_manifest）自动回退到 :func:`download_release` 的完整 zip 路径。
-    """
-    # 1. 老 release / 服务端没拆包 → 回退完整 zip
-    if not release.manifest_url:
-        return download_release(release, dest_root, progress_cb), False
-
-    plan = _fetch_update_plan(release)
-    for url in (plan.app_zip_url, plan.runtime_zip_url):
-        _validate_url(url)
-    for rel in plan.app_files:
-        _validate_rel_path(rel)
-
-    dest_root = Path(dest_root)
-    target_dir = dest_root / f"v{plan.version}"
-    if target_dir.exists():
-        raise UpdateError(f"版本目录已存在，无需重复下载：\n{target_dir}")
-
-    bundle_name = f"{APP_NAME}_v{plan.version}"
-    reusable = _find_reusable_runtime(local_roots, plan.runtime_hash)
-
-    tmp_dir = Path(tempfile.mkdtemp(prefix="specimen-update-"))
-    try:
-        staging = tmp_dir / "staging"
-        staging_bundle = staging / bundle_name
-        staging_bundle.mkdir(parents=True)
-
-        if reusable is not None:
-            # 增量路径：复用本地运行时，只下载应用包
-            src_bundle, src_meta = reusable
-            _copy_runtime_files(src_bundle, src_meta, staging_bundle)
-            app_zip = tmp_dir / plan.app_zip_name
-            _download_to(plan.app_zip_url, app_zip, progress_cb)
-            _verify_sha256(app_zip, plan.app_sha256)
-            _safe_extract(app_zip, staging)  # arcname 带 bundle 前缀，合并进 staging_bundle
-            incremental = True
-        else:
-            # 完整路径：下载应用包 + 运行时包（运行时是大头，占 0-85% 进度）
-            runtime_zip = tmp_dir / plan.runtime_zip_name
-            app_zip = tmp_dir / plan.app_zip_name
-            _download_to(plan.runtime_zip_url, runtime_zip, _scaled_cb(progress_cb, 0, 85))
-            _verify_sha256(runtime_zip, plan.runtime_sha256)
-            _download_to(plan.app_zip_url, app_zip, _scaled_cb(progress_cb, 85, 100))
-            _verify_sha256(app_zip, plan.app_sha256)
-            _safe_extract(runtime_zip, staging)
-            _safe_extract(app_zip, staging)
-            incremental = False
-
-        # 写入 .update_meta.json，让该目录日后也能作为运行时复用源
-        (staging_bundle / APP_META_FILE).write_text(
-            json.dumps(
-                {
-                    "version": plan.version,
-                    "runtime_hash": plan.runtime_hash,
-                    "app_files": list(plan.app_files),
-                },
-                ensure_ascii=False, indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-        dest_root.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(staging), str(target_dir))
-        return target_dir, incremental
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -824,15 +653,19 @@ def download_assets_for_distribution(
     dest_dir: Path | str,
     *,
     include_sha256: bool = True,
-    include_manifest: bool = True,
     progress_cb: Callable[[int], None] | None = None,
 ) -> list[Path]:
     """Download the GitHub release's full setup zip (and optionally its
-    sha256 / manifest) into ``dest_dir`` without extracting.
+    sha256) into ``dest_dir`` without extracting.
 
     Used by D5 "下载安装包供分发": admin on a Windows box wants the Linux
     setup zip to USB-stick over to an offline Linux machine.
     """
+    if not release.zip_url:
+        raise UpdateError(
+            f"v{release.version} 的安装包尚未就绪（GitHub Release 中未找到对应平台的 zip）。\n"
+            "可能是 GitHub Actions 构建未完成；请稍后重试。"
+        )
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
@@ -840,12 +673,12 @@ def download_assets_for_distribution(
     zip_dest = dest_dir / release.zip_name
     if progress_cb:
         progress_cb(0)
-    _download_to(release.zip_url, zip_dest, _scaled_cb(progress_cb, 0, 80))
+    _download_to(release.zip_url, zip_dest, _scaled_cb(progress_cb, 0, 90))
     written.append(zip_dest)
 
     if include_sha256 and release.sha256_url:
         sha_dest = dest_dir / f"{release.zip_name}.sha256"
-        _download_to(release.sha256_url, sha_dest, _scaled_cb(progress_cb, 80, 90))
+        _download_to(release.sha256_url, sha_dest, _scaled_cb(progress_cb, 90, 100))
         written.append(sha_dest)
         # belt-and-braces: verify what we just wrote.
         expected = _extract_expected_hash(
@@ -853,13 +686,6 @@ def download_assets_for_distribution(
         )
         if expected:
             _verify_sha256(zip_dest, expected)
-
-    if include_manifest and release.manifest_url:
-        manifest_dest = dest_dir / Path(
-            urllib.parse.urlparse(release.manifest_url).path
-        ).name
-        _download_to(release.manifest_url, manifest_dest, _scaled_cb(progress_cb, 90, 100))
-        written.append(manifest_dest)
 
     if progress_cb:
         progress_cb(100)

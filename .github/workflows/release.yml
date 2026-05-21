@@ -55,27 +55,19 @@ jobs:
 
             ---
 
-            ## 下载说明
+            ## 下载安装
 
-            | 操作系统 | 下载文件 | 使用方式 |
+            选你的操作系统，下载对应 zip 即可：
+
+            | 操作系统 | 下载文件 | 安装方式 |
             |---------|---------|--------|
             | **Windows 10/11 64位** | `setup_v${{ steps.ver.outputs.version }}_windows.zip` | 解压 → 双击 `.exe` |
             | **Linux (Ubuntu 20.04+)** | `setup_v${{ steps.ver.outputs.version }}_linux.zip` | 解压 → `chmod +x 文件名 && ./文件名` |
 
-            > **注意**：软件采用目录模式打包，`.exe` 文件必须和 `_internal/` 子目录放在同一层，不能单独复制 `.exe` 运行。
-
-            ---
-
-            ### 其他文件说明（普通用户无需手动下载）
-
-            | 文件 | 用途 |
-            |-----|------|
-            | `app_v*.zip` | 软件内「检查更新」增量下载用（仅含应用代码） |
-            | `runtime_*.zip` | 软件内「检查更新」增量下载用（Qt/Python 运行时） |
-            | `*.sha256` | 文件完整性校验码 |
-            | `update_manifest_*.json` | 软件内更新检测配置 |
+            > 软件采用目录模式打包，`.exe` 必须和 `_internal/` 子目录在同一层，不能单独复制 `.exe` 运行。
+            >
+            > `.sha256` 文件是完整性校验码，普通用户无需下载。
 
           files: |
-            releases/v${{ steps.ver.outputs.version }}/*.zip
-            releases/v${{ steps.ver.outputs.version }}/*.zip.sha256
-            releases/v${{ steps.ver.outputs.version }}/update_manifest_*.json
+            releases/v${{ steps.ver.outputs.version }}/setup_*.zip
+            releases/v${{ steps.ver.outputs.version }}/setup_*.zip.sha256

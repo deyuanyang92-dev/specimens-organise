@@ -120,7 +120,6 @@ from .updater import (
     check_latest_release,
     default_download_root,
     download_release,
-    download_update,
     is_newer,
 )
 from .species import FamilyMatch, SpeciesMatch, SpeciesMatcher
@@ -666,22 +665,23 @@ class UpdateCheckWorker(QThread):
 
 class UpdateDownloadWorker(QThread):
     progress = pyqtSignal(int)               # 下载进度百分比
-    # Path|None, incremental(bool), Exception|None
+    # Path|None, incremental(bool, 始终 False), Exception|None
     finished_download = pyqtSignal(object, object, object)
 
     def __init__(self, release, dest_root, local_roots=None, parent=None):
         super().__init__(parent)
         self._release = release
         self._dest_root = dest_root
+        # local_roots 形参保留以兼容现有调用点;v0.8.2 删增量后不再使用。
         self._local_roots = local_roots or []
 
     def run(self) -> None:
         try:
-            # download_update 尽量走增量（只下应用包）；老 release 自动回退完整 zip。
-            path, incremental = download_update(
-                self._release, self._dest_root, self._local_roots, self.progress.emit
+            # v0.8.2:删增量更新,统一下载完整 setup zip。
+            path = download_release(
+                self._release, self._dest_root, self.progress.emit
             )
-            self.finished_download.emit(path, incremental, None)
+            self.finished_download.emit(path, False, None)
         except Exception as exc:
             self.finished_download.emit(None, False, exc)
 

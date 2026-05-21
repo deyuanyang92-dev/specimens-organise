@@ -400,11 +400,8 @@ class UpgradeCenterDialog(QDialog):
         self._dist_chk_zip.setEnabled(False)  # mandatory
         self._dist_chk_sha = QCheckBox("sha256 完整性校验文件")
         self._dist_chk_sha.setChecked(True)
-        self._dist_chk_manifest = QCheckBox("update_manifest_*.json（增量更新清单）")
-        self._dist_chk_manifest.setChecked(False)
         content_layout.addWidget(self._dist_chk_zip)
         content_layout.addWidget(self._dist_chk_sha)
-        content_layout.addWidget(self._dist_chk_manifest)
         v.addWidget(content_box)
 
         dest_row = QHBoxLayout()
@@ -480,7 +477,6 @@ class UpgradeCenterDialog(QDialog):
             channel=channel,
             dest_dir=dest_path,
             include_sha256=self._dist_chk_sha.isChecked(),
-            include_manifest=self._dist_chk_manifest.isChecked(),
             parent=self,
         )
         worker.progress.connect(self._dist_progress.setValue)
@@ -959,13 +955,12 @@ class _DistributionWorker(QThread):
     finished_distribute = pyqtSignal(object, object)
 
     def __init__(self, *, platform_key: str, channel: str, dest_dir: Path,
-                  include_sha256: bool, include_manifest: bool, parent=None):
+                  include_sha256: bool, parent=None):
         super().__init__(parent)
         self._platform = platform_key
         self._channel = channel
         self._dest_dir = dest_dir
         self._include_sha256 = include_sha256
-        self._include_manifest = include_manifest
 
     def run(self) -> None:
         try:
@@ -980,7 +975,6 @@ class _DistributionWorker(QThread):
             files = download_assets_for_distribution(
                 release, self._dest_dir,
                 include_sha256=self._include_sha256,
-                include_manifest=self._include_manifest,
                 progress_cb=self.progress.emit,
             )
             self.finished_distribute.emit(files, None)
