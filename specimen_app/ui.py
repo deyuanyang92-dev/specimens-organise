@@ -1790,24 +1790,26 @@ class SpecimenWindow(QMainWindow):
         self._new_voucher_btn.setToolTip("请先开始录入任务")
         self._new_voucher_btn.clicked.connect(self.new_specimen)
         voucher_layout.addWidget(self._new_voucher_btn)
-        # 编号系列选择行：标签 + 下拉框（下拉框独占整行剩余宽度，可显示长系列名）。
+        # 编号系列行：标签 + 小下拉框 + 「编号系列管理」按钮，一行排开。
+        # 下拉框只放系列名(YZZ 等),不需要很宽 → minWidth 60 / maxWidth 130 限制为
+        # 紧凑尺寸。「编号系列管理」按钮取自然宽度(6 字约 108px),紧挨下拉框。
+        # 行尾 addStretch 吸收多余宽度,按钮始终紧贴下拉框、不被推走。
         series_row = QHBoxLayout()
         series_row.setSpacing(4)
         series_row.addWidget(QLabel("编号系列"))
         self._series_selector = QComboBox()
         self._series_selector.setToolTip("选择入库编号系列（当前系列用于新增编号）")
-        self._series_selector.setMinimumWidth(0)
+        self._series_selector.setMinimumWidth(60)
+        self._series_selector.setMaximumWidth(130)
         self._refresh_series_selector()
         self._series_selector.currentIndexChanged.connect(self._on_series_selector_changed)
-        series_row.addWidget(self._series_selector, stretch=1)
-        voucher_layout.addLayout(series_row)
-        # 「编号系列管理」独立整行按钮（与「人员记录」「＋ 新增编号」一致的满宽按钮）。
-        # 旧设计把它塞成下拉框旁的窄「管理」按钮 → 反复被下拉框挤掉/裁切。
-        # 整行满宽按钮文字恒完整可见，6 字远在 8 字设计余量内。
+        series_row.addWidget(self._series_selector)
         manage_series_btn = QPushButton("编号系列管理")
         manage_series_btn.setToolTip("新增 / 编辑 / 删除 入库编号系列")
         manage_series_btn.clicked.connect(self._open_series_manager)
-        voucher_layout.addWidget(manage_series_btn)
+        series_row.addWidget(manage_series_btn)
+        series_row.addStretch(1)
+        voucher_layout.addLayout(series_row)
         # Search + quick filter
         filter_row = QHBoxLayout()
         self._voucher_search = QLineEdit()
@@ -1932,11 +1934,10 @@ class SpecimenWindow(QMainWindow):
         # scrollable=False:入库编号面板内含可自滚的表格,不再外套 QScrollArea。
         self.voucher_panel = self._create_panel("入库编号", voucher_content,
                                                 collapsible=False, scrollable=False)
-        # 旧逻辑：290 硬下限 → 降 150 → 降 60。降到 60 后面板可拖到极窄,
-        # 但行内按钮(开始录入/管理/...)被裁切看不见 —— 用户多次反馈。
-        # 现：下限设 200,既能让出空间给中央图,又保证所有行按钮完整可见。
+        # 旧逻辑：290 硬下限 → 降 150 → 降 60。降到 60 后行内按钮被裁切看不见。
+        # 现：下限设 270,保证「编号系列 标签 + 下拉 + 编号系列管理 按钮」整行完整可见。
         # 要彻底隐藏面板仍可用分割条折叠(setChildrenCollapsible)。
-        self.voucher_panel.setMinimumWidth(200)
+        self.voucher_panel.setMinimumWidth(270)
 
         # Right: specimen info panel
         specimen_content = QWidget()
