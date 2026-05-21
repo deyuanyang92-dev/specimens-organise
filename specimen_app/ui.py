@@ -1170,7 +1170,7 @@ class SpecimenWindow(QMainWindow):
         self._manual_dialog: "object | None" = None  # UserManualDialog
 
         # 录入任务状态：开始录入任务后填充，结束后清空。
-        # keys: 记录ID, 人员, 用途, 备注, 开始时间, 新增数量
+        # keys: 记录ID, 人员, 用途, 备注, 开始时间, 本任务编号(set)
         self._active_task: dict | None = None
 
         # 搜索数据容器：必须在 _build_ui() 之前初始化，因为 UI 构造期间
@@ -2633,6 +2633,8 @@ class SpecimenWindow(QMainWindow):
         if current and current in self._all_flags:
             self._select_voucher_in_table(current)
         self._update_dashboard()
+        # 照片关联/取消关联后都会走 refresh_list，借此实时刷新任务指示器的「入库」数。
+        self._update_task_indicator()
 
     def _refresh_series_selector(self) -> None:
         """刷新系列选择器下拉（新增入库编号时用）。"""
@@ -2720,7 +2722,9 @@ class SpecimenWindow(QMainWindow):
             "用途": dlg.purpose,
             "备注": dlg.note,
             "开始时间": now,
-            "新增数量": 0,
+            # 本任务创建的所有入库编号集合。认领数 = len();
+            # 入库数 = 其中已关联照片的个数(实时按 get_photos 计算)。
+            "本任务编号": set(),
         }
         self.store.log_alloc_event({
             "记录ID": task_id,
@@ -2741,7 +2745,7 @@ class SpecimenWindow(QMainWindow):
             "时间": _dt.now().isoformat(timespec="seconds"),
             "类型": "任务结束",
             "人员": self._active_task["人员"],
-            "数量": str(self._active_task["新增数量"]),
+            "数量": str(len(self._active_task["本任务编号"])),
             "关联任务ID": self._active_task["记录ID"],
         })
         self._active_task = None
@@ -2756,8 +2760,17 @@ class SpecimenWindow(QMainWindow):
         if self._active_task:
             person = self._active_task["人员"]
             purpose = self._active_task["用途"]
-            count = self._active_task["新增数量"]
-            self._task_label.setText(f"● {person} · {purpose} · {count}条")
+            # 认领 = 本任务创建的编号数;入库 = 其中已关联照片的编号数。
+            # 新增编号只认领,关联照片后才算入库 —— 实时按 get_photos 计算。
+            vouchers = self._active_task["本任务编号"]
+            claimed = len(vouchers)
+            ingested = sum(
+                1 for v in vouchers
+                if self.store is not None and self.store.get_photos(v)
+            )
+            self._task_label.setText(
+                f"● {person} · {purpose} · 认领 {claimed} · 入库 {ingested}"
+            )
             self._task_label.setStyleSheet("color: #1a7a1a; font-weight: bold;")
             self._task_indicator.setStyleSheet("#task_indicator { background: #d4edda; border-radius: 3px; }")
             self._task_start_btn.setVisible(False)
@@ -2765,7 +2778,7 @@ class SpecimenWindow(QMainWindow):
             self._new_voucher_btn.setEnabled(True)
             self._new_voucher_btn.setToolTip("")
         else:
-            self._task_label.setText("未开始录入任务")
+            self._task_label.setText("未开始任务")
             self._task_label.setStyleSheet("color: #888;")
             self._task_indicator.setStyleSheet("")
             self._task_start_btn.setVisible(True)
@@ -3442,7 +3455,7 @@ class SpecimenWindow(QMainWindow):
             if carry:
                 self.store.set_fields("specimen", voucher, carry)
             if self._active_task:
-                self._active_task["新增数量"] += 1
+                self._active_task["本任务编号"].add(voucher)
                 self._update_task_indicator()
             self.refresh_list()
             self.select_voucher(voucher)
