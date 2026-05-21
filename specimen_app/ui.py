@@ -1790,30 +1790,24 @@ class SpecimenWindow(QMainWindow):
         self._new_voucher_btn.setToolTip("请先开始录入任务")
         self._new_voucher_btn.clicked.connect(self.new_specimen)
         voucher_layout.addWidget(self._new_voucher_btn)
-        # 行2：编号系列 下拉 + 管理。
-        # 关键:下拉框 hard-cap maxWidth + 无 stretch + 末尾 addStretch —— 三者合力让
-        # 下拉框不会无限拉伸,「管理」按钮永远紧挨下拉框、不被挤走。
-        # (旧:下拉 stretch=1 无 maxWidth → 吞掉整行宽度,把管理按钮顶到面板边缘。)
+        # 编号系列选择行：标签 + 下拉框（下拉框独占整行剩余宽度，可显示长系列名）。
         series_row = QHBoxLayout()
         series_row.setSpacing(4)
         series_row.addWidget(QLabel("编号系列"))
         self._series_selector = QComboBox()
         self._series_selector.setToolTip("选择入库编号系列（当前系列用于新增编号）")
-        # minWidth 小(48):窄面板时下拉框可收缩,让出空间给「管理」按钮 —— 按钮恒可见。
-        # maxWidth 160:宽面板时下拉框不会无限拉伸。stretch=1 + 行尾 addStretch:
-        # 多余宽度归行尾弹簧,「管理」始终紧挨下拉框。
-        self._series_selector.setMinimumWidth(48)
-        self._series_selector.setMaximumWidth(160)
+        self._series_selector.setMinimumWidth(0)
         self._refresh_series_selector()
         self._series_selector.currentIndexChanged.connect(self._on_series_selector_changed)
         series_row.addWidget(self._series_selector, stretch=1)
-        manage_series_btn = QPushButton("管理")
-        manage_series_btn.setToolTip("编号系列管理（新增/编辑/删除）")
-        manage_series_btn.setFixedWidth(44)
-        manage_series_btn.clicked.connect(self._open_series_manager)
-        series_row.addWidget(manage_series_btn)
-        series_row.addStretch(1)
         voucher_layout.addLayout(series_row)
+        # 「编号系列管理」独立整行按钮（与「人员记录」「＋ 新增编号」一致的满宽按钮）。
+        # 旧设计把它塞成下拉框旁的窄「管理」按钮 → 反复被下拉框挤掉/裁切。
+        # 整行满宽按钮文字恒完整可见，6 字远在 8 字设计余量内。
+        manage_series_btn = QPushButton("编号系列管理")
+        manage_series_btn.setToolTip("新增 / 编辑 / 删除 入库编号系列")
+        manage_series_btn.clicked.connect(self._open_series_manager)
+        voucher_layout.addWidget(manage_series_btn)
         # Search + quick filter
         filter_row = QHBoxLayout()
         self._voucher_search = QLineEdit()
