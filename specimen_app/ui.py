@@ -2760,6 +2760,8 @@ class SpecimenWindow(QMainWindow):
         if self._active_task:
             person = self._active_task["人员"]
             purpose = self._active_task["用途"]
+            # 用途词转状态形式（入库→入库中），与后面计数「入库 M」区分开。
+            status = f"{purpose}中" if purpose in ("入库", "整理", "核查") else (purpose or "录入中")
             # 认领 = 本任务创建的编号数;入库 = 其中已关联照片的编号数。
             # 新增编号只认领,关联照片后才算入库 —— 实时按 get_photos 计算。
             vouchers = self._active_task["本任务编号"]
@@ -2769,7 +2771,7 @@ class SpecimenWindow(QMainWindow):
                 if self.store is not None and self.store.get_photos(v)
             )
             self._task_label.setText(
-                f"● {person} · {purpose} · 认领 {claimed} · 入库 {ingested}"
+                f"● {person} · {status} · 认领 {claimed} · 入库 {ingested}"
             )
             self._task_label.setStyleSheet("color: #1a7a1a; font-weight: bold;")
             self._task_indicator.setStyleSheet("#task_indicator { background: #d4edda; border-radius: 3px; }")
