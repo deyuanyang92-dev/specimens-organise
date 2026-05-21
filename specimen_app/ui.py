@@ -1036,8 +1036,10 @@ _DEFERRED_WORKSPACE = object()
 class SpecimenWindow(QMainWindow):
     # voucher_table 列宽/字体基准值（系统默认字号下的原始值）。
     # 全局字体缩放时按 (当前字号 - 默认字号) 的差值同比放大，避免文字被覆盖。
-    _VOUCHER_COL_BASE_WIDTHS = (85, 36, 36, 36, 52, 42)
-    _VOUCHER_TABLE_BASE_PT = 10
+    # 列0(入库编号)基准宽 110:YZZ000001 等 9 字 Consolas 在 85px 下挤,加宽到不截断。
+    _VOUCHER_COL_BASE_WIDTHS = (110, 36, 36, 36, 52, 42)
+    # 基准字号 11(旧 10):默认就略大、更清晰。A-/A+ 在此基础上叠加 voucher_table_font_delta。
+    _VOUCHER_TABLE_BASE_PT = 11
 
     def __init__(self, workspace_root: Path | str | None, manager: "WindowManager | None" = None,
                  read_only: bool = False):
@@ -1771,32 +1773,36 @@ class SpecimenWindow(QMainWindow):
         self._task_end_btn.clicked.connect(self._end_task)
         task_ind_layout.addWidget(self._task_end_btn)
         voucher_layout.addWidget(self._task_indicator)
-        personnel_btn = QPushButton("查看人员记录")
+        personnel_btn = QPushButton("人员记录")
         personnel_btn.setToolTip("查看录入工作量汇总，了解各录入人员的任务次数和时长")
         personnel_btn.clicked.connect(self._open_workload_report)
         voucher_layout.addWidget(personnel_btn)
 
-        # 「＋新增入库编号」按钮 + 系列选择器行
-        new_voucher_row = QHBoxLayout()
-        new_voucher_row.setSpacing(4)
-        self._new_voucher_btn = QPushButton("＋新增入库编号")
+        # 入库编号操作区：两行。旧设计单行塞「＋新增按钮(stretch=1 无限拉) + 系列下拉 +
+        # 管理按钮」，窄面板时新增按钮吞掉全部宽度、把系列/管理挤出可视区。
+        # 现拆两行：行1 新增按钮独占；行2 系列下拉 + 管理，保证两者始终可见。
+        # 行1：＋ 新增编号
+        self._new_voucher_btn = QPushButton("＋ 新增编号")
         self._new_voucher_btn.setEnabled(False)
         self._new_voucher_btn.setToolTip("请先开始录入任务")
         self._new_voucher_btn.clicked.connect(self.new_specimen)
-        new_voucher_row.addWidget(self._new_voucher_btn, stretch=1)
+        voucher_layout.addWidget(self._new_voucher_btn)
+        # 行2：编号系列 下拉 + 管理
+        series_row = QHBoxLayout()
+        series_row.setSpacing(4)
+        series_row.addWidget(QLabel("编号系列"))
         self._series_selector = QComboBox()
         self._series_selector.setToolTip("选择入库编号系列（当前系列用于新增编号）")
         self._series_selector.setMinimumWidth(70)
-        self._series_selector.setMaximumWidth(110)
         self._refresh_series_selector()
         self._series_selector.currentIndexChanged.connect(self._on_series_selector_changed)
-        new_voucher_row.addWidget(self._series_selector)
+        series_row.addWidget(self._series_selector, stretch=1)
         manage_series_btn = QPushButton("管理")
         manage_series_btn.setToolTip("管理入库编号系列（新增/编辑/删除）")
-        manage_series_btn.setFixedWidth(40)
+        manage_series_btn.setFixedWidth(44)
         manage_series_btn.clicked.connect(self._open_series_manager)
-        new_voucher_row.addWidget(manage_series_btn)
-        voucher_layout.addLayout(new_voucher_row)
+        series_row.addWidget(manage_series_btn)
+        voucher_layout.addLayout(series_row)
         # Search + quick filter
         filter_row = QHBoxLayout()
         self._voucher_search = QLineEdit()
@@ -1842,6 +1848,23 @@ class SpecimenWindow(QMainWindow):
         self._filter_buttons["all"].setChecked(True)
         self._active_filter = "all"
         voucher_layout.addLayout(quick_row)
+        # 编号列表字体微调行：A- / A+ 就地调编号列表字号（独立于全局界面字体）。
+        # 用户反馈编号值看不清、找不到调字体入口 → 放在表格正上方,一眼可见。
+        font_row = QHBoxLayout()
+        font_row.setSpacing(4)
+        font_row.addWidget(QLabel("编号列表"))
+        font_row.addStretch(1)
+        self._voucher_font_minus = QPushButton("A-")
+        self._voucher_font_minus.setFixedWidth(30)
+        self._voucher_font_minus.setToolTip("缩小入库编号列表字体")
+        self._voucher_font_minus.clicked.connect(lambda: self._adjust_voucher_table_font(-1))
+        font_row.addWidget(self._voucher_font_minus)
+        self._voucher_font_plus = QPushButton("A+")
+        self._voucher_font_plus.setFixedWidth(30)
+        self._voucher_font_plus.setToolTip("放大入库编号列表字体")
+        self._voucher_font_plus.clicked.connect(lambda: self._adjust_voucher_table_font(1))
+        font_row.addWidget(self._voucher_font_plus)
+        voucher_layout.addLayout(font_row)
         # Table: 入库编号 | 标本 | 照片 | 分类 | 认领 | 照片数
         self.voucher_table = QTableWidget(0, 7)
         self.voucher_table.setHorizontalHeaderLabels(["入库编号","标本","照片","分类","认领","照片数","关联照片"])
@@ -1914,6 +1937,9 @@ class SpecimenWindow(QMainWindow):
         sf_layout = QFormLayout(specimen_content)
         sf_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
         sf_layout.setContentsMargins(0, 0, 0, 0)
+        # label 右对齐成列 + 行间留呼吸空间（旧版左对齐参差、行距 0 偏挤）。
+        sf_layout.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        sf_layout.setVerticalSpacing(6)
         for field in SPECIMEN_HEADERS:
             if field == "保存方式":
                 widget = QComboBox()
@@ -1962,7 +1988,11 @@ class SpecimenWindow(QMainWindow):
         pf_layout.addLayout(page_row)
         for field in ("文件名", "相对路径", "绝对路径", "描述"):
             row = QHBoxLayout()
-            row.addWidget(QLabel(field))
+            # label 统一固定宽 + 右对齐,消除手搭行的参差左缘（与右侧 QFormLayout 一致观感）。
+            field_label = QLabel(field)
+            field_label.setFixedWidth(64)
+            field_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            row.addWidget(field_label)
             widget = QLineEdit()
             if field in {"相对路径", "绝对路径"}:
                 widget.setReadOnly(True)
@@ -1990,6 +2020,8 @@ class SpecimenWindow(QMainWindow):
         cf_layout = QFormLayout(class_content)
         cf_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
         cf_layout.setContentsMargins(0, 0, 0, 0)
+        cf_layout.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        cf_layout.setVerticalSpacing(6)
         for field in EDITABLE_CLASSIFICATION_COLUMNS:
             widget = QLineEdit()
             widget.textChanged.connect(lambda text, f=field: self.schedule_save("classification", f))
@@ -6115,7 +6147,11 @@ class SpecimenWindow(QMainWindow):
     # ---- 全局字体缩放 ----
 
     def _refresh_scaled_fonts(self) -> None:
-        """按当前全局字号设置 voucher_table 字体与列宽（默认字号时与旧版一致）。"""
+        """按全局字号 + 编号列表微调档设置 voucher_table 字体、行高、列宽。
+
+        字号 = 基准 + 全局缩放 delta + voucher_table_font_delta（A-/A+ 调节）。
+        行高随字号同步（旧版未设,字号变大时行被压扁）。
+        """
         table = getattr(self, "voucher_table", None)
         if table is None:
             return
@@ -6123,11 +6159,30 @@ class SpecimenWindow(QMainWindow):
         cur_pt = app.font().pointSize() if app is not None else self._VOUCHER_TABLE_BASE_PT
         base_pt = _default_app_font_point or cur_pt
         delta = cur_pt - base_pt
-        table_pt = max(6, self._VOUCHER_TABLE_BASE_PT + delta)
-        table.setFont(QFont("Consolas", table_pt))
+        try:
+            user_delta = load_settings().voucher_table_font_delta
+        except Exception:
+            user_delta = 0
+        table_pt = max(7, self._VOUCHER_TABLE_BASE_PT + delta + user_delta)
+        font = QFont("Consolas", table_pt)
+        table.setFont(font)
+        # 行高随字号:用 QFontMetrics 实测高度 + 8px 内边距,避免行被压扁。
+        from PyQt5.QtGui import QFontMetrics
+        row_h = QFontMetrics(font).height() + 8
+        table.verticalHeader().setDefaultSectionSize(row_h)
         scale = table_pt / self._VOUCHER_TABLE_BASE_PT
         for col, base in enumerate(self._VOUCHER_COL_BASE_WIDTHS):
             table.setColumnWidth(col, max(base, int(base * scale)))
+
+    def _adjust_voucher_table_font(self, step: int) -> None:
+        """A- / A+ 按钮:调编号列表字体微调档（持久化 + 立即刷新）。"""
+        settings = load_settings()
+        new_delta = max(-2, min(12, settings.voucher_table_font_delta + step))
+        if new_delta == settings.voucher_table_font_delta:
+            return  # 已到上下限
+        settings.voucher_table_font_delta = new_delta
+        save_settings(settings)
+        self._refresh_scaled_fonts()
 
     def _refresh_all_windows_fonts(self) -> None:
         """刷新所有打开窗口的缩放字体（app.setFont 已全局生效，这里补表格字体/列宽）。"""
@@ -6186,14 +6241,20 @@ class SpecimenWindow(QMainWindow):
         title_label.setStyleSheet("font-weight: bold; font-size: 12px; padding: 2px 0;")
         title_bar.addWidget(title_label)
         title_bar.addStretch()
+        # content 外包 QScrollArea:拖窄分割条时字段可滚动而非被裁切（旧版直接裁掉）。
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setWidget(content)
         if collapsible:
             collapse_btn = QPushButton("−")
             collapse_btn.setFixedSize(22, 22)
             collapse_btn.setToolTip("折叠/展开面板")
-            collapse_btn.clicked.connect(lambda: _toggle_content(collapse_btn, content))
+            collapse_btn.clicked.connect(lambda: _toggle_content(collapse_btn, scroll))
             title_bar.addWidget(collapse_btn)
         layout.addLayout(title_bar)
-        layout.addWidget(content, stretch=1)
+        layout.addWidget(scroll, stretch=1)
         # Store toggle function in closure
         def _toggle_content(btn, w):
             visible = w.isVisible()
@@ -8708,9 +8769,12 @@ class _StartTaskDialog(QDialog):
             pass
         self._person_combo.member_changed.connect(self._on_person_changed)
         person_row.addWidget(self._person_combo, 1)
-        self._manage_btn = QPushButton("管理人员…")
-        self._manage_btn.clicked.connect(self._open_manage)
-        person_row.addWidget(self._manage_btn)
+        # 「＋ 新增」:就地弹小窗快速新增一名录入人员(姓名+角色),不必进完整管理对话框。
+        # 新人写入人员库后自动选中。完整管理仍可从状态栏录入员下拉的「管理人员…」进。
+        self._add_person_btn = QPushButton("＋ 新增")
+        self._add_person_btn.setToolTip("快速新增一名录入人员")
+        self._add_person_btn.clicked.connect(self._quick_add_person)
+        person_row.addWidget(self._add_person_btn)
         person_widget = QWidget()
         person_widget.setLayout(person_row)
         layout.addRow("录入人员*", person_widget)
@@ -8747,15 +8811,13 @@ class _StartTaskDialog(QDialog):
             if idx >= 0:
                 self._purpose_combo.setCurrentIndex(idx)
 
-    def _open_manage(self) -> None:
-        from .persons_dialog import PersonsManagerDialog
-        store = getattr(self._parent_window, "store", None) if self._parent_window else None
-        dlg = PersonsManagerDialog(self, workspace=self._workspace, store=store)
-        dlg.exec_()
-        # 刷新下拉,保留之前选中
-        prev = self._person_combo.current_name()
-        self._person_combo.refresh(preselect=prev)
-        # 若 prev 被删,_ok_btn 自动 disable (通过 _on_person_changed)
+    def _quick_add_person(self) -> None:
+        from .widgets_persons import quick_add_person
+        new_member = quick_add_person(self, self._workspace)
+        if new_member is None:
+            return
+        # 刷新下拉并自动选中新人。
+        self._person_combo.refresh(preselect=new_member.name)
         self._on_person_changed("")
 
     def accept(self) -> None:

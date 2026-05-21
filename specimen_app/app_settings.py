@@ -107,6 +107,9 @@ class AppSettings:
     upgrade_last_distribution_dir: str = ""
     # D10 引导黄条:用户点过"不再提示"后置 True,跳过 frozen-direct 引导提示。
     upgrade_skip_current_init: bool = False
+    # 入库编号列表字体微调档（相对基准 _VOUCHER_TABLE_BASE_PT 的增量,钳 -2..+12）。
+    # 由编号列表上方 A- / A+ 按钮调节,独立于全局界面字体。
+    voucher_table_font_delta: int = 0
 
 
 def app_config_dir() -> Path:
@@ -235,6 +238,10 @@ def load_settings() -> AppSettings:
     upgrade_skip_current_init = data.get("upgrade_skip_current_init", False)
     if not isinstance(upgrade_skip_current_init, bool):
         upgrade_skip_current_init = False
+    voucher_table_font_delta = data.get("voucher_table_font_delta", 0)
+    if not isinstance(voucher_table_font_delta, int) or isinstance(voucher_table_font_delta, bool):
+        voucher_table_font_delta = 0
+    voucher_table_font_delta = max(-2, min(12, voucher_table_font_delta))
     return AppSettings(
         last_workspace=str(data.get("last_workspace", "")),
         recent_workspaces=[str(item) for item in data.get("recent_workspaces", []) if item],
@@ -271,6 +278,7 @@ def load_settings() -> AppSettings:
         auto_update_channel=auto_update_channel,
         upgrade_last_distribution_dir=upgrade_last_distribution_dir,
         upgrade_skip_current_init=upgrade_skip_current_init,
+        voucher_table_font_delta=voucher_table_font_delta,
     )
 
 
@@ -313,6 +321,7 @@ def save_settings(settings: AppSettings) -> None:
         "auto_update_channel": settings.auto_update_channel,
         "upgrade_last_distribution_dir": settings.upgrade_last_distribution_dir,
         "upgrade_skip_current_init": settings.upgrade_skip_current_init,
+        "voucher_table_font_delta": settings.voucher_table_font_delta,
     }
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)

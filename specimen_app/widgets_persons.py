@@ -8,17 +8,34 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PyQt5.QtCore import Qt, QSize, QRect, pyqtSignal
+from datetime import datetime
+
+from PyQt5.QtCore import Qt, QSize, QRect, QStringListModel, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QPainter, QPixmap, QBrush, QPen
 from PyQt5.QtWidgets import (
     QComboBox,
+    QCompleter,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QLabel,
+    QLineEdit,
+    QMessageBox,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QWidget,
 )
 
-from .persons_store import TeamMember, avatar_text, color_for, load_members, sort_key, ROLE_OPTIONS
+from .persons_store import (
+    ROLE_OPTIONS,
+    TeamMember,
+    avatar_text,
+    color_for,
+    find_member,
+    load_members,
+    save_members,
+    sort_key,
+)
 
 
 class PersonAvatar(QLabel):
@@ -138,8 +155,23 @@ class PersonComboBox(QComboBox):
         self._delegate = _PersonItemDelegate(self)
         self.setItemDelegate(self._delegate)
         self.setMinimumHeight(28)
-        self.setEditable(False)
+        # 可编辑 + completer:支持输入姓名 / 拼音检索（用户反馈选人繁琐）。
+        # NoInsert:手输文字不会被加成新项;下拉仍用 _PersonItemDelegate 富渲染。
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.NoInsert)
+        if self.lineEdit() is not None:
+            self.lineEdit().setPlaceholderText("输入姓名/拼音检索，或点开下拉")
+        self._term_to_name: dict[str, str] = {}
+        self._completer_model = QStringListModel(self)
+        self._completer = QCompleter(self._completer_model, self)
+        self._completer.setFilterMode(Qt.MatchContains)
+        self._completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self._completer.setCompletionMode(QCompleter.PopupCompletion)
+        self.setCompleter(self._completer)
+        self._completer.activated[str].connect(self._on_completion_picked)
         self.currentIndexChanged.connect(self._on_index_changed)
+        if self.lineEdit() is not None:
+            self.lineEdit().editingFinished.connect(self._on_edit_finished)
         self.refresh()
 
     def refresh(self, members: Optional[list[TeamMember]] = None,
@@ -176,6 +208,22 @@ class PersonComboBox(QComboBox):
         finally:
             self.blockSignals(False)
 
+        # 重建 completer 候选:姓名 + 拼音(若有)。两者都解析回同一姓名。
+        self._term_to_name = {}
+        terms: list[str] = []
+        for m in members:
+            terms.append(m.name)
+            self._term_to_name[m.name] = m.name
+            py = (m.pinyin or "").strip()
+            if py and py.lower() != m.name.lower():
+                terms.append(py)
+                self._term_to_name[py] = m.name
+        self._completer_model.setStringList(terms)
+        # 同步 line edit 显示当前选中姓名
+        cur = self.current_member()
+        if cur is not None and self.lineEdit() is not None:
+            self.setEditText(cur.name)
+
     def current_member(self) -> Optional[TeamMember]:
         d = self.itemData(self.currentIndex(), Qt.UserRole)
         return d if isinstance(d, TeamMember) else None
@@ -184,6 +232,38 @@ class PersonComboBox(QComboBox):
         m = self.current_member()
         return m.name if m else ""
 
+    def _select_by_name(self, name: str) -> bool:
+        """按姓名选中对应项。成功返回 True。"""
+        for i in range(self.count()):
+            d = self.itemData(i, Qt.UserRole)
+            if isinstance(d, TeamMember) and d.name == name:
+                self.setCurrentIndex(i)
+                return True
+        return False
+
+    def _on_completion_picked(self, text: str) -> None:
+        """用户从 completer 弹窗选了一项（可能是姓名或拼音）。"""
+        name = self._term_to_name.get(text, text)
+        self._select_by_name(name)
+
+    def _on_edit_finished(self) -> None:
+        """line edit 失焦 / 回车:把输入解析回某个成员;无匹配则还原显示。"""
+        if self.lineEdit() is None:
+            return
+        txt = self.lineEdit().text().strip()
+        name = self._term_to_name.get(txt, txt)
+        cur = self.current_member()
+        if cur is not None and cur.name == name:
+            self.setEditText(cur.name)  # 规整大小写/空格
+            return
+        if self._select_by_name(name):
+            return
+        # 无匹配 → 还原到当前成员姓名,避免 line edit 残留无效文字
+        if cur is not None:
+            self.setEditText(cur.name)
+        elif self.count() > 0:
+            self.setCurrentIndex(0)
+
     def _on_index_changed(self, idx: int) -> None:
         d = self.itemData(idx, Qt.UserRole)
         if d == self.SPECIAL_MANAGE:
@@ -191,6 +271,56 @@ class PersonComboBox(QComboBox):
             self.member_changed.emit(self.SPECIAL_MANAGE)
             return
         if isinstance(d, TeamMember):
+            if self.lineEdit() is not None:
+                self.setEditText(d.name)
             self.member_changed.emit(d.name)
         else:
             self.member_changed.emit("")
+
+
+def quick_add_person(parent: QWidget, workspace=None) -> Optional[TeamMember]:
+    """弹小窗快速新增一名人员，写入人员库（settings + 工作区 xlsx），返回新成员。
+
+    用户取消返回 None。重名时直接返回库内已存在的同名成员（视为"选用"）。
+    供 _StartTaskDialog 的「＋ 新增」按钮等处复用 —— 比打开完整 PersonsManagerDialog
+    快得多，且数据照样进人员库。
+    """
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("新增录入人员")
+    form = QFormLayout(dlg)
+    name_edit = QLineEdit()
+    name_edit.setPlaceholderText("必填，例如 张三")
+    role_combo = QComboBox()
+    for key, label in ROLE_OPTIONS.items():
+        role_combo.addItem(label, key)
+    form.addRow("姓名", name_edit)
+    form.addRow("角色", role_combo)
+    buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+    buttons.button(QDialogButtonBox.Ok).setText("确定")
+    buttons.button(QDialogButtonBox.Cancel).setText("取消")
+    form.addRow(buttons)
+    buttons.accepted.connect(dlg.accept)
+    buttons.rejected.connect(dlg.reject)
+    name_edit.setFocus()
+
+    if dlg.exec_() != QDialog.Accepted:
+        return None
+    name = name_edit.text().strip()
+    if not name:
+        QMessageBox.information(parent, "新增人员", "姓名不能为空。")
+        return None
+
+    members = load_members(workspace)
+    existing = find_member(name, members)
+    if existing is not None:
+        QMessageBox.information(parent, "新增人员", f"「{name}」已在人员库中，将直接选用。")
+        return existing
+
+    new_member = TeamMember(
+        name=name,
+        role=role_combo.currentData() or "recorder",
+        created_at=datetime.now().isoformat(sep=" ", timespec="seconds"),
+    )
+    new_member.ensure_color()
+    save_members(members + [new_member], workspace)
+    return new_member
