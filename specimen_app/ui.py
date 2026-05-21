@@ -42,7 +42,6 @@ from PyQt5.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QSpinBox,
     QSplitter,
     QStatusBar,
@@ -1762,14 +1761,17 @@ class SpecimenWindow(QMainWindow):
         task_ind_layout = QHBoxLayout(self._task_indicator)
         task_ind_layout.setContentsMargins(4, 2, 4, 2)
         task_ind_layout.setSpacing(4)
-        self._task_label = QLabel("未开始录入任务")
+        # 任务标签可被压缩(纯状态文字),按钮短名 —— 保证窄面板下按钮不被裁。
+        self._task_label = QLabel("未开始任务")
         self._task_label.setStyleSheet("color: #888;")
+        self._task_label.setMinimumWidth(0)
         task_ind_layout.addWidget(self._task_label, stretch=1)
-        self._task_start_btn = QPushButton("▶ 开始录入任务")
+        self._task_start_btn = QPushButton("▶ 开始录入")
         self._task_start_btn.setToolTip("开始录入任务，记录录入人员和工作时长")
         self._task_start_btn.clicked.connect(self._start_task)
         task_ind_layout.addWidget(self._task_start_btn)
-        self._task_end_btn = QPushButton("结束任务")
+        self._task_end_btn = QPushButton("结束")
+        self._task_end_btn.setToolTip("结束当前录入任务")
         self._task_end_btn.setVisible(False)
         self._task_end_btn.clicked.connect(self._end_task)
         task_ind_layout.addWidget(self._task_end_btn)
@@ -1797,12 +1799,14 @@ class SpecimenWindow(QMainWindow):
         series_row.addWidget(QLabel("编号系列"))
         self._series_selector = QComboBox()
         self._series_selector.setToolTip("选择入库编号系列（当前系列用于新增编号）")
-        self._series_selector.setMinimumWidth(90)
+        # minWidth 小(48):窄面板时下拉框可收缩,让出空间给「管理」按钮 —— 按钮恒可见。
+        # maxWidth 160:宽面板时下拉框不会无限拉伸。stretch=1 + 行尾 addStretch:
+        # 多余宽度归行尾弹簧,「管理」始终紧挨下拉框。
+        self._series_selector.setMinimumWidth(48)
         self._series_selector.setMaximumWidth(160)
-        self._series_selector.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         self._refresh_series_selector()
         self._series_selector.currentIndexChanged.connect(self._on_series_selector_changed)
-        series_row.addWidget(self._series_selector)
+        series_row.addWidget(self._series_selector, stretch=1)
         manage_series_btn = QPushButton("管理")
         manage_series_btn.setToolTip("编号系列管理（新增/编辑/删除）")
         manage_series_btn.setFixedWidth(44)
@@ -1931,13 +1935,14 @@ class SpecimenWindow(QMainWindow):
         voucher_layout.addLayout(page_row)
         self._voucher_page = 0
         self._voucher_page_size = 200
-        self.voucher_panel = self._create_panel("入库编号", voucher_content, collapsible=False)
-        # 旧逻辑：setMinimumWidth(290) 硬下限，拖到 290px 卡住；后降到 150。
-        # 现配合 main_splitter.setChildrenCollapsible(True) 再降到 60，可拖到极窄甚至折叠，
-        # 把空间让给中央图片显示区。
-        # self.voucher_panel.setMinimumWidth(290)
-        # self.voucher_panel.setMinimumWidth(150)
-        self.voucher_panel.setMinimumWidth(60)
+        # scrollable=False:入库编号面板内含可自滚的表格,不再外套 QScrollArea。
+        self.voucher_panel = self._create_panel("入库编号", voucher_content,
+                                                collapsible=False, scrollable=False)
+        # 旧逻辑：290 硬下限 → 降 150 → 降 60。降到 60 后面板可拖到极窄,
+        # 但行内按钮(开始录入/管理/...)被裁切看不见 —— 用户多次反馈。
+        # 现：下限设 200,既能让出空间给中央图,又保证所有行按钮完整可见。
+        # 要彻底隐藏面板仍可用分割条折叠(setChildrenCollapsible)。
+        self.voucher_panel.setMinimumWidth(200)
 
         # Right: specimen info panel
         specimen_content = QWidget()
@@ -6262,7 +6267,8 @@ class SpecimenWindow(QMainWindow):
     # ---- Panel helpers ----
 
     @staticmethod
-    def _create_panel(title: str, content: QWidget, collapsible: bool = True) -> QFrame:
+    def _create_panel(title: str, content: QWidget, collapsible: bool = True,
+                      scrollable: bool = True) -> QFrame:
         frame = QFrame()
         frame.setFrameStyle(QFrame.StyledPanel | QFrame.Raised)
         layout = QVBoxLayout(frame)
@@ -6273,20 +6279,26 @@ class SpecimenWindow(QMainWindow):
         title_label.setStyleSheet("font-weight: bold; font-size: 12px; padding: 2px 0;")
         title_bar.addWidget(title_label)
         title_bar.addStretch()
-        # content 外包 QScrollArea:拖窄分割条时字段可滚动而非被裁切（旧版直接裁掉）。
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setWidget(content)
+        # scrollable=True:右侧数据面板(标本/照片/分类)外包 QScrollArea,拖窄时字段
+        # 可滚动而非裁切。scrollable=False:入库编号面板 —— 它内含 QTableWidget,
+        # 表格自带滚动;再套一层 QScrollArea 会让内容最小宽度撑出横向滚动条,把
+        # 行内按钮(开始录入/管理…)裁掉(用户多次反馈的"按键看不到")。
+        if scrollable:
+            holder = QScrollArea()
+            holder.setWidgetResizable(True)
+            holder.setFrameShape(QFrame.NoFrame)
+            holder.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            holder.setWidget(content)
+        else:
+            holder = content
         if collapsible:
             collapse_btn = QPushButton("−")
             collapse_btn.setFixedSize(22, 22)
             collapse_btn.setToolTip("折叠/展开面板")
-            collapse_btn.clicked.connect(lambda: _toggle_content(collapse_btn, scroll))
+            collapse_btn.clicked.connect(lambda: _toggle_content(collapse_btn, holder))
             title_bar.addWidget(collapse_btn)
         layout.addLayout(title_bar)
-        layout.addWidget(scroll, stretch=1)
+        layout.addWidget(holder, stretch=1)
         # Store toggle function in closure
         def _toggle_content(btn, w):
             visible = w.isVisible()
