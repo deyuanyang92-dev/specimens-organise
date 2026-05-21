@@ -1776,26 +1776,20 @@ class SpecimenWindow(QMainWindow):
         self._task_end_btn.clicked.connect(self._end_task)
         task_ind_layout.addWidget(self._task_end_btn)
         voucher_layout.addWidget(self._task_indicator)
-        personnel_btn = QPushButton("人员记录")
-        personnel_btn.setToolTip("查看录入工作量汇总，了解各录入人员的任务次数和时长")
-        personnel_btn.clicked.connect(self._open_workload_report)
-        voucher_layout.addWidget(personnel_btn)
+        # 「人员记录」按钮已从左侧面板移除（干扰「新增编号」）。
+        # 入口保留在菜单栏「入库 → 入库人员记录…」。
 
-        # 入库编号操作区：两行。旧设计单行塞「＋新增按钮(stretch=1 无限拉) + 系列下拉 +
-        # 管理按钮」，窄面板时新增按钮吞掉全部宽度、把系列/管理挤出可视区。
-        # 现拆两行：行1 新增按钮独占；行2 系列下拉 + 管理，保证两者始终可见。
-        # 行1：＋ 新增编号
+        # 行1：＋ 新增编号（满宽）。
         self._new_voucher_btn = QPushButton("＋ 新增编号")
         self._new_voucher_btn.setEnabled(False)
         self._new_voucher_btn.setToolTip("请先开始录入任务")
         self._new_voucher_btn.clicked.connect(self.new_specimen)
         voucher_layout.addWidget(self._new_voucher_btn)
-        # 编号系列行：标签 + 小下拉框 + 「编号系列管理」按钮，一行排开。
-        # 下拉框只放系列名(YZZ 等),不需要很宽 → minWidth 60 / maxWidth 130 限制为
-        # 紧凑尺寸。「编号系列管理」按钮取自然宽度(6 字约 108px),紧挨下拉框。
-        # 行尾 addStretch 吸收多余宽度,按钮始终紧贴下拉框、不被推走。
+        # 行2：编号系列 标签 + 小下拉框 + 「编号系列管理」按钮 —— 整组居中,
+        # 两侧加 addStretch 留白,不再左挤显得拥挤。
         series_row = QHBoxLayout()
-        series_row.setSpacing(4)
+        series_row.setSpacing(8)
+        series_row.addStretch(1)
         series_row.addWidget(QLabel("编号系列"))
         self._series_selector = QComboBox()
         self._series_selector.setToolTip("选择入库编号系列（当前系列用于新增编号）")
