@@ -6,7 +6,7 @@ import shutil
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -2107,6 +2107,121 @@ class Phase2CrossHostLockTests(unittest.TestCase):
         after = _json.loads(store.lock_file.read_text(encoding="utf-8"))["heartbeat_at"]
         self.assertNotEqual(before, after, "heartbeat_at should advance after write_lock_heartbeat_now()")
         store.release_lock()
+
+
+class Phase3TransactionJournalTests(unittest.TestCase):
+    """plan v0.10.0 Phase 3 (P1 事务 journal)：C1 行为回归。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_transaction_journal_commits_on_success(self) -> None:
+        from specimen_app.excel_store import ExcelStore
+        from specimen_app.models import TRANSACTION_JOURNAL_FILE
+        store = ExcelStore(self.tmp)
+        with store.with_transaction_journal("test_success") as tx_id:
+            self.assertTrue(tx_id)
+        journal = (store.data_dir / TRANSACTION_JOURNAL_FILE).read_text(encoding="utf-8")
+        import json as _json
+        records = [_json.loads(line) for line in journal.strip().split("\n") if line.strip()]
+        my_records = [r for r in records if r.get("id") == tx_id]
+        self.assertEqual(len(my_records), 2)
+        self.assertEqual(my_records[0].get("status"), "pending")
+        self.assertEqual(my_records[1].get("status"), "committed")
+
+    def test_transaction_journal_aborts_on_exception(self) -> None:
+        from specimen_app.excel_store import ExcelStore
+        from specimen_app.models import TRANSACTION_JOURNAL_FILE
+        store = ExcelStore(self.tmp)
+        tx_id_holder = []
+        with self.assertRaises(RuntimeError):
+            with store.with_transaction_journal("test_failure") as tx_id:
+                tx_id_holder.append(tx_id)
+                raise RuntimeError("simulated failure")
+        journal = (store.data_dir / TRANSACTION_JOURNAL_FILE).read_text(encoding="utf-8")
+        import json as _json
+        records = [_json.loads(line) for line in journal.strip().split("\n") if line.strip()]
+        my_records = [r for r in records if r.get("id") == tx_id_holder[0]]
+        self.assertEqual(my_records[-1].get("status"), "aborted")
+        self.assertIn("simulated failure", my_records[-1].get("error", ""))
+
+    def test_store_init_exposes_pending_not_dialog(self) -> None:
+        """plan C1 headless 修正：store 只暴露 pending 列表，不弹对话框。"""
+        from specimen_app.excel_store import ExcelStore
+        from specimen_app.models import TRANSACTION_JOURNAL_FILE
+        store = ExcelStore(self.tmp)
+        # 手工 inject pending 记录到 journal
+        import json as _json
+        journal_path = store.data_dir / TRANSACTION_JOURNAL_FILE
+        with journal_path.open("a", encoding="utf-8") as h:
+            h.write(_json.dumps({
+                "id": "fake-pending-id",
+                "operation_name": "fake_op",
+                "started_at": "2026-05-25T12:00:00",
+                "status": "pending",
+                "snapshot_path": None,
+            }) + "\n")
+        store.release_lock()
+        # 重开 store：应填充 pending_transaction_records 但不弹任何对话框
+        store2 = ExcelStore(self.tmp)
+        self.assertEqual(len(store2.pending_transaction_records), 1)
+        self.assertEqual(store2.pending_transaction_records[0]["id"], "fake-pending-id")
+        store2.release_lock()
+
+    def test_pending_record_resolves_abort_when_snapshot_null(self) -> None:
+        from specimen_app.excel_store import ExcelStore
+        from specimen_app.models import TRANSACTION_JOURNAL_FILE
+        store = ExcelStore(self.tmp)
+        # inject pending 无 snapshot
+        import json as _json
+        with (store.data_dir / TRANSACTION_JOURNAL_FILE).open("a", encoding="utf-8") as h:
+            h.write(_json.dumps({
+                "id": "null-snap-id",
+                "operation_name": "fake_op",
+                "started_at": "2026-05-25T12:00:00",
+                "status": "pending",
+                "snapshot_path": None,
+            }) + "\n")
+        store.pending_transaction_records = store._scan_transaction_journal_for_pending_records()
+        # 无 snapshot 时调 restore_snapshot 应抛 ValueError（提示 UI 隐藏按钮）
+        with self.assertRaises(ValueError):
+            store.resolve_pending_transaction("null-snap-id", "restore_snapshot")
+        # 但 abort 一定能成功
+        store.resolve_pending_transaction("null-snap-id", "abort_and_keep_current")
+        self.assertEqual(store.pending_transaction_records, [])
+
+    def test_journal_vacuum_drops_old_committed_records(self) -> None:
+        from specimen_app.excel_store import ExcelStore
+        from specimen_app.models import TRANSACTION_JOURNAL_FILE
+        store = ExcelStore(self.tmp)
+        journal_path = store.data_dir / TRANSACTION_JOURNAL_FILE
+        import json as _json
+        # 写一条 365 天前的 committed + 一条今天的 committed + 一条 pending
+        old_ts = (datetime.now() - timedelta(days=365)).isoformat(timespec="seconds")
+        with journal_path.open("a", encoding="utf-8") as h:
+            h.write(_json.dumps({"id": "old-c", "status": "pending", "started_at": old_ts, "operation_name": "x"}) + "\n")
+            h.write(_json.dumps({"id": "old-c", "status": "committed", "ended_at": old_ts}) + "\n")
+            h.write(_json.dumps({"id": "new-c", "status": "committed", "ended_at": datetime.now().isoformat(timespec="seconds")}) + "\n")
+            h.write(_json.dumps({"id": "pend", "status": "pending", "started_at": old_ts, "operation_name": "x", "snapshot_path": None}) + "\n")
+        dropped = store.vacuum_transaction_journal(older_than_days=180)
+        # 旧 committed 的 2 行（pending+committed）都应被丢弃；pending 保留；新 committed 保留
+        self.assertGreaterEqual(dropped, 2)
+        remaining = journal_path.read_text(encoding="utf-8")
+        self.assertNotIn("old-c", remaining)
+        self.assertIn("pend", remaining)
+
+    def test_delete_specimen_creates_journal_entry(self) -> None:
+        from specimen_app.excel_store import ExcelStore
+        from specimen_app.models import TRANSACTION_JOURNAL_FILE
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+        store.delete_specimen(voucher)
+        journal = (store.data_dir / TRANSACTION_JOURNAL_FILE).read_text(encoding="utf-8")
+        self.assertIn(f"delete_specimen({voucher})", journal)
+        self.assertIn("committed", journal)
 
 
 if __name__ == "__main__":

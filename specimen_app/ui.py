@@ -1145,6 +1145,9 @@ class SpecimenWindow(QMainWindow):
             if not self.read_only and self.store is not None:
                 self._lock_heartbeat_thread = LockHeartbeatThread(self.store, interval_seconds=60.0, parent=self)
                 self._lock_heartbeat_thread.start()
+            # plan C1: 启动恢复对话框由 UI 层负责（不在 ExcelStore.__init__ 内弹，保 headless 可用）
+            if not self.read_only and self.store is not None and self.store.pending_transaction_records:
+                self._prompt_for_pending_transactions()
 
         self.current_voucher: str | None = None
         self.current_photos: list[dict[str, str]] = []
@@ -4599,6 +4602,54 @@ class SpecimenWindow(QMainWindow):
             item.setText(fallback)
             self.photo_table.blockSignals(False)
             QMessageBox.critical(self, "保存失败", str(exc))
+
+    def _prompt_for_pending_transactions(self) -> None:
+        """plan C1：启动时若 store.pending_transaction_records 非空，逐条弹恢复对话框。
+
+        对话框按钮逻辑（plan A 修正）：
+          - ``snapshot_path`` 非空 → 显示 [回退到操作前快照] + [继续(标 aborted)] 两个按钮
+          - ``snapshot_path`` == None（NAS 超时未建快照）→ **隐藏「回退」按钮**，
+            只显示 [继续(标 aborted, 用户手工检查)]，附文案说明无法自动回退
+
+        UI 层独立于 ExcelStore.__init__，让未来的 CLI / headless 工具也能用 store 而不弹窗。
+        """
+        if self.store is None:
+            return
+        for record in list(self.store.pending_transaction_records):
+            record_id = record.get("id", "")
+            operation_name = record.get("operation_name", "未知操作")
+            started_at = record.get("started_at", "")
+            snapshot_path = record.get("snapshot_path")
+            dialog = QMessageBox(self)
+            dialog.setIcon(QMessageBox.Warning)
+            dialog.setWindowTitle("上次操作中断 — 恢复决定")
+            text = f"上次操作 `{operation_name}` 中断（{started_at}）。"
+            informative_lines = []
+            if snapshot_path:
+                informative_lines.append("可选择回退到操作前的自动快照，或标记为已中断、保留当前数据。")
+                restore_button = dialog.addButton("回退到操作前快照", QMessageBox.AcceptRole)
+                continue_button = dialog.addButton("继续 (标记为已中断)", QMessageBox.RejectRole)
+                dialog.setDefaultButton(restore_button)
+            else:
+                informative_lines.append(
+                    "快照创建失败（疑似 NAS 超时），无法自动回退。"
+                    "请人工检查 数据/ 目录完整性后再继续。"
+                )
+                restore_button = None
+                continue_button = dialog.addButton("继续 (标记为已中断)", QMessageBox.AcceptRole)
+                dialog.setDefaultButton(continue_button)
+            dialog.setText(text)
+            dialog.setInformativeText("\n".join(informative_lines))
+            dialog.exec_()
+            clicked = dialog.clickedButton()
+            try:
+                if restore_button is not None and clicked is restore_button:
+                    self.store.resolve_pending_transaction(record_id, "restore_snapshot")
+                    QMessageBox.information(self, "回退完成", f"已回退到 {snapshot_path}")
+                else:
+                    self.store.resolve_pending_transaction(record_id, "abort_and_keep_current")
+            except Exception as exc:
+                QMessageBox.critical(self, "恢复失败", f"处理 pending 事务 {record_id} 失败：{exc}")
 
     def _add_write_action_to_menu(self, menu: QMenu, label: str, callback) -> QAction:
         """plan A2 helper: add a menu action that is disabled when the window is in read-only mode.

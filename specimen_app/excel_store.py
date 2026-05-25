@@ -12,7 +12,7 @@ import time  # plan B1: 心跳时间戳
 import uuid
 from collections import Counter, OrderedDict
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterator
 from zipfile import BadZipFile, ZipFile  # plan A5: 写后校验 xlsx ZIP 完整性
@@ -85,6 +85,7 @@ from .models import (
     SUMMARY_COLUMN_SOURCE,
     HeartbeatThreadStalled,
     SnapshotIntegrityCheckFailed,
+    TRANSACTION_JOURNAL_FILE,
     WORKSPACE_CONFIG_FILE,
     WorkbookWriteVerificationFailed,
     WorkspaceLockedError,
@@ -173,6 +174,10 @@ class ExcelStore:
         self._persistent_host_id = load_or_create_persistent_host_id()
         self._instance_id = uuid.uuid4().hex
         self._last_heartbeat_write_monotonic: float = time.monotonic()
+        # plan C1: 跨文件事务 journal pending 记录列表（在 __init__ 末尾由扫描填充）
+        # 类型：[{id, operation_name, started_at, status:"pending", snapshot_path: str | None}, ...]
+        # UI 层（SpecimenWindow.__init__）读取并逐条弹恢复对话框。
+        self.pending_transaction_records: list[dict[str, Any]] = []
         # 规范化软件设计 2026-05 P1 审查修复:_row_cache 加 LRU 上限。
         # 2026-05 内存档位扩展:maxsize 由 memory_profile 驱动 (3/4/6/12/20)。
         # settings 不可用 fallback 到 8 (老默认)。
@@ -227,6 +232,15 @@ class ExcelStore:
         _startup_mark("ExcelStore.ensure_index")
         self._sync_next_serial()
         _startup_mark("ExcelStore._sync_next_serial")
+        # plan C1: 启动时扫 transaction.jsonl 找 pending 记录，store 只暴露列表不弹对话框
+        # （让 UI 层 / headless CLI 自行决定怎么处理）。只读副本跳过——它不会留 pending。
+        if not self._read_only:
+            self.pending_transaction_records = self._scan_transaction_journal_for_pending_records()
+            try:
+                self.vacuum_transaction_journal(older_than_days=180)
+            except OSError:
+                pass
+            _startup_mark("ExcelStore.scan_transaction_journal")
 
     def close(self) -> None:
         """释放工作区锁文件。退出应用前应调用，避免遗留过期锁。
@@ -820,20 +834,23 @@ class ExcelStore:
         specimen = self.get_specimen(voucher)
         if not specimen:
             return
-        old = {
-            "specimen": specimen,
-            "classification": self.get_classification(voucher),
-            "photos": self.get_photos(voucher),
-            "index": self._find_index(voucher),
-        }
-        remaining_photos = [row for row in self.read_rows("photo") if self._value(row, "入库编号*") != voucher]
-        self._delete_rows("specimen", voucher)
-        self._delete_rows("classification", voucher)
-        self._write_rows("photo", remaining_photos)
-        for photo in old["photos"]:
-            self._delete_unreferenced_photo_file(photo, remaining_photos)
-        self._delete_index(voucher)
-        self._record_action("delete_specimen", voucher, "specimen", "", old, {})
+        # plan C1: delete_specimen 跨 4 张 xlsx + 多个照片归档文件，真多文件原子性场景。
+        # crash 在中途会留半残工作区，所以用 transaction journal 包住。
+        with self.with_transaction_journal(f"delete_specimen({voucher})"):
+            old = {
+                "specimen": specimen,
+                "classification": self.get_classification(voucher),
+                "photos": self.get_photos(voucher),
+                "index": self._find_index(voucher),
+            }
+            remaining_photos = [row for row in self.read_rows("photo") if self._value(row, "入库编号*") != voucher]
+            self._delete_rows("specimen", voucher)
+            self._delete_rows("classification", voucher)
+            self._write_rows("photo", remaining_photos)
+            for photo in old["photos"]:
+                self._delete_unreferenced_photo_file(photo, remaining_photos)
+            self._delete_index(voucher)
+            self._record_action("delete_specimen", voucher, "specimen", "", old, {})
 
     def clear_photos(self, voucher: str) -> int:
         photos = self.get_photos(voucher)
@@ -1513,6 +1530,20 @@ class ExcelStore:
         source_root: Path | str,
         photo_duplicate_policy: str = "import",
     ) -> ImportResult:
+        """合并源工作区到当前工作区（外部入口）。
+
+        plan C1：导入跨 4 张主表 + 索引 + 修改记录 + 多文件归档，最典型的跨文件原子性场景。
+        crash 在中途留下半残合并结果，所以包 transaction journal。
+        实际工作在 ``_import_workspace_unwrapped`` 内完成。
+        """
+        with self.with_transaction_journal(f"import_workspace({source_root})"):
+            return self._import_workspace_unwrapped(source_root, photo_duplicate_policy)
+
+    def _import_workspace_unwrapped(
+        self,
+        source_root: Path | str,
+        photo_duplicate_policy: str = "import",
+    ) -> ImportResult:
         """合并源工作区到当前工作区。
 
         photo_duplicate_policy: M4 跨 voucher 同 SHA256 照片审核策略
@@ -1803,6 +1834,265 @@ class ExcelStore:
     def list_data_versions(self) -> list[Row]:
         rows = self._read_plain_rows(self.data_dir / DATA_VERSION_LOG_FILE, DATA_VERSION_LOG_HEADERS)
         return [row for row in rows if self._value(row, "快照路径")]
+
+    # ---- plan C1: 跨文件事务 journal -----------------------------------------
+
+    def create_snapshot_bypassing_readonly_guard(self, timeout_seconds: float = 30.0) -> Path | None:
+        """plan C1：给 ``with_transaction_journal`` 用的"绕只读守卫"快照入口。
+
+        必要性：``create_data_snapshot`` 被 ``_install_readonly_guards`` 包过；
+        而 journal 写入是只读模式不会走的路径，所以这里直接调下层私有方法。
+        在 NAS / SMB 上 ``shutil.copy2`` 可能挂死，因此用后台线程 + ``Event.wait(timeout)``
+        做软超时：超时返回 ``None``，journal 据此记 ``snapshot:null``，恢复对话框
+        据此**隐藏"回退"按钮**（避免 ``restore_data_snapshot(None)`` 崩）。
+        """
+        if self._read_only:
+            return None
+        import threading
+
+        result_holder: dict[str, Path | None] = {"path": None}
+        error_holder: dict[str, Exception | None] = {"error": None}
+        finished = threading.Event()
+
+        # 用 __dict__ 直接拿到未被 readonly guard 包过的原始方法（其实写状态下不需要绕，但保险）
+        bound_create = type(self).create_data_snapshot.__get__(self, type(self))
+
+        def _worker() -> None:
+            try:
+                result_holder["path"] = bound_create("事务前快照", "transaction.jsonl 自动快照")
+            except Exception as exc:
+                error_holder["error"] = exc
+            finally:
+                finished.set()
+
+        worker_thread = threading.Thread(
+            target=_worker,
+            name="create_snapshot_for_transaction_journal",
+            daemon=True,
+        )
+        worker_thread.start()
+        if not finished.wait(timeout=timeout_seconds):
+            # 超时：worker 还在跑（被 NAS 卡住），不阻塞主线程，留个孤儿线程让它自己跑完或随进程退出
+            return None
+        if error_holder["error"] is not None:
+            # 已知失败：snapshot 路径不可用
+            return None
+        return result_holder["path"]
+
+    @contextmanager
+    def with_transaction_journal(self, operation_name: str) -> Iterator[str]:
+        """plan C1：把"多文件写入操作"包成事务，crash 时下次启动可恢复。
+
+        Enter：调 ``create_snapshot_bypassing_readonly_guard``（30s 超时），写一行
+              ``{id, operation_name, started_at, status:"pending", snapshot_path}`` 到 journal。
+        正常退出：再追加 ``{id, status:"committed", ended_at}``。
+        异常退出：追加 ``{id, status:"aborted", ended_at, error}`` 后 reraise。
+
+        恢复语义（启动时扫 journal）：
+          - 同一 id 最后状态 == "pending" → 真的中断了，UI 弹对话框让用户选回退/继续
+          - snapshot_path == None → 对话框隐藏"回退"按钮（无法自动回退）
+
+        yield 出 transaction_id，调用方一般不需要用。
+        """
+        if self._read_only:
+            # 只读不该到达这里；防御性 yield 个假 id，不写 journal
+            yield f"readonly-noop-{uuid.uuid4().hex}"
+            return
+        transaction_id = uuid.uuid4().hex
+        snapshot_path = self.create_snapshot_bypassing_readonly_guard(timeout_seconds=30.0)
+        started_at = datetime.now().isoformat(timespec="seconds")
+        self._append_transaction_journal_record({
+            "id": transaction_id,
+            "operation_name": operation_name,
+            "started_at": started_at,
+            "status": "pending",
+            "snapshot_path": str(snapshot_path) if snapshot_path is not None else None,
+        })
+        try:
+            yield transaction_id
+        except Exception as exc:
+            self._append_transaction_journal_record({
+                "id": transaction_id,
+                "status": "aborted",
+                "ended_at": datetime.now().isoformat(timespec="seconds"),
+                "error": str(exc)[:500],
+            })
+            raise
+        else:
+            self._append_transaction_journal_record({
+                "id": transaction_id,
+                "status": "committed",
+                "ended_at": datetime.now().isoformat(timespec="seconds"),
+            })
+
+    def _append_transaction_journal_record(self, record: dict[str, Any]) -> None:
+        """plan C1：把一条 JSON 记录追加到 ``transaction.jsonl``。
+
+        用 ``os.O_APPEND`` 行级追加；POSIX 保证 ``write()`` < PIPE_BUF (~4KB) 时原子，
+        我们的 record 通常 < 200 字节，安全。文件不存在则创建。
+        """
+        journal_path = self.data_dir / TRANSACTION_JOURNAL_FILE
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        try:
+            fd = os.open(journal_path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o644)
+        except OSError:
+            return  # journal 写失败不应阻塞主流程
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+
+    def _scan_transaction_journal_for_pending_records(self) -> list[dict[str, Any]]:
+        """plan C1：读 ``transaction.jsonl``，返回所有"最后状态为 pending"的事务记录。
+
+        同一 id 多行的合并规则：按出现顺序，最后一行的 status 决定该事务最终状态。
+        ``pending``（无后续 commit/abort）= 真的中断；其他 = 正常完成。
+        """
+        journal_path = self.data_dir / TRANSACTION_JOURNAL_FILE
+        if not journal_path.exists():
+            return []
+        latest_by_id: dict[str, dict[str, Any]] = {}
+        try:
+            with journal_path.open("r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    try:
+                        record = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        continue
+                    record_id = record.get("id")
+                    if not record_id:
+                        continue
+                    existing = latest_by_id.get(record_id)
+                    if existing is None:
+                        latest_by_id[record_id] = record
+                    else:
+                        # 合并：保留首条 record 的 op/started_at/snapshot_path，更新 status/ended_at
+                        merged = dict(existing)
+                        merged.update({k: v for k, v in record.items() if v is not None or k == "snapshot_path"})
+                        latest_by_id[record_id] = merged
+        except OSError:
+            return []
+        return [r for r in latest_by_id.values() if r.get("status") == "pending"]
+
+    def resolve_pending_transaction(self, record_id: str, resolution: str) -> None:
+        """plan C1：UI 层对恢复对话框的决定回传给 store。
+
+        Args:
+            record_id: pending 记录的 id（从 ``self.pending_transaction_records`` 取）
+            resolution: 必须是 ``"restore_snapshot"`` 或 ``"abort_and_keep_current"``
+                之一。前者调 ``restore_data_snapshot``；后者只标 aborted。
+        """
+        if resolution not in ("restore_snapshot", "abort_and_keep_current"):
+            raise ValueError(f"unknown resolution: {resolution}")
+        target_record = next(
+            (r for r in self.pending_transaction_records if r.get("id") == record_id),
+            None,
+        )
+        if target_record is None:
+            return
+        if resolution == "restore_snapshot":
+            snapshot_path_str = target_record.get("snapshot_path")
+            if not snapshot_path_str:
+                raise ValueError(
+                    "该事务无快照可回退（snapshot_path 为空）。请在 UI 层把"
+                    "「回退」按钮隐藏，让用户只能选「继续」。"
+                )
+            self.restore_data_snapshot(Path(snapshot_path_str))
+        self._append_transaction_journal_record({
+            "id": record_id,
+            "status": "aborted",
+            "ended_at": datetime.now().isoformat(timespec="seconds"),
+            "resolved_by_user": resolution,
+        })
+        self.pending_transaction_records = [
+            r for r in self.pending_transaction_records if r.get("id") != record_id
+        ]
+
+    def vacuum_transaction_journal(self, older_than_days: int = 180) -> int:
+        """plan C1：物理重写 ``transaction.jsonl``，丢弃已完结（committed/aborted）且年龄 > N 天的事务的全部记录。
+
+        判定方式：先扫一遍 journal 算出每个 id 的最终状态 + 最近时间戳；
+        最终状态是 committed/aborted 且最近时间 < cutoff，则该 id 的所有行都丢弃。
+        pending 事务的所有行无论年龄一律保留（等用户决定）。
+        返回被丢弃的行数。
+        """
+        if self._read_only:
+            return 0
+        journal_path = self.data_dir / TRANSACTION_JOURNAL_FILE
+        if not journal_path.exists():
+            return 0
+        cutoff_iso = (datetime.now() - timedelta(days=older_than_days)).isoformat(timespec="seconds")
+
+        # 第一遍：算出每个 id 的最终状态 + 最近时间戳
+        final_status_by_id: dict[str, str] = {}
+        latest_timestamp_by_id: dict[str, str] = {}
+        try:
+            with journal_path.open("r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    stripped = raw_line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        record = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    record_id = record.get("id")
+                    if not record_id:
+                        continue
+                    status = record.get("status")
+                    if status:
+                        final_status_by_id[record_id] = status
+                    timestamp = record.get("ended_at") or record.get("started_at") or ""
+                    if timestamp and timestamp > latest_timestamp_by_id.get(record_id, ""):
+                        latest_timestamp_by_id[record_id] = timestamp
+        except OSError:
+            return 0
+
+        ids_to_drop = {
+            record_id
+            for record_id, final_status in final_status_by_id.items()
+            if final_status in ("committed", "aborted")
+            and latest_timestamp_by_id.get(record_id, "") < cutoff_iso
+            and latest_timestamp_by_id.get(record_id, "")
+        }
+
+        # 第二遍：重写 journal 跳过待丢弃 id 的所有行
+        kept_lines: list[str] = []
+        dropped_count = 0
+        try:
+            with journal_path.open("r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    stripped = raw_line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        record = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        kept_lines.append(stripped)  # 损坏行保留，方便事后排查
+                        continue
+                    if record.get("id") in ids_to_drop:
+                        dropped_count += 1
+                        continue
+                    kept_lines.append(stripped)
+        except OSError:
+            return 0
+        if dropped_count == 0:
+            return 0
+        tmp = journal_path.with_suffix(f".{os.getpid()}.tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as handle:
+                handle.write("\n".join(kept_lines) + "\n" if kept_lines else "")
+            tmp.replace(journal_path)
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return 0
+        return dropped_count
 
     def restore_data_snapshot(self, snapshot_path: Path | str) -> None:
         snapshot = Path(snapshot_path).resolve()

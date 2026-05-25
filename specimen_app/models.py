@@ -17,6 +17,7 @@ CLASSIFICATION_FILE = "分类信息.xlsx"  # 也供 server_sync.preview_aggregat
 INDEX_FILE = "编号索引.xlsx"
 CHANGE_LOG_FILE = "修改记录.xlsx"
 ACTION_LOG_FILE = "操作记录.xlsx"
+TRANSACTION_JOURNAL_FILE = "transaction.jsonl"  # plan C1：跨文件事务恢复 journal
 DATA_VERSION_LOG_FILE = "数据版本记录.xlsx"
 ALLOC_LOG_FILE = "编号分发记录.xlsx"
 WORKSPACE_CONFIG_FILE = "工作区配置.json"
