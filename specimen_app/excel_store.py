@@ -840,23 +840,26 @@ class ExcelStore:
         specimen = self.get_specimen(voucher)
         if not specimen:
             return
-        # plan C1: delete_specimen 跨 4 张 xlsx + 多个照片归档文件，真多文件原子性场景。
-        # crash 在中途会留半残工作区，所以用 transaction journal 包住。
-        with self.with_transaction_journal(f"delete_specimen({voucher})"):
-            old = {
-                "specimen": specimen,
-                "classification": self.get_classification(voucher),
-                "photos": self.get_photos(voucher),
-                "index": self._find_index(voucher),
-            }
-            remaining_photos = [row for row in self.read_rows("photo") if self._value(row, "入库编号*") != voucher]
-            self._delete_rows("specimen", voucher)
-            self._delete_rows("classification", voucher)
-            self._write_rows("photo", remaining_photos)
-            for photo in old["photos"]:
-                self._delete_unreferenced_photo_file(photo, remaining_photos)
-            self._delete_index(voucher)
-            self._record_action("delete_specimen", voucher, "specimen", "", old, {})
+        # 旧（v0.10.0 plan C1）：with self.with_transaction_journal(f"delete_specimen({voucher})"):
+        # 该包装让每次 delete 都拷整个 数据/ 做 snapshot (~30-50MB IO + sha256)，用户感知秒级卡顿。
+        # 退回（v0.10.1 hotfix）：直接执行。delete_specimen 的回滚信息全部装入 _record_action
+        # 单条 action-log 条目（specimen + classification + photos + index 一并），undo 走
+        # _apply_action[delete_specimen, undo=True] 路径完整恢复，无需额外 snapshot。
+        # transaction journal 包装保留给真多文件 + 真重 IO 的 import_workspace。
+        old = {
+            "specimen": specimen,
+            "classification": self.get_classification(voucher),
+            "photos": self.get_photos(voucher),
+            "index": self._find_index(voucher),
+        }
+        remaining_photos = [row for row in self.read_rows("photo") if self._value(row, "入库编号*") != voucher]
+        self._delete_rows("specimen", voucher)
+        self._delete_rows("classification", voucher)
+        self._write_rows("photo", remaining_photos)
+        for photo in old["photos"]:
+            self._delete_unreferenced_photo_file(photo, remaining_photos)
+        self._delete_index(voucher)
+        self._record_action("delete_specimen", voucher, "specimen", "", old, {})
 
     def clear_photos(self, voucher: str) -> int:
         photos = self.get_photos(voucher)
@@ -2869,33 +2872,43 @@ class ExcelStore:
         self._ensure_workbook(self.data_dir / ALLOC_LOG_FILE, ALLOC_LOG_HEADERS)
 
     def _verify_workbook_file_can_be_reopened(self, workbook_path: Path) -> None:
-        """plan A5：把 openpyxl 刚写完的 xlsx 当 ZIP 打开校验完整性。
+        """plan A5（v0.10.1 hotfix）：把 openpyxl 刚写完的 xlsx 当 ZIP 打开校验完整性。
 
         触发场景：openpyxl ``wb.save(tmp)`` 在 OOM/磁盘满/SMB 抖断时会留下截断的 ZIP，
         随后 ``tmp.replace(target)`` 原子换上去，用户工作区就坏了。本 helper 在 replace
-        之前用 stdlib ``ZipFile.testzip()`` 检：central directory 残缺、文件 CRC 不符、
-        member 缺失都会被发现 → 抛 ``WorkbookWriteVerificationFailed``，同时删 tmp。
+        之前用 stdlib ``zipfile`` 做**轻量**头部校验：打开 ZIP（central directory 完整
+        会成功） + 检查 ``[Content_Types].xml`` 在 namelist 中（xlsx 半写时该 part
+        缺失最常见）。失败抛 ``WorkbookWriteVerificationFailed``，同时删 tmp。
 
-        用 stdlib ``zipfile`` 而非 ``openpyxl.load_workbook``——后者按文件扩展名拒
-        ``.tmp``，且解析整本 sheet 太慢；前者只校验 ZIP 字节结构，几 ms 完成。
+        旧（v0.10.0）：``archive.testzip()`` 读全部 member 并算 CRC，5000-行 xlsx
+        每次几十到上百 ms。在 ``_append_row_incremental`` / ``_record_action`` 这种
+        每次用户编辑都跑的高频路径上，累计延迟达 200ms+，用户感知"异常的卡"。
+        新（v0.10.1）：只读 ZIP 头 + namelist，< 1ms，恢复 v0.9.9 交互流畅度。
+        member CRC 检测属于 bit-rot 防护，由 v0.11.0 backlog 的"SHA 位腐败检测"
+        专项处理，与 A5 的"openpyxl 半写"目标分离。
 
         所有 ``wb.save(tmp) → tmp.replace(target)`` 路径中间必须插一次本函数调用。
         """
+        failure_reason: str | None = None
         try:
             with ZipFile(workbook_path, "r") as archive:
-                corrupted_member_name = archive.testzip()
-            if corrupted_member_name is not None:
-                raise WorkbookWriteVerificationFailed(
-                    f"Excel 写入校验失败：{workbook_path.name} 内 ZIP 成员 CRC 错: {corrupted_member_name}"
-                )
+                archive_member_names = archive.namelist()
         except (BadZipFile, OSError) as exc:
+            failure_reason = f"ZIP 损坏 (疑似存储介质问题): {exc}"
+            archive_member_names = []
+        if failure_reason is None:
+            if not archive_member_names:
+                failure_reason = "ZIP 空 namelist (半写)"
+            elif "[Content_Types].xml" not in archive_member_names:
+                failure_reason = "缺 [Content_Types].xml (xlsx 必有 part)"
+        if failure_reason is not None:
             try:
                 workbook_path.unlink()
             except OSError:
                 pass
             raise WorkbookWriteVerificationFailed(
-                f"Excel 写入校验失败 (疑似存储介质问题): {workbook_path.name}: {exc}"
-            ) from exc
+                f"Excel 写入校验失败：{workbook_path.name}: {failure_reason}"
+            )
 
     # ── 编号分发日志 ──────────────────────────────────────────────────────────
 

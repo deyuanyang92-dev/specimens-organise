@@ -2005,6 +2005,28 @@ class Phase1DataSafetyTests(unittest.TestCase):
         store._verify_workbook_file_can_be_reopened(good)
         self.assertTrue(good.exists())
 
+    def test_excel_write_verify_catches_missing_content_types(self) -> None:
+        """v0.10.1 hotfix H1：xlsx 必有的 [Content_Types].xml 缺失时仍能被检出。"""
+        import zipfile as _zipfile
+        store = ExcelStore(self.tmp)
+        bad = self.tmp / "missing_content_types.xlsx"
+        # 造一个有 namelist 但缺 [Content_Types].xml 的 ZIP
+        with _zipfile.ZipFile(bad, "w") as zf:
+            zf.writestr("xl/workbook.xml", "<workbook/>")
+        with self.assertRaises(WorkbookWriteVerificationFailed):
+            store._verify_workbook_file_can_be_reopened(bad)
+        self.assertFalse(bad.exists())  # 验证失败时仍 unlink
+
+    def test_excel_write_verify_catches_empty_zip(self) -> None:
+        """v0.10.1 hotfix H1：完全空 ZIP（namelist 空）也应被检出为半写。"""
+        import zipfile as _zipfile
+        store = ExcelStore(self.tmp)
+        bad = self.tmp / "empty.xlsx"
+        with _zipfile.ZipFile(bad, "w"):
+            pass
+        with self.assertRaises(WorkbookWriteVerificationFailed):
+            store._verify_workbook_file_can_be_reopened(bad)
+
 
 class Phase2CrossHostLockTests(unittest.TestCase):
     """plan v0.10.0 Phase 2 (P1 跨机锁加固)：B1 行为回归。"""
@@ -2213,15 +2235,20 @@ class Phase3TransactionJournalTests(unittest.TestCase):
         self.assertNotIn("old-c", remaining)
         self.assertIn("pend", remaining)
 
-    def test_delete_specimen_creates_journal_entry(self) -> None:
+    def test_delete_specimen_no_longer_creates_journal_entry(self) -> None:
+        """v0.10.1 hotfix：delete_specimen 取消 transaction journal 包装，
+        action-log 单条已含全部回滚信息；每次 delete 不再拷整个 数据/。"""
         from specimen_app.excel_store import ExcelStore
         from specimen_app.models import TRANSACTION_JOURNAL_FILE
         store = ExcelStore(self.tmp)
         voucher = store.create_specimen()
         store.delete_specimen(voucher)
-        journal = (store.data_dir / TRANSACTION_JOURNAL_FILE).read_text(encoding="utf-8")
-        self.assertIn(f"delete_specimen({voucher})", journal)
-        self.assertIn("committed", journal)
+        journal_path = store.data_dir / TRANSACTION_JOURNAL_FILE
+        journal = journal_path.read_text(encoding="utf-8") if journal_path.exists() else ""
+        self.assertNotIn(f"delete_specimen({voucher})", journal)
+        # 但 undo 仍应能完整还原（action-log 路径）
+        store.undo_last()
+        self.assertIsNotNone(store.get_specimen(voucher))
 
 
 class Phase4PerformanceTests(unittest.TestCase):
