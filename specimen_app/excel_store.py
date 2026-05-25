@@ -180,6 +180,8 @@ class ExcelStore:
         self.pending_transaction_records: list[dict[str, Any]] = []
         # plan D2: 入库汇总派生 SQLite 缓存；lazy 初始化，避免只读副本也建文件
         self._inventory_summary_cache_database: Any = None
+        # plan E1: 照片归档管理（文件系统侧）；lazy 创建，仅在用到时实例化
+        self._photo_archive_manager: Any = None
         # 规范化软件设计 2026-05 P1 审查修复:_row_cache 加 LRU 上限。
         # 2026-05 内存档位扩展:maxsize 由 memory_profile 驱动 (3/4/6/12/20)。
         # settings 不可用 fallback 到 8 (老默认)。
@@ -2379,11 +2381,28 @@ class ExcelStore:
     def _archive_target_path(self, archive_dir: Path, digest: str, clean_name: str) -> Path:
         return self._available_archive_target(archive_dir, clean_name, digest)
 
+    def photo_archive(self):
+        """plan E1：lazy 获取 ``PhotoArchive`` 单例。
+
+        现阶段仅文件系统侧 4 个 helper 走 PhotoArchive；其他归档方法继续留在 ExcelStore。
+        v0.11.0 会继续向 PhotoArchive 迁移 ``_archive_photo_file`` 等更复杂的方法。
+        """
+        if self._photo_archive_manager is None:
+            from .photo_archive import PhotoArchive
+            self._photo_archive_manager = PhotoArchive(
+                workspace_root=self.root,
+                read_only=self._read_only,
+                read_photo_rows_callback=lambda: self.read_rows("photo"),
+            )
+        return self._photo_archive_manager
+
     def _photo_archive_dir(self) -> Path:
-        return self.root / "照片"
+        # plan E1: 委托给 PhotoArchive；保持原方法名让现有调用方零改动
+        return self.photo_archive().compute_workspace_archive_directory()
 
     def _archive_relative_path(self, path: Path) -> str:
-        return "./" + path.resolve().relative_to(self.root).as_posix()
+        # plan E1: 委托给 PhotoArchive
+        return self.photo_archive().compute_archive_relative_path(path)
 
     def _is_under_root(self, path: Path, root: Path) -> bool:
         try:
@@ -2540,11 +2559,8 @@ class ExcelStore:
             return False
 
     def _is_workspace_archive_path(self, path: Path) -> bool:
-        try:
-            path.resolve().relative_to(self._photo_archive_dir().resolve())
-            return True
-        except ValueError:
-            return False
+        # plan E1: 委托给 PhotoArchive
+        return self.photo_archive().is_path_under_workspace_archive_directory(path)
 
     def _is_managed_photo_path(self, photo_row: Row, path: Path) -> bool:
         if self._is_workspace_archive_path(path):
@@ -2562,14 +2578,8 @@ class ExcelStore:
         return bool(absolute) and Path(absolute).expanduser().resolve() == path.resolve()
 
     def _safe_photo_filename(self, filename: str, default_suffix: str = "") -> str:
-        name = Path(filename or "photo").name.strip() or "photo"
-        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
-        path = Path(name)
-        suffix = path.suffix or default_suffix
-        stem = path.stem or "photo"
-        if len(stem) > 140:
-            stem = stem[:140].rstrip(" ._") or "photo"
-        return f"{stem}{suffix}"
+        # plan E1: 委托给 PhotoArchive
+        return self.photo_archive().sanitize_photo_filename_for_storage(filename, default_suffix)
 
     def _file_sha256(self, path: Path) -> str:
         h = hashlib.sha256()

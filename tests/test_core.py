@@ -2326,5 +2326,56 @@ class Phase4PerformanceTests(unittest.TestCase):
         self.assertFalse(result)
 
 
+class Phase5PhotoArchiveExtractionTests(unittest.TestCase):
+    """plan v0.10.0 Phase 5 (P2 结构拆分)：E1 PhotoArchive 模块抽离。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_photo_archive_module_can_be_imported_standalone(self) -> None:
+        """PhotoArchive 应不引 openpyxl / 不导致 ExcelStore 循环 import。"""
+        # 模拟最小依赖：构造一个不依赖 ExcelStore 的 PhotoArchive
+        from specimen_app.photo_archive import PhotoArchive
+        archive = PhotoArchive(
+            workspace_root=self.tmp,
+            read_only=False,
+            read_photo_rows_callback=lambda: [],
+        )
+        self.assertEqual(archive.compute_workspace_archive_directory(), self.tmp / "照片")
+
+    def test_photo_archive_sanitize_filename(self) -> None:
+        from specimen_app.photo_archive import PhotoArchive
+        archive = PhotoArchive(self.tmp, False, lambda: [])
+        self.assertEqual(archive.sanitize_photo_filename_for_storage("foo/bar.jpg"), "bar.jpg")
+        self.assertEqual(archive.sanitize_photo_filename_for_storage("a<b>:c.jpg"), "a_b__c.jpg")
+        self.assertEqual(archive.sanitize_photo_filename_for_storage(""), "photo")
+        self.assertEqual(
+            archive.sanitize_photo_filename_for_storage("noext", default_suffix=".jpg"),
+            "noext.jpg",
+        )
+
+    def test_photo_archive_is_path_under_workspace_archive_directory(self) -> None:
+        from specimen_app.photo_archive import PhotoArchive
+        archive = PhotoArchive(self.tmp, False, lambda: [])
+        archive_dir = archive.compute_workspace_archive_directory()
+        archive_dir.mkdir(parents=True)
+        self.assertTrue(archive.is_path_under_workspace_archive_directory(archive_dir / "a.jpg"))
+        self.assertFalse(archive.is_path_under_workspace_archive_directory(self.tmp / "outside.jpg"))
+
+    def test_excel_store_delegates_to_photo_archive(self) -> None:
+        """ExcelStore 的 4 个迁移方法应通过委托给 PhotoArchive 实现。"""
+        from specimen_app.excel_store import ExcelStore
+        store = ExcelStore(self.tmp)
+        self.assertEqual(store._photo_archive_dir(), self.tmp / "照片")
+        # 同一调用经由两条路径应得到相同结果
+        self.assertEqual(
+            store._safe_photo_filename("bad/name.jpg"),
+            store.photo_archive().sanitize_photo_filename_for_storage("bad/name.jpg"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
