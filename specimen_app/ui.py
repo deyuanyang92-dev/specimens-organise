@@ -1200,7 +1200,9 @@ class SpecimenWindow(QMainWindow):
         self.search_index: ImageSearchIndex | None = None
         self._index_build_worker: IndexBuildWorker | None = None
         self._image_index_timer = QTimer(self)
-        self._image_index_timer.setInterval(120000)
+        # plan v0.10.4 I4: 旧 120s 太频繁——增量+5分钟短路落地后高频已无意义。
+        # 改 10 分钟一次定期扫；新照片落地后最长 10 分钟内可被检索到，体感"自动更新"。
+        self._image_index_timer.setInterval(600000)
         self._image_index_timer.timeout.connect(self._build_search_index_background)
         if self.workspace_root is not None:
             self.thumbnail_cache = ThumbnailCache(self.workspace_root)
@@ -6182,12 +6184,27 @@ class SpecimenWindow(QMainWindow):
     # ---- Search index ----
 
     def _build_search_index_background(self, force_rebuild: bool = False) -> None:
-        """Incrementally reconcile the default and saved search scopes."""
+        """Incrementally reconcile the default and saved search scopes.
+
+        plan v0.10.4 I3：默认 scope 在 5 分钟内已扫过则直接 return，避免反复扫
+        让用户体感"反复索引很笨拙"。force_rebuild=True（用户显式触发"强制重建"）
+        始终绕过短路。
+        """
         if self._is_closing or self.workspace_root is None or self._index_build_worker is not None:
             return
         if self._import_job_active or self._save_timers:
             QTimer.singleShot(3000, self._build_search_index_background)
             return
+        # plan v0.10.4 I3: 5 分钟内已扫过 → 静默跳过
+        if not force_rebuild:
+            try:
+                from .image_search import get_image_index_last_scan_timestamp
+                import time as _time
+                last_scan = get_image_index_last_scan_timestamp(self.workspace_root)
+                if last_scan is not None and (_time.time() - last_scan) < 300:
+                    return
+            except Exception:
+                pass
         scopes: list[list[str] | None] = [None]
         for path in load_settings().search_paths:
             if Path(path).is_dir() and [path] not in scopes:
@@ -6203,6 +6220,22 @@ class SpecimenWindow(QMainWindow):
         self.search_index = None
         self.image_index_updated.emit(updates)
         _startup_mark("image search index reconciliation ready")
+        # plan v0.10.4 I5: 静默体感——仅在实际有 added/removed/changed 时才提示
+        try:
+            total_added = 0
+            total_removed = 0
+            total_changed = 0
+            for update in updates or []:
+                total_added += int(getattr(update, "added", 0) or 0)
+                total_removed += int(getattr(update, "removed", 0) or 0)
+                total_changed += int(getattr(update, "changed", 0) or 0)
+            if total_added + total_removed + total_changed > 0:
+                self.statusBar().showMessage(
+                    f"图片索引已更新（新增 {total_added}，删 {total_removed}，变更 {total_changed}）",
+                    3000,
+                )
+        except Exception:
+            pass
 
     # ---- Version manager ----
 

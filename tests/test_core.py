@@ -2444,6 +2444,69 @@ class Phase6StartupPerfTests(unittest.TestCase):
         self.assertTrue(voucher.startswith("YZZ"))
         store.release_lock()
 
+    def test_iter_images_skips_unchanged_directories(self) -> None:
+        """plan v0.10.4 I1：父目录 mtime 未变时不 yield 该目录的文件。"""
+        from specimen_app.image_search import iter_images
+        import time as _time
+        photos_dir = self.tmp / "photos"
+        photos_dir.mkdir()
+        from PIL import Image as _PILImage
+        _PILImage.new("RGB", (8, 8)).save(photos_dir / "a.jpg", "JPEG")
+        _PILImage.new("RGB", (8, 8)).save(photos_dir / "b.jpg", "JPEG")
+        first_pass = iter_images([self.tmp], max_depth=0, suffixes=[".jpg"])
+        self.assertEqual(len(first_pass), 2)
+        scan_baseline = _time.time() + 5  # baseline 设到未来一点，确保已有目录全部 <= baseline
+        # 父目录 mtime 未变（不增删子项），incremental 应返回 0
+        second_pass = iter_images(
+            [self.tmp], max_depth=0, suffixes=[".jpg"],
+            skip_directories_unchanged_since=scan_baseline,
+        )
+        self.assertEqual(len(second_pass), 0)
+
+    def test_iter_images_detects_newly_added_files_via_parent_dir_mtime(self) -> None:
+        """plan v0.10.4 I1：新增文件触发父目录 mtime 更新，incremental 应能检出。"""
+        from specimen_app.image_search import iter_images
+        import time as _time
+        photos_dir = self.tmp / "photos"
+        photos_dir.mkdir()
+        from PIL import Image as _PILImage
+        _PILImage.new("RGB", (8, 8)).save(photos_dir / "old.jpg", "JPEG")
+        scan_baseline = _time.time()
+        _time.sleep(1.1)  # 确保新文件的父目录 mtime 严格大于 baseline
+        _PILImage.new("RGB", (8, 8)).save(photos_dir / "new.jpg", "JPEG")
+        new_files = iter_images(
+            [self.tmp], max_depth=0, suffixes=[".jpg"],
+            skip_directories_unchanged_since=scan_baseline,
+        )
+        new_file_names = {p.name for p in new_files}
+        self.assertIn("new.jpg", new_file_names)
+
+    def test_reconcile_scope_preserves_cached_entries_outside_changed_dirs(self) -> None:
+        """plan v0.10.4 I2：未扫描的目录 cached entries 不应被 removed。"""
+        from specimen_app.image_search import ImageIndexStore
+        import time as _time
+        dir_a = self.tmp / "dirA"
+        dir_b = self.tmp / "dirB"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        from PIL import Image as _PILImage
+        _PILImage.new("RGB", (8, 8)).save(dir_a / "a.jpg", "JPEG")
+        _PILImage.new("RGB", (8, 8)).save(dir_b / "b.jpg", "JPEG")
+        store = ImageIndexStore(self.tmp)
+        # 全扫一次让两个目录都进 cache
+        full_update = store.reconcile_scope([self.tmp], max_depth=0)
+        self.assertEqual(full_update.added, 2)
+        # 等一下保证 mtime 分辨率，往 dirA 加一个文件，dirB 不动
+        scan_baseline = _time.time()
+        _time.sleep(1.1)
+        _PILImage.new("RGB", (8, 8)).save(dir_a / "a2.jpg", "JPEG")
+        # 增量 reconcile：dirB 未变不应被扫到，所以 dirB 的 cached entry 不应进 removed
+        incremental_update = store.reconcile_scope(
+            [self.tmp], max_depth=0, incremental_since_unix=scan_baseline,
+        )
+        self.assertEqual(incremental_update.removed, 0)
+        self.assertGreaterEqual(incremental_update.added, 1)
+
     def test_detect_workspace_on_windows_mounted_filesystem(self) -> None:
         """plan H2：WSL + /mnt/<drive>/... 工作区被识别为跨 fs。"""
         from specimen_app.startup_diag import detect_workspace_on_windows_mounted_filesystem

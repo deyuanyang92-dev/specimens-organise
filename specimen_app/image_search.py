@@ -288,13 +288,58 @@ class ImageIndexStore:
         except sqlite3.Error:
             return False
 
+    def get_scope_last_scan_timestamp(
+        self,
+        roots: list[Path | str],
+        max_depth: int = 0,
+    ) -> float | None:
+        """plan v0.10.4 I3：读取该 scope 上次完成 reconcile 的时间戳。
+
+        scopes 表已有 ``last_scan`` 列 (v0.10.4 之前已存在)，本方法只读，不触发任何 walk。
+        返回 None 代表"从未扫描过"——调用方应走全扫；返回 float 时调用方可决定
+        是否短路 / 走 incremental。
+        """
+        if not self.path.exists():
+            return None
+        scope_key = self.scope_key(roots, max_depth)
+        try:
+            with self._connection() as conn:
+                row = conn.execute(
+                    "SELECT last_scan FROM scopes WHERE scope_key = ?", (scope_key,)
+                ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        try:
+            return float(row[0])
+        except (TypeError, ValueError):
+            return None
+
     def reconcile_scope(
         self,
         roots: list[Path | str],
         max_depth: int = 0,
         should_stop: Callable[[], bool] | None = None,
+        incremental_since_unix: float | None = None,
     ) -> ImageIndexUpdate:
-        paths = iter_images(roots, max_depth=max_depth, suffixes=SUPPORTED_IMAGE_SUFFIXES, should_stop=should_stop)
+        """plan v0.10.4 I2：增量模式扫描 + 收窄 diff 范围。
+
+        ``incremental_since_unix=None`` 时与旧逻辑等价：iter_images 全扫，
+        diff 在整套 cached entries 上计算。
+
+        ``incremental_since_unix=T`` 时：
+          - iter_images 跳过 mtime <= T 的目录（不 yield 它的文件）
+          - changed_directories = 实际 yield 出来的文件的 parent dir 集合
+          - removed 只在 changed_directories 范围内算（未扫描的目录其 cached 条目仍有效）
+        """
+        paths = iter_images(
+            roots,
+            max_depth=max_depth,
+            suffixes=SUPPORTED_IMAGE_SUFFIXES,
+            should_stop=should_stop,
+            skip_directories_unchanged_since=incremental_since_unix,
+        )
         if should_stop and should_stop():
             return ImageIndexUpdate(cancelled=True)
         current: dict[str, tuple[ImageIndexEntry, int, int]] = {}
@@ -317,7 +362,16 @@ class ImageIndexStore:
                     str(entry.path): (entry, size, mtime_ns)
                     for entry, size, mtime_ns in current.values()
                 }
-                removed = set(existing).difference(current_by_path)
+                # plan v0.10.4 I2: 增量模式下 removed 仅在"本次扫到的父目录"范围内算
+                # 否则未扫的目录（mtime 未变）会被误判为整体消失
+                if incremental_since_unix is not None:
+                    changed_directories = {str(Path(p).parent) for p in current_by_path}
+                    relevant_existing_paths = {
+                        p for p in existing if str(Path(p).parent) in changed_directories
+                    }
+                    removed = relevant_existing_paths.difference(current_by_path)
+                else:
+                    removed = set(existing).difference(current_by_path)
                 added = set(current_by_path).difference(existing)
                 changed = {
                     path
@@ -533,7 +587,20 @@ def iter_images(
     suffixes: Iterable[str] | None = None,
     name_pattern: re.Pattern[str] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    skip_directories_unchanged_since: float | None = None,
 ) -> list[Path]:
+    """遍历 ``roots`` 下匹配 ``suffixes`` 的图片文件。
+
+    plan v0.10.4 I1：增量模式 ``skip_directories_unchanged_since``——
+      - None → 全扫（首次 / 强制重建走此路径，行为不变）
+      - 非 None → 走目录前对比 ``dir.stat().st_mtime``：
+        · dir mtime > since → 该目录可能有新增/删除/重命名，yield 所有匹配文件
+        · dir mtime <= since → 该目录子项未变（ext4/NTFS 子项增删 rename 才 bump dir mtime），
+          不 yield 该层文件；**仍 recurse 进 subdirs**（subdir mtime 可能 > since）
+
+    工作区里"修改照片内容"极罕见（照片基本只读），所以"父目录 mtime 不变"≈
+    "该目录直接子项无变化"。漏判文件内容修改是 acceptable trade-off。
+    """
     allowed_suffixes = normalize_suffixes(suffixes) if suffixes is not None else SUPPORTED_IMAGE_SUFFIXES
     seen: set[str] = set()
     results: list[Path] = []
@@ -560,6 +627,14 @@ def iter_images(
                 d for d in dir_names
                 if d not in EXCLUDED_DIR_NAMES and not is_excluded_path(current_path / d, root_path)
             ]
+            # plan v0.10.4 I1: 目录 mtime 门控；未变目录跳过文件 yield 但保留递归
+            if skip_directories_unchanged_since is not None:
+                try:
+                    directory_mtime = current_path.stat().st_mtime
+                except OSError:
+                    directory_mtime = float("inf")  # 取不到 mtime 时保守全扫
+                if directory_mtime <= skip_directories_unchanged_since:
+                    continue  # subdir 由 os.walk 自动递归处理；当前 dir 文件视为缓存仍有效
             for fn in file_names:
                 if should_stop and should_stop():
                     break
@@ -652,19 +727,54 @@ def image_index_exists(
     return ImageIndexStore(workspace).has_scope(roots, effective_depth)
 
 
+def get_image_index_last_scan_timestamp(
+    root: Path | str,
+    extra_roots: list[Path | str] | None = None,
+    max_depth: int = 0,
+) -> float | None:
+    """plan v0.10.4 I3：UI 层读取上次完成 reconcile 的时间，决定是否短路。
+
+    纯只读，不触发任何 walk。``None`` = 从未扫描过 / 索引文件不存在。
+    """
+    workspace = Path(root).resolve()
+    roots = image_search_roots(workspace, extra_roots)
+    effective_depth = image_search_depth(workspace, extra_roots, roots, max_depth)
+    if not roots:
+        return None
+    return ImageIndexStore(workspace).get_scope_last_scan_timestamp(roots, effective_depth)
+
+
 def reconcile_image_index(
     root: Path | str,
     extra_roots: list[Path | str] | None = None,
     max_depth: int = 0,
     should_stop: Callable[[], bool] | None = None,
+    incremental_since_unix: float | None = None,
+    force_full_scan: bool = False,
 ) -> ImageIndexUpdate:
-    """Check one search scope for external additions, deletes and renames."""
+    """Check one search scope for external additions, deletes and renames.
+
+    plan v0.10.4 I2：``incremental_since_unix`` 透传给 reconcile_scope，走目录级
+    mtime 门控。本函数默认**自动增量**：如果该 scope 已有 ``last_scan`` 记录，
+    把它当 incremental_since 用；首次扫描（无 last_scan）走全扫。
+    ``force_full_scan=True`` 时绕过自动增量，全扫——「强制重建」按钮走这条路径。
+    显式传 ``incremental_since_unix`` 时优先用调用方给的值。
+    """
     workspace = Path(root).resolve()
     roots = image_search_roots(workspace, extra_roots)
     effective_depth = image_search_depth(workspace, extra_roots, roots, max_depth)
     if not roots:
         return ImageIndexUpdate()
-    update = ImageIndexStore(workspace).reconcile_scope(roots, effective_depth, should_stop)
+    store = ImageIndexStore(workspace)
+    effective_incremental_since = incremental_since_unix
+    if effective_incremental_since is None and not force_full_scan:
+        effective_incremental_since = store.get_scope_last_scan_timestamp(roots, effective_depth)
+    update = store.reconcile_scope(
+        roots,
+        effective_depth,
+        should_stop,
+        incremental_since_unix=effective_incremental_since,
+    )
     if update.modified:
         key = _image_index_key(roots, effective_depth)
         with _IMAGE_INDEX_LOCK:
