@@ -178,6 +178,8 @@ class ExcelStore:
         # 类型：[{id, operation_name, started_at, status:"pending", snapshot_path: str | None}, ...]
         # UI 层（SpecimenWindow.__init__）读取并逐条弹恢复对话框。
         self.pending_transaction_records: list[dict[str, Any]] = []
+        # plan D2: 入库汇总派生 SQLite 缓存；lazy 初始化，避免只读副本也建文件
+        self._inventory_summary_cache_database: Any = None
         # 规范化软件设计 2026-05 P1 审查修复:_row_cache 加 LRU 上限。
         # 2026-05 内存档位扩展:maxsize 由 memory_profile 驱动 (3/4/6/12/20)。
         # settings 不可用 fallback 到 8 (老默认)。
@@ -272,6 +274,8 @@ class ExcelStore:
             "add_photo", "add_photos", "delete_photo", "replace_photo",
             "set_photo_filename", "set_photo_description",
             "clear_photos", "move_photos",
+            # plan D3: 新增的批量照片字段保存
+            "set_photo_fields_batch",
         ]
         for name in write_methods:
             if hasattr(self, name):
@@ -1344,6 +1348,73 @@ class ExcelStore:
     def set_photo_description(self, voucher: str, photo_index: int, description: str) -> bool:
         return self._set_photo_text_field(voucher, photo_index, "描述", description)
 
+    def set_photo_fields_batch(
+        self,
+        voucher: str,
+        photo_index: int,
+        updates: dict[str, str],
+    ) -> bool:
+        """plan D3：把同一张照片的多字段更新合并为一次 action-log 写入。
+
+        旧：UI 层 ``_save_pending_group`` 在 photo 分支按字段循环调
+        ``set_photo_filename`` / ``set_photo_description``，每次都写一条 action-log。
+        2 个字段就有 2 条 undo 历史，与 specimen/classification 已合并的行为不一致。
+
+        本方法接受 ``{"描述": ..., "文件名": ...}``，原子完成：
+          1. 文件名变更（如需要）的文件系统 rename
+          2. xlsx 行更新
+          3. 单条 修改记录 / 操作日志
+
+        仅支持 ``"描述"`` 和 ``"文件名"`` 两个字段——这是 photo 面板唯一允许的可编辑字段。
+        其他字段（``入库编号*`` / SHA / 归档状态 等）由 store 内部管理。
+        """
+        allowed_fields = {"描述", "文件名"}
+        cleaned_updates = {
+            field: self._string(value)
+            for field, value in updates.items()
+            if field in allowed_fields
+        }
+        if not cleaned_updates:
+            return False
+
+        rows = self.read_rows("photo")
+        matching_positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == voucher]
+        if photo_index < 0 or photo_index >= len(matching_positions):
+            return False
+        position = matching_positions[photo_index]
+        old_row = rows[position].copy()
+        new_row = old_row.copy()
+
+        new_filename = cleaned_updates.get("文件名")
+        if new_filename is not None and new_filename != self._value(old_row, "文件名"):
+            archival_status = self._value(old_row, "归档状态")
+            if archival_status != "仅记录":
+                # 文件系统 rename — 复用现成 _move_archive_file_to_name
+                old_path = self.resolve_photo_path(old_row)
+                if old_path.exists():
+                    archive_dir = old_path.parent if not self._is_workspace_archive_path(old_path) else None
+                    target = self._move_archive_file_to_name(old_path, new_filename, archive_dir=archive_dir)
+                    new_row["文件名"] = target.name
+                    new_row["相对路径"] = self._archive_relative_path(target) if self._is_under_root(target, self.root) else self._value(old_row, "相对路径")
+                    new_row["来源工作区根路径"] = ""
+                else:
+                    new_row["文件名"] = new_filename
+            else:
+                new_row["文件名"] = new_filename
+
+        if "描述" in cleaned_updates:
+            new_row["描述"] = cleaned_updates["描述"]
+
+        if old_row == new_row:
+            return False
+
+        rows[position] = new_row
+        self._write_rows("photo", rows)
+        # 单条 modified-log 条目（即使多字段改了），单条 action-log 条目（undo 一步还原所有字段）
+        self._write_changes_and_summary(voucher, "photo", old_row, new_row, "update_photo")
+        self._record_action("update_photo", voucher, "photo", "batch", old_row, new_row)
+        return True
+
     def _set_photo_text_field(self, voucher: str, photo_index: int, field: str, value: str) -> bool:
         if field not in {"文件名", "描述"}:
             raise ValueError(f"不支持修改照片字段：{field}")
@@ -1801,6 +1872,40 @@ class ExcelStore:
                         f"快照文件 SHA256 不一致：{filename}"
                     )
 
+    def inventory_summary_cache(self):
+        """plan D2：lazy 获取 ``InventorySummaryCacheDatabase`` 单例。
+
+        只读副本可以读缓存（如果存在）但不会主动建文件，因为 lazy import + 实例化
+        只在调用方第一次需要时才发生。``mark_cache_as_invalid`` 在只读下也不抛
+        （cache 文件可能不存在），保留主写路径上的"无脑调用"语义。
+        """
+        if self._inventory_summary_cache_database is None:
+            from .summary_cache import InventorySummaryCacheDatabase
+            self._inventory_summary_cache_database = InventorySummaryCacheDatabase(self.data_dir)
+        return self._inventory_summary_cache_database
+
+    def _mark_inventory_summary_cache_invalid(self) -> None:
+        """plan D2：主表写入 / undo / redo 后调；让下次读必走 fallback 重建。"""
+        if self._read_only:
+            return
+        try:
+            self.inventory_summary_cache().mark_cache_as_invalid()
+        except Exception:
+            pass  # 缓存损坏 / IO 错误绝不阻塞主流程
+
+    def read_inventory_summary_via_cache(self) -> list[dict[str, Any]]:
+        """plan D2：UI 层的统一入口。优先读 SQLite cache；失效 / 缺失 → fallback 调 ``summary_records()``。
+
+        永远返回与 ``summary_records()`` 同 schema 的 list[dict]。
+        """
+        try:
+            return self.inventory_summary_cache().read_all_summary_rows_or_fallback(
+                fallback_provider=self.summary_records,
+                now_iso_provider=self._now,
+            )
+        except Exception:
+            return self.summary_records()
+
     def cleanup_incomplete_snapshot_directories(self) -> list[Path]:
         """plan A4：启动时扫 ``数据版本/``，把缺 ``.snapshot.complete`` 标记的目录删掉。
 
@@ -2095,6 +2200,8 @@ class ExcelStore:
         return dropped_count
 
     def restore_data_snapshot(self, snapshot_path: Path | str) -> None:
+        # plan D2: 快照还原是整库写入，缓存必须立刻失效
+        self._mark_inventory_summary_cache_invalid()
         snapshot = Path(snapshot_path).resolve()
         expected_parent = (self.data_dir / DATA_VERSION_DIR).resolve()
         try:
@@ -3285,10 +3392,16 @@ class ExcelStore:
                 self._file_mtimes[file_key] = path.stat().st_mtime
             except OSError:
                 self._file_mtimes[file_key] = 0.0
+        # plan D2: _append_row_incremental 绕过 _write_rows，必须自己触发汇总缓存失效
+        if category in ("specimen", "classification", "photo"):
+            self._mark_inventory_summary_cache_invalid()
 
     def _write_rows(self, category: str, rows: list[Row]) -> None:
         self._write_plain_rows(self.data_dir / CATEGORY_FILES[category], CATEGORY_HEADERS[category], rows)
         self._invalidate_cache(CATEGORY_FILES[category])
+        # plan D2: 主表三类（specimen / classification / photo）任一写入都让汇总缓存失效
+        if category in ("specimen", "classification", "photo"):
+            self._mark_inventory_summary_cache_invalid()
 
     def _delete_rows(self, category: str, voucher: str) -> None:
         rows = [row for row in self.read_rows(category) if self._value(row, "入库编号*") != voucher]

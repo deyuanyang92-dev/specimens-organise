@@ -2224,5 +2224,107 @@ class Phase3TransactionJournalTests(unittest.TestCase):
         self.assertIn("committed", journal)
 
 
+class Phase4PerformanceTests(unittest.TestCase):
+    """plan v0.10.0 Phase 4 (P2 性能)：D2 汇总缓存 + D3 照片字段合并保存。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # ---- D2: 汇总缓存 ----
+
+    def test_summary_cache_sqlite_fallback_when_missing(self) -> None:
+        from specimen_app.excel_store import ExcelStore
+        store = ExcelStore(self.tmp)
+        store.create_specimen()
+        # 第一次读：缓存不存在 → fallback summary_records，并应同步写回 SQLite
+        rows_first = store.read_inventory_summary_via_cache()
+        self.assertTrue(rows_first)
+        cache_path = store.inventory_summary_cache().cache_path
+        self.assertTrue(cache_path.exists())
+        # 第二次读：直接从 cache 读，行数应相同
+        rows_second = store.read_inventory_summary_via_cache()
+        self.assertEqual(len(rows_first), len(rows_second))
+
+    def test_summary_cache_invalidated_on_write(self) -> None:
+        from specimen_app.excel_store import ExcelStore
+        store = ExcelStore(self.tmp)
+        store.create_specimen()
+        # 写一次让 cache 建出来
+        store.read_inventory_summary_via_cache()
+        freshness_before = store.inventory_summary_cache().current_cache_freshness_timestamp()
+        self.assertTrue(freshness_before)
+        # 任何主表写入应让 cache 失效
+        store.create_specimen()
+        freshness_after_write = store.inventory_summary_cache().current_cache_freshness_timestamp()
+        self.assertEqual(freshness_after_write, "")  # 已失效
+
+    def test_summary_cache_invalidated_on_undo(self) -> None:
+        from specimen_app.excel_store import ExcelStore
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+        store.set_fields("specimen", voucher, {"管内编号*": "TEST-001"})
+        store.read_inventory_summary_via_cache()  # 建 cache
+        self.assertTrue(store.inventory_summary_cache().current_cache_freshness_timestamp())
+        store.undo_last()
+        # undo 内部走 _apply_action → _write_rows → _mark_inventory_summary_cache_invalid
+        self.assertEqual(store.inventory_summary_cache().current_cache_freshness_timestamp(), "")
+
+    def test_summary_cache_per_call_new_connection(self) -> None:
+        """plan D2：每次方法调用都开新 sqlite3.Connection，不跨调用共享对象。"""
+        from specimen_app.summary_cache import InventorySummaryCacheDatabase
+        cache_dir = self.tmp / "数据"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        db = InventorySummaryCacheDatabase(cache_dir)
+        # 写一次再读一次，不应出现 sqlite3 ThreadCheck 错误
+        db.rebuild_cache_from_records(
+            [{"入库编号*": "YZZ000001", "字段": "v"}],
+            now_iso="2026-05-25T10:00:00",
+        )
+        rows = db.read_all_summary_rows_or_fallback(
+            fallback_provider=lambda: [],
+            now_iso_provider=lambda: "2026-05-25T10:00:00",
+        )
+        self.assertEqual(len(rows), 1)
+
+    # ---- D3: 照片字段保存合并 ----
+
+    def test_photo_field_save_merges_into_single_action_log(self) -> None:
+        from specimen_app.excel_store import ExcelStore
+        from specimen_app.models import ACTION_LOG_FILE
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+        src = self.tmp / "photo.jpg"
+        Image.new("RGB", (16, 16), color="blue").save(src, "JPEG")
+        store.add_photo(voucher, src)
+        # 单次 batch 同时改两个字段
+        before_rows = store._read_plain_rows(store.data_dir / ACTION_LOG_FILE)
+        before_count = len(before_rows)
+        changed = store.set_photo_fields_batch(voucher, 0, {"描述": "新描述", "文件名": "renamed.jpg"})
+        self.assertTrue(changed)
+        after_rows = store._read_plain_rows(store.data_dir / ACTION_LOG_FILE)
+        new_actions = after_rows[before_count:]
+        self.assertEqual(len(new_actions), 1, "batch 改 2 个字段应只增 1 条 action-log")
+        # 一次 undo 应同时还原两个字段
+        store.undo_last()
+        photo_after_undo = [r for r in store.read_rows("photo") if r.get("入库编号*") == voucher][0]
+        self.assertEqual(photo_after_undo.get("描述"), "")
+        self.assertNotEqual(photo_after_undo.get("文件名"), "renamed.jpg")
+
+    def test_photo_field_save_batch_returns_false_when_no_changes(self) -> None:
+        from specimen_app.excel_store import ExcelStore
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+        src = self.tmp / "no_change.jpg"
+        Image.new("RGB", (16, 16), color="green").save(src, "JPEG")
+        store.add_photo(voucher, src)
+        # 写一致的值 → False，不产生 action-log
+        photo = [r for r in store.read_rows("photo") if r.get("入库编号*") == voucher][0]
+        result = store.set_photo_fields_batch(voucher, 0, {"描述": photo.get("描述", ""), "文件名": photo.get("文件名", "")})
+        self.assertFalse(result)
+
+
 if __name__ == "__main__":
     unittest.main()

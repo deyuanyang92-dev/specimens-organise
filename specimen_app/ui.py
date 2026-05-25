@@ -3521,10 +3521,47 @@ class SpecimenWindow(QMainWindow):
             return 0
         if category in ("specimen", "classification"):
             self._save_text_fields(category, fields, voucher)
+        elif category == "photo":
+            # plan D3：把同一张照片同 500ms 内的多字段合并为单次 set_photo_fields_batch，
+            # action-log 只增 1 条，undo 一步还原所有字段；语义与 specimen/classification 一致。
+            # 旧：for field in fields: save_field(...) → N 条 action-log，undo 粒度过细。
+            self._save_photo_fields_batched(fields, voucher)
         else:
             for field in sorted(fields):
                 self.save_field(category, field, voucher)
         return len(fields)
+
+    def _save_photo_fields_batched(self, fields: set[str], voucher: str) -> None:
+        """plan D3：合并同一张照片的多字段保存。"""
+        if not fields or self.current_photo_index < 0:
+            return
+        updates: dict[str, str] = {}
+        for field in fields:
+            widget = self.photo_widgets.get(field)
+            if widget is None:
+                continue
+            try:
+                updates[field] = widget.text()
+            except AttributeError:
+                continue
+        if not updates:
+            return
+        try:
+            self.store.set_photo_fields_batch(voucher, self.current_photo_index, updates)
+        except PermissionError:
+            return  # 只读副本忽略（A2 守卫已经拦在 UI 层）
+        except Exception as exc:
+            print(f"[D3] batch photo save failed: {exc}", file=sys.stderr)
+            return
+        self.current_photos = self.store.get_photos(voucher)
+        self.refresh_photo_table()
+        # 文件名改了需要刷新 grid / 图像索引
+        if "文件名" in updates and self.current_photo_index < len(self.current_photos):
+            actual_name = str(self.current_photos[self.current_photo_index].get("文件名", ""))
+            self.photo_widgets["文件名"].blockSignals(True)
+            self.photo_widgets["文件名"].setText(actual_name)
+            self.photo_widgets["文件名"].blockSignals(False)
+            self._refresh_image_index_after_photo_change()
 
     def _save_text_fields(self, category: str, fields: set[str], voucher: str) -> None:
         try:
@@ -7520,7 +7557,7 @@ class IngestSummaryDialog(QDialog):
         self._build_photo_counts()
 
         # 入库汇总宽表：把分散在多个 Excel 的字段 join 成一张表（纯内存视图）。
-        self._summary_records: list[dict] = self.store.summary_records()
+        self._summary_records: list[dict] = self.store.read_inventory_summary_via_cache()  # plan D2: SQLite cache + fallback
         self._record_by_voucher: dict[str, dict] = {
             r["入库编号*"]: r for r in self._summary_records
         }
@@ -7762,7 +7799,7 @@ class IngestSummaryDialog(QDialog):
 
     def _reload_summary(self) -> None:
         """重建汇总记录缓存（主窗口改过数据后由 _refresh 调用）。"""
-        self._summary_records = self.store.summary_records()
+        self._summary_records = self.store.read_inventory_summary_via_cache()  # plan D2
         self._record_by_voucher = {r["入库编号*"]: r for r in self._summary_records}
 
     def _refresh(self) -> None:

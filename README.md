@@ -89,6 +89,19 @@ python run_app.py --workspace "D:\我的标本数据"
 | **源码运行** | Python 3.10+，pip | Python 3.10+，pip |
 | **依赖** | PyQt5 / openpyxl / Pillow / tifffile | 同左 |
 
+### 低配置基线（v0.10.0 plan D4 跟踪目标）
+
+| 机器档位 | 内存 | 启动耗时目标 | 入库汇总首屏目标（1000 条） |
+|---------|------|--------------|---------------------------------|
+| 2 GB    | 2 GB | < 3.5 s      | < 3 s（SQLite cache 命中后 < 0.5 s） |
+| 4 GB    | 4 GB | < 2.5 s      | < 2 s（SQLite cache 命中后 < 0.3 s） |
+| 8 GB+   | ≥ 8 GB | < 1.5 s    | < 1 s（SQLite cache 命中后 < 0.2 s） |
+
+诊断方式：启动会在 stderr 打 `[startup]` 行展示分阶段耗时 + 峰值 RSS；
+日志同步追加到 `%APPDATA%/标本入库管理/startup_diagnostics.log`（Windows）
+或 `~/.specimen_inventory/startup_diagnostics.log`（Linux）。
+首屏汇总耗时可通过「入库汇总」对话框第一次打开 vs 第二次打开（缓存命中）的差异观察。
+
 ---
 
 ## 工作区
