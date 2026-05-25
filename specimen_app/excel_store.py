@@ -8,6 +8,7 @@ import re
 import shutil
 import socket  # plan B1: 锁文件需要 hostname
 import sys
+import threading  # plan v0.10.3 H1: 索引异步重建的就绪信号
 import time  # plan B1: 心跳时间戳
 import uuid
 from collections import Counter, OrderedDict
@@ -182,6 +183,11 @@ class ExcelStore:
         self._inventory_summary_cache_database: Any = None
         # plan E1: 照片归档管理（文件系统侧）；lazy 创建，仅在用到时实例化
         self._photo_archive_manager: Any = None
+        # plan v0.10.3 H1: 索引就绪信号
+        # 启动时 ensure_index 改成异步后台跑（WSL+大工作区慢秒级），
+        # next_voucher / 等需要 index_voucher_set 完整的方法在 event 未 set 时同步等。
+        # 只读副本不重建索引，event 永不 set，依赖方走 _ensure_index_voucher_set 的 lazy 路径。
+        self._index_ready_event = threading.Event()
         # 规范化软件设计 2026-05 P1 审查修复:_row_cache 加 LRU 上限。
         # 2026-05 内存档位扩展:maxsize 由 memory_profile 驱动 (3/4/6/12/20)。
         # settings 不可用 fallback 到 8 (老默认)。
@@ -232,8 +238,18 @@ class ExcelStore:
         self._upgrade_workspace_schema()
         _startup_mark("ExcelStore._upgrade_workspace_schema")
         self._assert_supported_data_schema()
-        self.ensure_index()
-        _startup_mark("ExcelStore.ensure_index")
+        # plan v0.10.3 H1: ensure_index 同步链里只做轻量 sanity check
+        # 大工作区（>1000 voucher）+ WSL/NTFS 跨 fs 上完整 ensure_index 要秒级，
+        # 而 99% 情形下 index 是完好的（启动只是为了校验补缺），不该阻塞窗口可见。
+        # quick check 通过 → 标 ready，UI 层仍会在后台跑一次完整 ensure_index 做权威校验；
+        # quick check 失败（index 缺失 / 空文件 / 损坏）→ 这里同步重建一次保证可用。
+        if not self._read_only and self._quick_index_sanity_check_passes():
+            self._index_ready_event.set()
+            _startup_mark("ExcelStore.quick_index_sanity_check_passed")
+        else:
+            self.ensure_index()
+            self._index_ready_event.set()
+            _startup_mark("ExcelStore.ensure_index_synchronous_fallback")
         self._sync_next_serial()
         _startup_mark("ExcelStore._sync_next_serial")
         # plan C1: 启动时扫 transaction.jsonl 找 pending 记录，store 只暴露列表不弹对话框
@@ -1567,6 +1583,10 @@ class ExcelStore:
         # 新：信任 config["next_serial"]（__init__ 时 _sync_next_serial 重建为权威），
         # 运行时撞号兜底走 _ensure_index_voucher_set O(1) set 查；
         # 跨进程外部修改 xlsx 的极少场景由 mtime 校验自动失效缓存。
+        # plan v0.10.3 H1：启动初期 index 可能还在后台重建，撞号检测必须等就绪。
+        # 99% 情形下 quick check 已经 set event，此调用零成本；
+        # 少数后台重建中场景里，用户点"新增"会等几秒（含进度感知）。
+        self.wait_until_index_is_ready(timeout_seconds=30.0)
         active = self.config.get("active_series_name", "YZZ")
         if active == "YZZ":
             # 若曾批量预留，reserved_through_serial 记录上次预留的最末编号；
@@ -2685,7 +2705,38 @@ class ExcelStore:
         classification = classification_override if classification_override is not None else self.get_classification(voucher)
         return self._fingerprint_from_rows(specimen, classification)
 
+    def _quick_index_sanity_check_passes(self) -> bool:
+        """plan v0.10.3 H1：启动同步链里的廉价 index 校验，<1ms。
+
+        判定通过的条件（不读 xlsx 内容、纯文件元信息）：
+          - INDEX_FILE 存在
+          - INDEX_FILE 大小 > 200 字节（>= 表头一行就够，正常工作区轻松超过）
+
+        通过 → 标 self._index_ready_event 已 set，next_voucher 直接走 lazy
+        ``_ensure_index_voucher_set``（用 mtime 校验缓存）。UI 层会在窗口可见后开
+        QThread 跑一次完整 ``ensure_index()`` 做权威校验 + 补缺。
+        失败 → 同步链里立刻走完整 ensure_index，保证工作区可用。
+        """
+        index_file_path = self.data_dir / INDEX_FILE
+        try:
+            stat_result = index_file_path.stat()
+        except OSError:
+            return False
+        return stat_result.st_size > 200
+
+    def wait_until_index_is_ready(self, timeout_seconds: float = 30.0) -> bool:
+        """plan v0.10.3 H1：等索引就绪事件 set。
+
+        ``next_voucher`` / 撞号检测 / 任何依赖 index voucher set 完整性的方法在
+        启动初期可能正赶上后台 ``ensure_index`` 还没跑完——本方法让调用方同步等。
+        正常工作区秒级内就绪；超时返回 False，调用方决定降级 / 抛错。
+        只读副本永远不 set（无背景线程），但只读副本也不会创建新编号，无影响。
+        """
+        return self._index_ready_event.wait(timeout=timeout_seconds)
+
     def ensure_index(self) -> None:
+        # plan v0.10.3 H1: 完整重建 index（同步、耗时）。在 __init__ 同步链里只在 quick
+        # check 失败时直接调；正常路径下由 UI 层后台线程在窗口 show 后调，跑完 set event。
         index_rows = self._read_plain_rows(self.data_dir / INDEX_FILE)
         indexed = {self._value(row, "入库编号") for row in index_rows if self._value(row, "入库编号")}
         specimens = self.read_rows("specimen")

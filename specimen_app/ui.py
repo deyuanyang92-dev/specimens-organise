@@ -686,6 +686,37 @@ class UpdateDownloadWorker(QThread):
             self.finished_download.emit(None, False, exc)
 
 
+class IndexSyncBackgroundThread(QThread):
+    """plan v0.10.3 H1：窗口可见后台跑一次完整 ``ExcelStore.ensure_index()``。
+
+    启动同步链只做了廉价 quick check（看 INDEX 文件存不存在 + 非空）；这里做权威
+    重建，跑完 set ``store._index_ready_event``——其实 quick check 通过时 event 已经
+    set 了，本线程主要服务 quick check 失败时的兜底场景，以及大工作区周期性补缺。
+    """
+
+    sync_completed = pyqtSignal(float, object)  # elapsed_seconds, error_or_none
+
+    def __init__(self, store: "ExcelStore", parent=None) -> None:
+        super().__init__(parent)
+        self._store = store
+
+    def run(self) -> None:
+        import time as _time
+        started_at_monotonic = _time.monotonic()
+        captured_error: Exception | None = None
+        try:
+            self._store.ensure_index()
+        except Exception as exc:
+            captured_error = exc
+        finally:
+            try:
+                self._store._index_ready_event.set()
+            except Exception:
+                pass
+        elapsed_seconds = _time.monotonic() - started_at_monotonic
+        self.sync_completed.emit(elapsed_seconds, captured_error)
+
+
 class LockHeartbeatThread(QThread):
     """plan B1：每 ``interval_seconds`` 秒调一次 ``store.write_lock_heartbeat_now()``。
 
@@ -1276,6 +1307,14 @@ class SpecimenWindow(QMainWindow):
         # 分类预设缺失时显示持久黄色警告条（旧：8 秒状态栏消息，极易错过）。
         if self.matcher is not None and not list(self.matcher.all_rows()):
             self._preset_warning_banner.show()
+        # plan v0.10.3 H1: 启动同步链只做 index quick check；这里后台跑完整 ensure_index
+        # 做权威校验 + 补缺。99% 情形下 quick check 已 set event 跳过此重建（直接返回），
+        # 仅在 index 异常时会真做几秒的 IO。完成后再次 set event 保险。
+        if not self.read_only:
+            self._index_sync_thread = IndexSyncBackgroundThread(self.store, parent=self)
+            self._index_sync_thread.sync_completed.connect(self._on_index_sync_completed)
+            self._index_sync_thread.start()
+            self.statusBar().showMessage("正在后台校验索引…", 5000)
         # 先让主窗口可交互，再以低优先级维护持久图片索引。检索窗口只读取已有
         # SQLite 缓存，增量扫描不会阻挡其首次显示。
         QTimer.singleShot(200, self._post_load_gc)
@@ -1305,6 +1344,15 @@ class SpecimenWindow(QMainWindow):
         if fast:
             _startup_mark("fast profile: scheduling preheat")
             QTimer.singleShot(500, self._preheat_caches)
+
+    def _on_index_sync_completed(self, elapsed_seconds: float, error: object) -> None:
+        """plan v0.10.3 H1：后台索引校验完成的 UI 回调。"""
+        if error is not None:
+            self.statusBar().showMessage(f"索引校验失败：{error}", 8000)
+            return
+        if elapsed_seconds > 1.0:
+            # 仅在确实跑了完整重建（耗时 > 1s）时才提示，避免 quick check 即返回时的噪声
+            self.statusBar().showMessage(f"索引校验完成（{elapsed_seconds:.1f}s）", 3000)
 
     def _apply_read_only_ui(self) -> None:
         """规范化软件设计 2026-05 多窗口:只读副本禁所有写入 UI。
@@ -1366,8 +1414,15 @@ class SpecimenWindow(QMainWindow):
 
         非阻塞:用 QThread 后台跑 read_rows(3)。高档位用户内存足够,这点 _row_cache 撑得起
         (LRU maxsize=12/20)。
+
+        plan v0.10.3 H4：WSL + Windows-mounted 工作区跨 9P→NTFS IO 慢，preheat 把 3 张表
+        全读一遍会跟用户首次点击争 IO，反而拉高体感卡顿。这种环境下跳过 preheat，让用户
+        实际操作时再 lazy load（首次慢一点，但点击响应不再被 preheat 阻塞）。
         """
         if self._is_closing or self.store is None:
+            return
+        if self._is_workspace_on_cross_filesystem():
+            _startup_mark("preheat: skipped (WSL + Windows-mounted workspace)")
             return
         _startup_mark("preheat: start")
         try:
@@ -1379,6 +1434,21 @@ class SpecimenWindow(QMainWindow):
             _startup_mark("preheat: done (3 tables cached)")
         except Exception as exc:
             _startup_mark(f"preheat: failed ({exc})")
+
+    def _is_workspace_on_cross_filesystem(self) -> bool:
+        """plan v0.10.3 H4：缓存 WSL + Windows-mounted 检测结果。"""
+        cached = getattr(self, "_cross_filesystem_workspace_detected", None)
+        if cached is not None:
+            return cached
+        if self.workspace_root is None:
+            return False
+        try:
+            from .startup_diag import detect_workspace_on_windows_mounted_filesystem
+            result = detect_workspace_on_windows_mounted_filesystem(self.workspace_root)
+        except Exception:
+            result = False
+        self._cross_filesystem_workspace_detected = result
+        return result
 
     def _post_load_gc(self) -> None:
         """启动初始加载后强制 gc，回收 openpyxl 读 Excel 时的临时对象。
@@ -1500,6 +1570,8 @@ class SpecimenWindow(QMainWindow):
 
         # plan B1: 先停心跳线程，再停其他 worker，防止 release_lock 时心跳还在写 lock 文件
         _stop_worker(getattr(self, "_lock_heartbeat_thread", None), wait_ms=3000, label="lock_heartbeat")
+        # plan v0.10.3 H1: 停后台索引校验线程
+        _stop_worker(getattr(self, "_index_sync_thread", None), wait_ms=3000, label="index_sync")
         # Stop background index builder if running
         _stop_worker(getattr(self, "_index_build_worker", None), wait_ms=5000, label="index_builder")
         # Stop thumbnail worker
@@ -8995,6 +9067,18 @@ def run_app(workspace_root: Path | str | None) -> None:
 
     if workspace_root is None:
         workspace_root = default_workspace()
+    # plan v0.10.3 H2: WSL + Windows-mounted 工作区会显著拖慢启动 IO，提前 stderr 告警
+    if workspace_root is not None:
+        try:
+            from .startup_diag import detect_workspace_on_windows_mounted_filesystem
+            if detect_workspace_on_windows_mounted_filesystem(Path(workspace_root)):
+                print(
+                    f"[startup] 注意: 检测到 WSL + Windows-mounted 工作区 ({workspace_root})。"
+                    f"跨文件系统 IO 比 WSL 本地慢 10-100x，建议把工作区迁到 ~/ 下提升体感。",
+                    file=sys.stderr,
+                )
+        except Exception:
+            pass
     app = QApplication.instance() or QApplication(sys.argv)
     # 记录系统默认字号,并应用用户保存的全局字体大小(窗口创建前完成,新窗口即继承)。
     global _default_app_font_point

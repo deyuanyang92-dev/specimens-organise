@@ -78,6 +78,37 @@ def _append_log(line: str) -> None:
         pass  # 诊断日志写入失败绝不能影响启动
 
 
+def detect_workspace_on_windows_mounted_filesystem(workspace_root: Path) -> bool:
+    """plan v0.10.3 H2：识别 WSL 下工作区是否落在 Windows-mounted 文件系统上。
+
+    判定条件（同时满足）：
+      - 运行环境是 WSL（``/proc/version`` 含 ``"microsoft"`` 或 ``"WSL"``）
+      - 工作区路径以 ``/mnt/<单字符盘符>/`` 开头（如 ``/mnt/c/``、``/mnt/n/``）
+
+    跨 9P → NTFS 的 IO 比 ext4 慢 10-100×，启动阶段的多张 xlsx open 容易累积到秒级，
+    用户体感"超级卡"。检测命中时 UI 层会跳过 ``_preheat_caches``，并在 stderr 打提示
+    建议把工作区迁到 WSL 本地（``~/...``）。
+    """
+    try:
+        proc_version = Path("/proc/version").read_text(encoding="utf-8", errors="ignore").lower()
+    except OSError:
+        return False
+    if "microsoft" not in proc_version and "wsl" not in proc_version:
+        return False
+    try:
+        workspace_path_string = str(Path(workspace_root).resolve())
+    except (OSError, ValueError):
+        return False
+    # /mnt/c/, /mnt/n/, /mnt/d/ 等单字符盘符挂载
+    if not workspace_path_string.startswith("/mnt/"):
+        return False
+    parts = workspace_path_string.split("/", 3)
+    # parts == ["", "mnt", "<drive_letter>", "..."] for /mnt/c/...
+    if len(parts) >= 3 and len(parts[2]) == 1 and parts[2].isalpha():
+        return True
+    return False
+
+
 def mark(stage: str) -> None:
     """记录一个启动阶段完成：自上个 mark 的耗时 + 累计耗时 + 进程峰值 RSS。"""
     global _last_time

@@ -2404,5 +2404,59 @@ class Phase5PhotoArchiveExtractionTests(unittest.TestCase):
         )
 
 
+class Phase6StartupPerfTests(unittest.TestCase):
+    """plan v0.10.3 启动性能热修：H1 索引异步 + H2 WSL 检测 + H4 preheat 跳过。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_quick_index_sanity_check_passes_on_normal_workspace(self) -> None:
+        """正常工作区（建过 voucher）quick check 应返回 True，event 已 set。"""
+        from specimen_app.excel_store import ExcelStore
+        store = ExcelStore(self.tmp)
+        store.create_specimen()
+        store.release_lock()
+        # 重开 store 模拟启动
+        store2 = ExcelStore(self.tmp)
+        self.assertTrue(store2._quick_index_sanity_check_passes())
+        self.assertTrue(store2._index_ready_event.is_set())
+        store2.release_lock()
+
+    def test_next_voucher_waits_for_index_ready(self) -> None:
+        """index event 未 set 时 next_voucher 应同步等到 set。"""
+        from specimen_app.excel_store import ExcelStore
+        import threading as _threading
+        import time as _time
+        store = ExcelStore(self.tmp)
+        # 故意把 event clear 模拟启动后 quick check 失败 + 后台还没跑完
+        store._index_ready_event.clear()
+
+        def _delayed_set() -> None:
+            _time.sleep(0.3)
+            store._index_ready_event.set()
+
+        _threading.Thread(target=_delayed_set, daemon=True).start()
+        # next_voucher 应等到 set 才返回，不抛异常
+        voucher = store.next_voucher()
+        self.assertTrue(voucher.startswith("YZZ"))
+        store.release_lock()
+
+    def test_detect_workspace_on_windows_mounted_filesystem(self) -> None:
+        """plan H2：WSL + /mnt/<drive>/... 工作区被识别为跨 fs。"""
+        from specimen_app.startup_diag import detect_workspace_on_windows_mounted_filesystem
+        from unittest.mock import patch
+        # 模拟 WSL + /mnt/n/...
+        with patch("pathlib.Path.read_text", return_value="Linux microsoft WSL2"):
+            self.assertTrue(detect_workspace_on_windows_mounted_filesystem(Path("/mnt/n/codex/ws")))
+            self.assertTrue(detect_workspace_on_windows_mounted_filesystem(Path("/mnt/c/users/test")))
+            self.assertFalse(detect_workspace_on_windows_mounted_filesystem(Path("/home/user/ws")))
+        # 模拟非 WSL
+        with patch("pathlib.Path.read_text", return_value="Linux generic"):
+            self.assertFalse(detect_workspace_on_windows_mounted_filesystem(Path("/mnt/n/codex/ws")))
+
+
 if __name__ == "__main__":
     unittest.main()
