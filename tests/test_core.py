@@ -2481,6 +2481,61 @@ class Phase6StartupPerfTests(unittest.TestCase):
         new_file_names = {p.name for p in new_files}
         self.assertIn("new.jpg", new_file_names)
 
+    def test_list_reserved_vouchers_pending_ingestion_filters_already_built_specimens(self) -> None:
+        """plan v0.10.6 S2：批量领取后没建 specimen 行的号才出现在列表里。"""
+        from specimen_app.excel_store import ExcelStore
+        store = ExcelStore(self.tmp)
+        reserved_vouchers = store.batch_reserve_vouchers(5)
+        self.assertEqual(len(reserved_vouchers), 5)
+        # 显式 log 一条批量领取事件（UI 层 BatchGenerateDialog 默认会做这步）
+        store.log_alloc_event({
+            "记录ID": "test-batch-001",
+            "时间": "2026-05-26T10:00:00",
+            "类型": "批量领取",
+            "人员": "张三",
+            "编号系列": "YZZ",
+            "编号起始": reserved_vouchers[0],
+            "编号结束": reserved_vouchers[-1],
+            "数量": str(len(reserved_vouchers)),
+        })
+        # 给其中 2 个建 specimen 行
+        store.create_specimen_with_voucher(reserved_vouchers[0])
+        store.create_specimen_with_voucher(reserved_vouchers[2])
+        pending = store.list_reserved_vouchers_pending_ingestion()
+        pending_voucher_set = {entry["voucher"] for entry in pending}
+        # 剩 3 个应该还在 pending
+        self.assertNotIn(reserved_vouchers[0], pending_voucher_set)
+        self.assertNotIn(reserved_vouchers[2], pending_voucher_set)
+        self.assertIn(reserved_vouchers[1], pending_voucher_set)
+        self.assertIn(reserved_vouchers[3], pending_voucher_set)
+        self.assertIn(reserved_vouchers[4], pending_voucher_set)
+        # reserver_name 应正确透传
+        for entry in pending:
+            self.assertEqual(entry["reserver_name"], "张三")
+        store.release_lock()
+
+    def test_workload_aggregation_by_specimen_recorder_field(self) -> None:
+        """plan v0.10.6 S4：工作量按 specimen 表"信息录入人员"字段聚合，不依赖 ALLOC_LOG 任务记录。"""
+        from specimen_app.excel_store import ExcelStore
+        from collections import Counter
+        store = ExcelStore(self.tmp)
+        voucher1 = store.create_specimen()
+        voucher2 = store.create_specimen()
+        voucher3 = store.create_specimen()
+        store.set_fields("specimen", voucher1, {"信息录入人员": "张三"})
+        store.set_fields("specimen", voucher2, {"信息录入人员": "张三"})
+        store.set_fields("specimen", voucher3, {"信息录入人员": "李四"})
+        # 直接读 specimen 表算 — 与 WorkloadReportDialog 内部算法一致
+        rows = store.read_rows("specimen")
+        recorder_counts = Counter(
+            (row.get("信息录入人员") or "").strip()
+            for row in rows
+            if row.get("入库编号*")
+        )
+        self.assertEqual(recorder_counts.get("张三"), 2)
+        self.assertEqual(recorder_counts.get("李四"), 1)
+        store.release_lock()
+
     def test_reconcile_scope_preserves_cached_entries_outside_changed_dirs(self) -> None:
         """plan v0.10.4 I2：未扫描的目录 cached entries 不应被 removed。"""
         from specimen_app.image_search import ImageIndexStore

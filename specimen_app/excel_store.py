@@ -3008,6 +3008,45 @@ class ExcelStore:
         """
         return self.status_for(voucher).is_complete
 
+    def list_reserved_vouchers_pending_ingestion(self) -> list[dict[str, str]]:
+        """plan v0.10.6 S2：列出已批量领取但 specimen 行尚未建的入库编号。
+
+        与 ``list_unfinished_reserved_vouchers`` 的区别：
+          - 这个仅看 specimen 表是否已有行（True=有 → 不返回；False=无 → 返回）
+          - 用于主面板 voucher 列表显示"灰条占位"，用户点击即可建行编辑
+          - 旧 list_unfinished_reserved_vouchers 看 is_voucher_ingestion_complete
+            （含 specimen 必填+照片+分类全 OK），用于工作量"完成"判定，语义不同
+
+        返回 ``[{voucher, reserver_name, reserved_at}, ...]``，按领取时间倒序。
+        """
+        existing_specimen_vouchers = {
+            self._value(row, "入库编号*")
+            for row in self.read_rows("specimen")
+            if self._value(row, "入库编号*")
+        }
+        result: list[dict[str, str]] = []
+        seen_vouchers: set[str] = set()
+        for alloc_row in reversed(self.read_alloc_log()):
+            if self._value(alloc_row, "类型") != "批量领取":
+                continue
+            series = self._value(alloc_row, "编号系列") or "YZZ"
+            start_str = self._value(alloc_row, "编号起始")
+            end_str = self._value(alloc_row, "编号结束")
+            reserver_name = self._value(alloc_row, "人员")
+            reserved_at = self._value(alloc_row, "时间")
+            for voucher in self._expand_voucher_range(series, start_str, end_str):
+                if voucher in seen_vouchers:
+                    continue
+                seen_vouchers.add(voucher)
+                if voucher in existing_specimen_vouchers:
+                    continue  # 已建 specimen 行 → 不属于"待入库占位"
+                result.append({
+                    "voucher": voucher,
+                    "reserver_name": reserver_name,
+                    "reserved_at": reserved_at,
+                })
+        return result
+
     def list_unfinished_reserved_vouchers(self) -> list[tuple[str, str, str]]:
         """列出系统中所有「已批量领取 + 未完成入库」的编号。
 

@@ -23,7 +23,7 @@ python -m unittest discover -s tests
 python -m unittest tests.test_core.CoreTests.test_create_vouchers_increment
 
 # Build Windows/Linux release (requires PyInstaller)
-python build_release.py --version 0.10.5
+python build_release.py --version 0.10.6
 
 # Windows: one-click build (also runs build_release.py)
 build.bat
@@ -62,7 +62,7 @@ Entry point: `run_app.py` → `specimen_app/main.py:main()` → `specimen_app/ui
 - **`cursors.py`** — Fun cartoon cursors that replace the default arrow, picked in Settings. `CURSOR_STYLE_OPTIONS` (key→显示名: default/finger/palm/pen/paw/star), `create_cursor_image()` draws each procedurally via `QImage`+`QPainter` (no image assets, import-safe — no `QApplication` needed), `cursor_hotspot()`, `make_cursor()` builds the `QCursor` (lazy — needs a GUI). Persisted as `cursor_style` in settings.json.
 - **`theme.py`** — Shared light UI theme: semantic palette constants (consolidates the formerly scattered hex like `#2a6fbd`) + `APP_QSS` global stylesheet + `apply_app_theme(app)`, applied once in `run_app()` after font setup. Styles menus/buttons/inputs/table headers/toolbar/groupbox/tabs/scrollbars for a consistent Geneious/PhyloSuite-like look. **The QSS deliberately sets no `font`/`font-size`** — fonts stay owned by `apply_app_font_size()` + `_refresh_scaled_fonts()`. Existing per-widget `setStyleSheet` calls still win (widget-level QSS overrides app-level).
 - **`batch_export.py`** — `BatchExportDialog` for exporting specimen data + photos by voucher number list (like NCBI Batch Entrez). Parses voucher numbers from pasted text, writes a multi-sheet Excel workbook, optionally copies photo files and packages as ZIP. Accessible from right-click menu ("批量导出选中") or toolbar button. Photo export supports a format/compression group (`PHOTO_EXPORT_FORMATS`: "保持原格式"=`shutil.copy2` as before, else Pillow re-encode to JPG/PNG/TIFF via `_reencode_photo` — JPEG quality slider, optional max-edge downscale); the `photo_focus=True` ctor flag (used by the summary dialog's "导出选中照片") makes it a pure photo exporter — photo-files-only defaults, retitled dialog, and the 标本信息/分类信息/照片路径清单 checkboxes hidden (still constructed so `_do_export` is unchanged).
-- **`__init__.py`** — Only exports `__version__` (currently `"0.10.5"`), used by `build_release.py` as the default build version.
+- **`__init__.py`** — Only exports `__version__` (currently `"0.10.6"`), used by `build_release.py` as the default build version.
 
 ### Data storage
 

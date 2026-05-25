@@ -1909,12 +1909,9 @@ class SpecimenWindow(QMainWindow):
         self._new_voucher_btn.setToolTip("请先开始录入任务")
         self._new_voucher_btn.clicked.connect(self.new_specimen)
         voucher_layout.addWidget(self._new_voucher_btn)
-        # S2 接管按钮：列出「他人已批量领取但未入库」的编号，批量接管计入本任务工作量。
-        self._takeover_btn = QPushButton("⇩ 接管未入库编号…")
-        self._takeover_btn.setEnabled(False)
-        self._takeover_btn.setToolTip("请先开始录入任务")
-        self._takeover_btn.clicked.connect(self._open_takeover_dialog)
-        voucher_layout.addWidget(self._takeover_btn)
+        # 旧（v0.10.5 及之前）：「⇩ 接管未入库编号…」按钮 + TakeoverPickerDialog 流程。
+        # v0.10.6 删除——用户反馈太复杂；改为 voucher list 直接显示未入库领取号 + 点击即建。
+        # 工作量按 specimen 表的「信息录入人员」字段聚合，谁最终录入算谁的。
         # 行2：编号系列 标签 + 小下拉框 + 「编号系列管理」按钮 —— 整组居中,
         # 两侧加 addStretch 留白,不再左挤显得拥挤。
         series_row = QHBoxLayout()
@@ -2764,6 +2761,21 @@ class SpecimenWindow(QMainWindow):
         self._all_photo_counts = dict(overview["photo_counts"])
         self._all_tube_numbers = dict(overview["tube_numbers"])
         self._all_photo_filenames = dict(overview["photo_filenames"])
+        # plan v0.10.6 S2：把"已批量领取但 specimen 行未建"的编号合并进列表显示
+        # （灰条 + tooltip 标"领取人"），用户双击触发自动建行 + 进入编辑面板。
+        self._reserved_pending_metadata: dict[str, dict[str, str]] = {}
+        try:
+            for entry in self.store.list_reserved_vouchers_pending_ingestion():
+                voucher = entry.get("voucher", "")
+                if not voucher or voucher in self._all_flags:
+                    continue
+                self._reserved_pending_metadata[voucher] = entry
+                self._all_vouchers.append(voucher)
+                self._all_photo_counts.setdefault(voucher, 0)
+                self._all_tube_numbers.setdefault(voucher, "")
+                self._all_photo_filenames.setdefault(voucher, [])
+        except Exception:
+            pass  # 读 alloc_log 失败不应阻塞主列表
         self._refresh_series_selector()
         self._refresh_series_filter_combo()
         self._apply_voucher_filter()
@@ -2904,9 +2916,8 @@ class SpecimenWindow(QMainWindow):
             # 本任务创建的所有入库编号集合。认领数 = len();
             # 入库数 = status_for(v).is_complete 的个数（旧逻辑错用 get_photos(v) 非空，已修）。
             "本任务编号": set(),
-            # S2 新增：本任务接管补完的「他人已领取但未入库」编号；并入入库计数。
-            "接管编号": set(),
-            "接管来源": {},   # voucher -> 原领取人（来自 alloc_log "批量领取" 事件「人员」），供审计
+            # 旧（v0.10.5）："接管编号" / "接管来源" 字段——v0.10.6 删
+            # 工作量算法改按 specimen.信息录入人员 字段聚合，不再需要 task-level 接管追踪。
         }
         self.store.log_alloc_event({
             "记录ID": task_id,
@@ -2918,69 +2929,16 @@ class SpecimenWindow(QMainWindow):
         })
         self._update_task_indicator()
 
-    def _open_takeover_dialog(self) -> None:
-        """打开接管未入库编号选择器。
-
-        过滤：排除本任务已新建/已接管，排除「本人即原领取人」的段。
-        接管后若 specimen 行尚未创建，则先 create_specimen_with_voucher 建空行，
-        让用户能在主界面继续填字段。
-        """
-        if self._active_task is None or self.store is None:
-            QMessageBox.information(self, "未开始任务", "请先「开始录入任务」再接管编号。")
-            return
-        self_person = self._active_task.get("人员", "")
-        already_in_task = self._active_task["本任务编号"] | (self._active_task.get("接管编号") or set())
-        try:
-            all_candidates = self.store.list_unfinished_reserved_vouchers()
-        except Exception as exc:
-            QMessageBox.critical(self, "扫描失败", f"读取分发记录失败：{exc}")
-            return
-        # 过滤：排除已在本任务、排除本人领取的（自己领的不需要接管）
-        candidates = [
-            row for row in all_candidates
-            if row[0] not in already_in_task
-            and (row[1] or "") != self_person
-        ]
-        if not candidates:
-            QMessageBox.information(
-                self, "没有可接管编号",
-                "目前没有「他人已领取但未入库」的编号可接管。\n\n"
-                "（按 (voucher, 状态) 判定：specimen 必填 / 至少 1 张照片 / 分类必填 全 OK 即视为入库完成）",
-            )
-            return
-        dlg = TakeoverPickerDialog(self, candidates)
-        if dlg.exec_() != QDialog.Accepted:
-            return
-        added_count = 0
-        for voucher, reserver, _ts in dlg.selected:
-            try:
-                if self.store.get_specimen(voucher) is None:
-                    # 接管时如果 voucher 还没建 specimen 行（仅在 alloc_log 预留段内），先建空行
-                    self.store.create_specimen_with_voucher(voucher)
-                    self.patch_voucher_row(voucher, "added")
-                self._active_task["接管编号"].add(voucher)
-                self._active_task["接管来源"][voucher] = reserver
-                added_count += 1
-            except Exception as exc:
-                QMessageBox.warning(self, "接管失败", f"接管 {voucher} 失败：{exc}")
-        self._update_task_indicator()
-        QMessageBox.information(
-            self, "接管完成",
-            f"已接管 {added_count} 个未入库编号到本任务。\n"
-            "请在主界面填完字段（必填 / 照片 / 分类），完成入库后将计入本任务的「入库」数。",
-        )
-
     def _end_task(self) -> None:
         if self._active_task is None:
             return
         from datetime import datetime as _dt
-        # S2: 任务结束时同时记录「新建数量 / 接管数量 / 完成入库数 / 接管编号」4 列；
-        # 「数量」字段口径保持「认领数=本任务新建数」，旧报表向后兼容。
+        # plan v0.10.6 S5: 简化任务结束。旧 ALLOC_LOG 写 5 列（数量 / 新建数量 / 接管数量
+        # / 完成入库数 / 接管编号）；新只写 数量 / 完成入库数。schema 列保留向后兼容，
+        # 老 workspace 数据读得出来，新数据这两列写空串。
         created = self._active_task["本任务编号"]
-        taken_over = self._active_task.get("接管编号") or set()
-        all_handled = created | taken_over
         ingested = sum(
-            1 for v in all_handled
+            1 for v in created
             if self.store is not None and self.store.is_voucher_ingestion_complete(v)
         )
         self.store.log_alloc_event({
@@ -2991,9 +2949,10 @@ class SpecimenWindow(QMainWindow):
             "数量": str(len(created)),
             "关联任务ID": self._active_task["记录ID"],
             "新建数量": str(len(created)),
-            "接管数量": str(len(taken_over)),
             "完成入库数": str(ingested),
-            "接管编号": ";".join(sorted(taken_over)),
+            # 旧字段保留 schema 列，新数据不再写值
+            "接管数量": "",
+            "接管编号": "",
         })
         self._active_task = None
         self._update_task_indicator()
@@ -3009,23 +2968,18 @@ class SpecimenWindow(QMainWindow):
             purpose = self._active_task["用途"]
             # 用途词转状态形式（入库→入库中），与后面计数「入库 K」区分开。
             status = f"{purpose}中" if purpose in ("入库", "整理", "核查") else (purpose or "录入中")
-            # S2.1bis 修复：
-            # 旧：入库 = 本任务编号中 get_photos(v) 非空的个数 —— 只看挂没挂照片，
-            #     即使必填字段全空、分类全空也算入库 → 严重高估工作量。
-            # 新：入库 = (本任务编号 ∪ 接管编号) 中 status_for(v).is_complete 的个数
-            #     （specimen 必填 + 照片 + 分类必填 全 OK）。
+            # plan v0.10.6: 任务指示器简化——只算本任务新建的编号。
+            # 用户在主面板可直接点击"未入库领取号"灰条建行编辑（plan S2），
+            # 那种 voucher 也算入"本任务编号"集合（由 patch_voucher_row 注入）。
+            # 旧"接管编号"分集已删，所有用户实际录入的号都统一在本任务编号里。
             created = self._active_task["本任务编号"]
-            taken_over = self._active_task.get("接管编号") or set()
-            all_handled = created | taken_over
             claimed = len(created)
-            taken = len(taken_over)
             ingested = sum(
-                1 for v in all_handled
+                1 for v in created
                 if self.store is not None and self.store.is_voucher_ingestion_complete(v)
             )
-            extra = f" · 接管 {taken}" if taken else ""
             self._task_label.setText(
-                f"● {person} · {status} · 认领 {claimed}{extra} · 入库 {ingested}"
+                f"● {person} · {status} · 认领 {claimed} · 入库 {ingested}"
             )
             self._task_label.setStyleSheet("color: #1a7a1a; font-weight: bold;")
             self._task_indicator.setStyleSheet("#task_indicator { background: #d4edda; border-radius: 3px; }")
@@ -3033,9 +2987,6 @@ class SpecimenWindow(QMainWindow):
             self._task_end_btn.setVisible(True)
             self._new_voucher_btn.setEnabled(True)
             self._new_voucher_btn.setToolTip("")
-            if hasattr(self, "_takeover_btn"):
-                self._takeover_btn.setEnabled(True)
-                self._takeover_btn.setToolTip("接管他人已领取但未入库的编号，补完后计入本任务的入库数")
         else:
             self._task_label.setText("未开始任务")
             self._task_label.setStyleSheet("color: #888;")
@@ -3044,9 +2995,6 @@ class SpecimenWindow(QMainWindow):
             self._task_end_btn.setVisible(False)
             self._new_voucher_btn.setEnabled(False)
             self._new_voucher_btn.setToolTip("请先开始录入任务")
-            if hasattr(self, "_takeover_btn"):
-                self._takeover_btn.setEnabled(False)
-                self._takeover_btn.setToolTip("请先开始录入任务")
 
     def _open_batch_generate(self) -> None:
         if self.store is None:
@@ -3265,7 +3213,39 @@ class SpecimenWindow(QMainWindow):
         # Populate table
         self.voucher_table.blockSignals(True)
         self.voucher_table.setRowCount(len(page))
+        reserved_pending = getattr(self, "_reserved_pending_metadata", {})
         for i, v in enumerate(page):
+            pending_meta = reserved_pending.get(v)
+            if pending_meta is not None:
+                # plan v0.10.6 S2：未入库领取号 — 灰条占位，双击建行
+                reserver_name = pending_meta.get("reserver_name", "")
+                pending_tooltip = (
+                    f"已领取但未入库\n"
+                    f"领取人：{reserver_name or '(未知)'}\n"
+                    f"领取时间：{pending_meta.get('reserved_at', '')}\n\n"
+                    f"双击此行（或选中）→ 自动建行 + 进入编辑面板。"
+                )
+                voucher_item = QTableWidgetItem(v)
+                voucher_item.setToolTip(pending_tooltip)
+                voucher_item.setForeground(QColor("#888"))
+                self.voucher_table.setItem(i, 0, voucher_item)
+                claim_item = QTableWidgetItem(f"未入库 · {reserver_name or '?'}")
+                claim_item.setForeground(QColor("#888"))
+                claim_item.setToolTip(pending_tooltip)
+                # 1-3 列状态符显示空 + 灰色
+                for column_index in (1, 2, 3):
+                    cell = QTableWidgetItem("·")
+                    cell.setForeground(QColor("#bbb"))
+                    cell.setToolTip(pending_tooltip)
+                    self.voucher_table.setItem(i, column_index, cell)
+                self.voucher_table.setItem(i, 4, claim_item)
+                count_item = QTableWidgetItem("0")
+                count_item.setForeground(QColor("#bbb"))
+                self.voucher_table.setItem(i, 5, count_item)
+                empty_photo = QTableWidgetItem("")
+                empty_photo.setForeground(QColor("#bbb"))
+                self.voucher_table.setItem(i, 6, empty_photo)
+                continue
             f = self._all_flags.get(v)
             label = f.label() if f else "×××"
             pc = self._all_photo_counts.get(v, 0)
@@ -3321,7 +3301,50 @@ class SpecimenWindow(QMainWindow):
         # 单选时自动跳转到该标本（保持原有行为）；多选时不跳转（避免混乱）
         if len(rows) == 1:
             voucher = self.voucher_table.item(rows[0].row(), 0).text()
+            # plan v0.10.6 S2：未入库领取号被选中 → 自动建 specimen 行 + 跳入编辑
+            if voucher in getattr(self, "_reserved_pending_metadata", {}):
+                self._open_voucher_for_entry(voucher)
+                return
             self.select_voucher(voucher)
+
+    def _open_voucher_for_entry(self, voucher: str) -> None:
+        """plan v0.10.6 S2/S3：把"已领取未入库"占位 voucher 落地为可编辑的 specimen 行。
+
+        - 若 specimen 行尚未建 → 调 ``create_specimen_with_voucher`` 建空行
+        - 若 _active_task 非空 → 自动 ``set_fields("specimen", voucher, {信息录入人员: 任务人员})``
+          (S3：让工作量按 specimen.信息录入人员 字段聚合的口径成立)
+        - 加入本任务编号集合，nav 到该 voucher 进入编辑面板
+
+        用户可手动修改"信息录入人员"字段（不锁）。
+        """
+        if self.store is None:
+            return
+        try:
+            if self.store.get_specimen(voucher) is None:
+                self.store.create_specimen_with_voucher(voucher)
+                self.patch_voucher_row(voucher, "added")
+            # S3 自动填录入人员
+            if self._active_task is not None:
+                task_person = self._active_task.get("人员", "")
+                if task_person:
+                    try:
+                        self.store.set_fields(
+                            "specimen", voucher,
+                            {"信息录入人员": task_person},
+                            action_type="task_auto_assign_recorder",
+                        )
+                    except Exception:
+                        pass
+                # 加入本任务编号集合，end_task 计入认领/入库数
+                self._active_task["本任务编号"].add(voucher)
+                self._update_task_indicator()
+        except Exception as exc:
+            QMessageBox.warning(self, "建行失败", f"为 {voucher} 创建标本行失败：{exc}")
+            return
+        # 清掉 pending 标记，刷新视觉
+        if hasattr(self, "_reserved_pending_metadata"):
+            self._reserved_pending_metadata.pop(voucher, None)
+        self.select_voucher(voucher)
 
     def _select_voucher_in_table(self, voucher: str) -> None:
         for row in range(self.voucher_table.rowCount()):
@@ -3821,6 +3844,14 @@ class SpecimenWindow(QMainWindow):
                 voucher = self.store.create_specimen_with_voucher(text)
             else:
                 voucher = self.store.create_specimen()
+            # plan v0.10.6 S3：任务激活时把"信息录入人员"自动填为当前任务人员，
+            # 让工作量按 specimen.信息录入人员 字段聚合的口径成立（最终入库状态为准）。
+            # 用户可手动改字段，不锁。CARRY_OVER_SPECIMEN_FIELDS 已含"信息录入人员"
+            # （沿用上条），任务激活时优先用任务人员覆盖。
+            if self._active_task is not None:
+                task_recorder_name = self._active_task.get("人员", "")
+                if task_recorder_name:
+                    carry["信息录入人员"] = task_recorder_name
             if carry:
                 self.store.set_fields("specimen", voucher, carry)
             if self._active_task:
@@ -9799,114 +9830,10 @@ class BatchImportSourcesDialog(QDialog):
         self.accept()
 
 
-class TakeoverPickerDialog(QDialog):
-    """S2: 接管未入库编号选择器。
-
-    列出系统中所有「已批量领取但未完成入库」的编号，支持搜索 + 多选；
-    用户确认后由调用方把选中项加入 `_active_task["接管编号"]` set，
-    并在任务结束时计入工作量统计（alloc_log 新建数量 / 接管数量 / 完成入库数 三列）。
-    """
-
-    def __init__(self, parent, candidates: list[tuple[str, str, str]]):
-        super().__init__(parent)
-        self.setWindowTitle("接管未入库编号")
-        self.resize(720, 520)
-        self._all_rows = list(candidates)   # [(voucher, 领取人, 领取时间), ...]
-        self.selected: list[tuple[str, str, str]] = []
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(
-            "下列编号已被「批量领取」但尚未完成入库（specimen 必填 / 照片 / 分类必填 任一缺失）。\n"
-            "勾选后点「接管选中」，将这些编号纳入本任务的工作量统计；"
-            "「本人已领取」的编号不在此列。"
-        ))
-        # 搜索
-        search_row = QHBoxLayout()
-        search_row.addWidget(QLabel("筛选"))
-        self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("按入库编号 / 领取人筛选（支持包含匹配）")
-        self._search_edit.textChanged.connect(self._refresh_table)
-        search_row.addWidget(self._search_edit, stretch=1)
-        layout.addLayout(search_row)
-        # 表
-        self._table = QTableWidget(0, 4)
-        self._table.setHorizontalHeaderLabels(["", "入库编号", "原领取人", "领取时间"])
-        self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.setColumnWidth(0, 36)
-        self._table.setColumnWidth(1, 130)
-        self._table.setColumnWidth(2, 140)
-        self._table.setSelectionBehavior(QTableWidget.SelectRows)
-        self._table.setEditTriggers(QTableWidget.NoEditTriggers)
-        layout.addWidget(self._table, stretch=1)
-        # 控制行
-        ctrl_row = QHBoxLayout()
-        self._select_all_btn = QPushButton("全选当前筛选")
-        self._select_all_btn.clicked.connect(self._select_all_filtered)
-        ctrl_row.addWidget(self._select_all_btn)
-        self._clear_btn = QPushButton("清除选择")
-        self._clear_btn.clicked.connect(self._clear_selection)
-        ctrl_row.addWidget(self._clear_btn)
-        ctrl_row.addStretch(1)
-        self._status_label = QLabel("")
-        ctrl_row.addWidget(self._status_label)
-        layout.addLayout(ctrl_row)
-        # 按钮
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        ok = buttons.button(QDialogButtonBox.Ok)
-        if ok:
-            ok.setText("接管选中")
-        cancel = buttons.button(QDialogButtonBox.Cancel)
-        if cancel:
-            cancel.setText("取消")
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-        self._refresh_table()
-
-    def _filtered_rows(self) -> list[tuple[str, str, str]]:
-        kw = self._search_edit.text().strip().lower()
-        if not kw:
-            return list(self._all_rows)
-        return [r for r in self._all_rows if kw in r[0].lower() or kw in (r[1] or "").lower()]
-
-    def _refresh_table(self) -> None:
-        rows = self._filtered_rows()
-        self._table.setRowCount(len(rows))
-        for i, (v, person, ts) in enumerate(rows):
-            cb_item = QTableWidgetItem()
-            cb_item.setFlags(cb_item.flags() | Qt.ItemIsUserCheckable)
-            cb_item.setCheckState(Qt.Unchecked)
-            self._table.setItem(i, 0, cb_item)
-            self._table.setItem(i, 1, QTableWidgetItem(v))
-            self._table.setItem(i, 2, QTableWidgetItem(person or "(未知)"))
-            self._table.setItem(i, 3, QTableWidgetItem(ts or ""))
-        self._status_label.setText(f"候选 {len(rows)} 条")
-
-    def _select_all_filtered(self) -> None:
-        for i in range(self._table.rowCount()):
-            item = self._table.item(i, 0)
-            if item is not None:
-                item.setCheckState(Qt.Checked)
-
-    def _clear_selection(self) -> None:
-        for i in range(self._table.rowCount()):
-            item = self._table.item(i, 0)
-            if item is not None:
-                item.setCheckState(Qt.Unchecked)
-
-    def _on_accept(self) -> None:
-        rows = self._filtered_rows()
-        chosen = []
-        for i, r in enumerate(rows):
-            cb = self._table.item(i, 0)
-            if cb is not None and cb.checkState() == Qt.Checked:
-                chosen.append(r)
-        if not chosen:
-            QMessageBox.information(self, "未选择", "请至少勾选一个编号再接管。")
-            return
-        self.selected = chosen
-        self.accept()
+# 旧（v0.10.5 及之前）：TakeoverPickerDialog —— v0.10.6 已删除。
+# 用户反馈"接管"流程太复杂；改为 voucher 列表直接显示未入库领取号 +
+# 双击建行编辑（plan S2）。工作量按 specimen.信息录入人员 字段聚合，
+# 谁最终录入算谁的。老 ALLOC_LOG 的"接管"相关列保留 schema 但不再写入。
 
 
 class BatchGenerateDialog(QDialog):
@@ -10196,49 +10123,99 @@ class WorkloadReportDialog(QDialog):
 
     # ── 数据处理 ──────────────────────────────────────────────────────────────
 
-    def _parse_log(self) -> tuple[list[dict], list[str]]:
-        """配对任务开始/结束记录，返回 (tasks, sorted_persons)。"""
-        from datetime import datetime as _dt
-        rows = self._store.read_alloc_log()
-        starts = {r["记录ID"]: r for r in rows if r.get("类型") == "任务开始"}
-        ends = [r for r in rows if r.get("类型") == "任务结束"]
+    def _aggregate_workload_by_specimen_recorder(self) -> tuple[dict[str, dict], list[dict]]:
+        """plan v0.10.6 S4：以 specimen 表的"信息录入人员"为权威工作量来源。
 
-        tasks = []
-        for end in ends:
-            start_id = end.get("关联任务ID", "")
-            start = starts.get(start_id)
-            if not start:
+        旧（v0.10.5 _parse_log）：按 ALLOC_LOG 任务起止配对，看任务起始的"人员"
+        字段聚合"录入量=任务结束.数量"。问题：领取编号 ≠ 实际录入数据，张三领号但
+        李四接管的话工作量算谁就不清楚。
+
+        新（v0.10.6）："最终入库状态为准"——specimen 表里每行的"信息录入人员"字段
+        就是谁的工作量。统计走 specimen 表，按字段聚合 + 入库日期范围过滤。
+
+        附加列「领取编号数」来自 ALLOC_LOG「批量领取」，方便审计"张三只领号不录入"
+        的情形（结果：领取=N，录入=0）。
+
+        返回：
+          - summary_by_person: ``{人员: {录入标本数, 完成入库数, 领取编号数, 任务次数}}``
+          - specimen_detail_rows: ``[{入库编号, 信息录入人员, 入库日期, 状态}, ...]``
+        """
+        specimen_rows = self._store.read_rows("specimen")
+        alloc_log_rows = self._store.read_alloc_log()
+
+        # 1. 按 信息录入人员 聚合 specimen
+        summary_by_person: dict[str, dict] = {}
+        specimen_detail_rows: list[dict] = []
+        for row in specimen_rows:
+            voucher = row.get("入库编号*", "")
+            if not voucher:
+                continue
+            recorder_name = (row.get("信息录入人员", "") or "").strip() or "(未指定)"
+            ingestion_date = row.get("入库日期", "") or ""
+            try:
+                is_complete = self._store.is_voucher_ingestion_complete(voucher)
+            except Exception:
+                is_complete = False
+            stats = summary_by_person.setdefault(
+                recorder_name,
+                {"录入标本数": 0, "完成入库数": 0, "领取编号数": 0, "任务次数": 0},
+            )
+            stats["录入标本数"] += 1
+            if is_complete:
+                stats["完成入库数"] += 1
+            specimen_detail_rows.append({
+                "入库编号": voucher,
+                "信息录入人员": recorder_name,
+                "入库日期": ingestion_date,
+                "状态": "已入库" if is_complete else "未完整入库",
+            })
+
+        # 2. 加领取编号数（ALLOC_LOG 类型=批量领取，按"人员"聚合数量）
+        for alloc_row in alloc_log_rows:
+            if alloc_row.get("类型") != "批量领取":
+                continue
+            reserver_name = (alloc_row.get("人员", "") or "").strip()
+            if not reserver_name:
                 continue
             try:
-                t0 = _dt.fromisoformat(start["时间"])
-                t1 = _dt.fromisoformat(end["时间"])
-                duration_sec = max(0, int((t1 - t0).total_seconds()))
-            except (ValueError, KeyError):
-                duration_sec = 0
-            tasks.append({
-                "开始时间": start["时间"],
-                "人员": start.get("人员", ""),
-                "用途": start.get("用途", ""),
-                "录入量": int(end.get("数量", 0) or 0),
-                "时长秒": duration_sec,
-            })
-        persons = sorted({t["人员"] for t in tasks})
-        return tasks, persons
+                reserved_count = int(alloc_row.get("数量", 0) or 0)
+            except (ValueError, TypeError):
+                reserved_count = 0
+            stats = summary_by_person.setdefault(
+                reserver_name,
+                {"录入标本数": 0, "完成入库数": 0, "领取编号数": 0, "任务次数": 0},
+            )
+            stats["领取编号数"] += reserved_count
 
-    def _apply_filters(self, tasks: list[dict]) -> list[dict]:
-        person = self._person_filter.currentText()
-        date_from = self._date_from.text().strip()
-        date_to = self._date_to.text().strip()
-        result = []
-        for t in tasks:
-            if person != "全部" and t["人员"] != person:
+        # 3. 任务次数（按任务开始事件统计；与录入工作量解耦）
+        for alloc_row in alloc_log_rows:
+            if alloc_row.get("类型") != "任务开始":
                 continue
-            ts = t["开始时间"]
-            if date_from and ts < date_from:
+            task_starter_name = (alloc_row.get("人员", "") or "").strip()
+            if not task_starter_name:
                 continue
-            if date_to and ts[:10] > date_to:
+            stats = summary_by_person.setdefault(
+                task_starter_name,
+                {"录入标本数": 0, "完成入库数": 0, "领取编号数": 0, "任务次数": 0},
+            )
+            stats["任务次数"] += 1
+
+        return summary_by_person, specimen_detail_rows
+
+    def _apply_filters_to_detail(self, detail_rows: list[dict]) -> list[dict]:
+        selected_person = self._person_filter.currentText()
+        date_from_text = self._date_from.text().strip()
+        date_to_text = self._date_to.text().strip()
+        result: list[dict] = []
+        for row in detail_rows:
+            if selected_person != "全部" and row["信息录入人员"] != selected_person:
                 continue
-            result.append(t)
+            ingestion_date = (row.get("入库日期") or "")[:10]
+            if date_from_text and ingestion_date and ingestion_date < date_from_text:
+                continue
+            if date_to_text and ingestion_date and ingestion_date > date_to_text:
+                continue
+            result.append(row)
         return result
 
     @staticmethod
@@ -10250,7 +10227,8 @@ class WorkloadReportDialog(QDialog):
     # ── UI 刷新 ───────────────────────────────────────────────────────────────
 
     def _refresh(self) -> None:
-        tasks, persons = self._parse_log()
+        summary_by_person, detail_rows = self._aggregate_workload_by_specimen_recorder()
+        persons = sorted(summary_by_person.keys())
 
         current_person = self._person_filter.currentText()
         self._person_filter.blockSignals(True)
@@ -10262,48 +10240,60 @@ class WorkloadReportDialog(QDialog):
         self._person_filter.setCurrentIndex(idx if idx >= 0 else 0)
         self._person_filter.blockSignals(False)
 
-        filtered = self._apply_filters(tasks)
-        self._fill_summary(filtered)
-        self._fill_detail(filtered)
+        filtered_detail = self._apply_filters_to_detail(detail_rows)
+        self._fill_summary(summary_by_person, filtered_detail)
+        self._fill_detail(filtered_detail)
 
-    def _fill_summary(self, filtered: list[dict]) -> None:
+    def _fill_summary(self, summary_by_person: dict[str, dict], filtered_detail: list[dict]) -> None:
+        """汇总：按"信息录入人员"展示录入工作量 + 领取/任务附加列。
+
+        汇总数字由 _aggregate 一次性算好；但当日期范围筛选时录入标本数应只算
+        filtered_detail 范围内的，这里再算一次按人员 group。
+        """
         from collections import defaultdict
-        summary: dict[str, dict] = defaultdict(lambda: {"任务次数": 0, "录入标本数": 0, "时长秒": 0})
-        for t in filtered:
-            s = summary[t["人员"]]
-            s["任务次数"] += 1
-            s["录入标本数"] += t["录入量"]
-            s["时长秒"] += t["时长秒"]
+        filtered_count_by_person: dict[str, int] = defaultdict(int)
+        filtered_complete_by_person: dict[str, int] = defaultdict(int)
+        for detail_row in filtered_detail:
+            recorder_name = detail_row["信息录入人员"]
+            filtered_count_by_person[recorder_name] += 1
+            if detail_row["状态"] == "已入库":
+                filtered_complete_by_person[recorder_name] += 1
 
-        headers = ["录入人", "任务次数", "录入标本数", "累计时长"]
+        headers = ["录入人员", "录入标本数（筛选后）", "完成入库数（筛选后）", "领取编号数（总）", "任务次数（总）"]
         self._summary_table.setColumnCount(len(headers))
         self._summary_table.setHorizontalHeaderLabels(headers)
-        rows = sorted(summary.items())
-        self._summary_table.setRowCount(len(rows))
-        for row, (person_name, stats) in enumerate(rows):
-            self._summary_table.setItem(row, 0, QTableWidgetItem(person_name))
-            self._summary_table.setItem(row, 1, QTableWidgetItem(str(stats["任务次数"])))
-            self._summary_table.setItem(row, 2, QTableWidgetItem(str(stats["录入标本数"])))
-            self._summary_table.setItem(row, 3, QTableWidgetItem(self._fmt_duration(stats["时长秒"])))
+        # 列出现于 filtered 或 summary 的所有人员
+        all_person_names = sorted(set(summary_by_person.keys()) | set(filtered_count_by_person.keys()))
+        self._summary_table.setRowCount(len(all_person_names))
+        for row_index, person_name in enumerate(all_person_names):
+            person_stats = summary_by_person.get(
+                person_name,
+                {"领取编号数": 0, "任务次数": 0},
+            )
+            self._summary_table.setItem(row_index, 0, QTableWidgetItem(person_name))
+            self._summary_table.setItem(row_index, 1, QTableWidgetItem(str(filtered_count_by_person.get(person_name, 0))))
+            self._summary_table.setItem(row_index, 2, QTableWidgetItem(str(filtered_complete_by_person.get(person_name, 0))))
+            self._summary_table.setItem(row_index, 3, QTableWidgetItem(str(person_stats.get("领取编号数", 0))))
+            self._summary_table.setItem(row_index, 4, QTableWidgetItem(str(person_stats.get("任务次数", 0))))
         self._summary_table.resizeColumnsToContents()
 
-    def _fill_detail(self, filtered: list[dict]) -> None:
-        headers = ["任务开始时间", "录入人", "用途", "录入量", "时长"]
+    def _fill_detail(self, filtered_detail: list[dict]) -> None:
+        headers = ["入库编号", "录入人员", "入库日期", "状态"]
         self._detail_table.setColumnCount(len(headers))
         self._detail_table.setHorizontalHeaderLabels(headers)
-        sorted_tasks = sorted(filtered, key=lambda x: x["开始时间"], reverse=True)
-        self._detail_table.setRowCount(len(sorted_tasks))
-        for row, t in enumerate(sorted_tasks):
-            self._detail_table.setItem(row, 0, QTableWidgetItem(t["开始时间"]))
-            self._detail_table.setItem(row, 1, QTableWidgetItem(t["人员"]))
-            self._detail_table.setItem(row, 2, QTableWidgetItem(t["用途"]))
-            self._detail_table.setItem(row, 3, QTableWidgetItem(str(t["录入量"])))
-            self._detail_table.setItem(row, 4, QTableWidgetItem(self._fmt_duration(t["时长秒"])))
+        sorted_rows = sorted(filtered_detail, key=lambda r: (r.get("入库日期") or "", r.get("入库编号", "")), reverse=True)
+        self._detail_table.setRowCount(len(sorted_rows))
+        for row_index, detail_row in enumerate(sorted_rows):
+            self._detail_table.setItem(row_index, 0, QTableWidgetItem(detail_row.get("入库编号", "")))
+            self._detail_table.setItem(row_index, 1, QTableWidgetItem(detail_row.get("信息录入人员", "")))
+            self._detail_table.setItem(row_index, 2, QTableWidgetItem(detail_row.get("入库日期", "")))
+            self._detail_table.setItem(row_index, 3, QTableWidgetItem(detail_row.get("状态", "")))
         self._detail_table.resizeColumnsToContents()
 
     # ── 导出 ──────────────────────────────────────────────────────────────────
 
     def _export_excel(self) -> None:
+        """plan v0.10.6 S4：导出按 specimen 表"信息录入人员"聚合的工作量。"""
         from datetime import datetime as _dt
         path, _ = QFileDialog.getSaveFileName(
             self, "保存工作量报告",
@@ -10312,31 +10302,45 @@ class WorkloadReportDialog(QDialog):
         )
         if not path:
             return
-        tasks, _ = self._parse_log()
-        filtered = self._apply_filters(tasks)
-
+        summary_by_person, detail_rows = self._aggregate_workload_by_specimen_recorder()
+        filtered_detail = self._apply_filters_to_detail(detail_rows)
         from collections import defaultdict
-        from openpyxl import Workbook as _WB
-        summary: dict[str, dict] = defaultdict(lambda: {"任务次数": 0, "录入标本数": 0, "时长秒": 0})
-        for t in filtered:
-            s = summary[t["人员"]]
-            s["任务次数"] += 1
-            s["录入标本数"] += t["录入量"]
-            s["时长秒"] += t["时长秒"]
+        filtered_count_by_person: dict[str, int] = defaultdict(int)
+        filtered_complete_by_person: dict[str, int] = defaultdict(int)
+        for detail_row in filtered_detail:
+            recorder_name = detail_row["信息录入人员"]
+            filtered_count_by_person[recorder_name] += 1
+            if detail_row["状态"] == "已入库":
+                filtered_complete_by_person[recorder_name] += 1
 
+        from openpyxl import Workbook as _WB
         wb = _WB()
         ws1 = wb.active
         ws1.title = "汇总"
-        ws1.append(["录入人", "任务次数", "录入标本数", "累计时长"])
-        for person_name, stats in sorted(summary.items()):
-            ws1.append([person_name, stats["任务次数"], stats["录入标本数"],
-                        self._fmt_duration(stats["时长秒"])])
+        ws1.append(["录入人员", "录入标本数（筛选后）", "完成入库数（筛选后）", "领取编号数（总）", "任务次数（总）"])
+        all_person_names = sorted(set(summary_by_person.keys()) | set(filtered_count_by_person.keys()))
+        for person_name in all_person_names:
+            person_stats = summary_by_person.get(
+                person_name,
+                {"领取编号数": 0, "任务次数": 0},
+            )
+            ws1.append([
+                person_name,
+                filtered_count_by_person.get(person_name, 0),
+                filtered_complete_by_person.get(person_name, 0),
+                person_stats.get("领取编号数", 0),
+                person_stats.get("任务次数", 0),
+            ])
 
         ws2 = wb.create_sheet("明细")
-        ws2.append(["任务开始时间", "录入人", "用途", "录入量", "时长"])
-        for t in sorted(filtered, key=lambda x: x["开始时间"], reverse=True):
-            ws2.append([t["开始时间"], t["人员"], t["用途"], t["录入量"],
-                        self._fmt_duration(t["时长秒"])])
+        ws2.append(["入库编号", "录入人员", "入库日期", "状态"])
+        for detail_row in sorted(filtered_detail, key=lambda r: (r.get("入库日期") or "", r.get("入库编号", "")), reverse=True):
+            ws2.append([
+                detail_row.get("入库编号", ""),
+                detail_row.get("信息录入人员", ""),
+                detail_row.get("入库日期", ""),
+                detail_row.get("状态", ""),
+            ])
 
         wb.save(path)
         QMessageBox.information(self, "完成", f"已导出：{path}")
