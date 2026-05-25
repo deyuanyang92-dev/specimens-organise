@@ -6183,28 +6183,60 @@ class SpecimenWindow(QMainWindow):
 
     # ---- Search index ----
 
+    def _image_index_is_still_fresh(self) -> bool:
+        """plan v0.10.5：仅靠根目录 mtime 判断索引是否仍 fresh，永久短路。
+
+        返回 True 当且仅当：
+          - SQLite 已有 ``scopes.last_scan`` 时间戳（之前扫过）
+          - 工作区 ``照片/`` 目录 mtime <= last_scan（无新增/删除/重命名直接子项）
+          - 所有 saved ``search_paths`` 根目录 mtime <= last_scan
+
+        任一根目录 mtime > last_scan 或读不到 → False，触发常规增量扫。
+        本检查纯 stat，O(根数)，<1ms。
+        """
+        if self.workspace_root is None:
+            return False
+        try:
+            from .image_search import get_image_index_last_scan_timestamp
+            last_scan_timestamp = get_image_index_last_scan_timestamp(self.workspace_root)
+        except Exception:
+            return False
+        if last_scan_timestamp is None:
+            return False
+        scope_root_paths: list[Path] = [self.workspace_root / "照片"]
+        try:
+            for saved_path in load_settings().search_paths:
+                if saved_path:
+                    scope_root_paths.append(Path(saved_path))
+        except Exception:
+            pass
+        for scope_root_path in scope_root_paths:
+            try:
+                if not scope_root_path.is_dir():
+                    continue  # 不存在的根不参与判断
+                if scope_root_path.stat().st_mtime > last_scan_timestamp:
+                    return False  # 该根目录有变动，需重扫
+            except OSError:
+                return False  # 读不到 mtime 保守走重扫
+        return True
+
     def _build_search_index_background(self, force_rebuild: bool = False) -> None:
         """Incrementally reconcile the default and saved search scopes.
 
-        plan v0.10.4 I3：默认 scope 在 5 分钟内已扫过则直接 return，避免反复扫
-        让用户体感"反复索引很笨拙"。force_rebuild=True（用户显式触发"强制重建"）
-        始终绕过短路。
+        plan v0.10.5：旧 v0.10.4 用 5 分钟时间窗短路，用户反馈"关闭再打开还重扫，
+        已经索引过没必要"。新策略：比较 ``照片/`` + saved search_paths 各根目录的 mtime
+        与 SQLite 中 ``scopes.last_scan``——所有根 mtime <= last_scan → 永久短路，
+        不论时长。用户从 File Explorer 加照片到 ``照片/`` 会 bump 父目录 mtime，
+        下一轮 timer / 启动会自动检出。force_rebuild=True 始终绕过短路。
         """
         if self._is_closing or self.workspace_root is None or self._index_build_worker is not None:
             return
         if self._import_job_active or self._save_timers:
             QTimer.singleShot(3000, self._build_search_index_background)
             return
-        # plan v0.10.4 I3: 5 分钟内已扫过 → 静默跳过
-        if not force_rebuild:
-            try:
-                from .image_search import get_image_index_last_scan_timestamp
-                import time as _time
-                last_scan = get_image_index_last_scan_timestamp(self.workspace_root)
-                if last_scan is not None and (_time.time() - last_scan) < 300:
-                    return
-            except Exception:
-                pass
+        if not force_rebuild and self._image_index_is_still_fresh():
+            _startup_mark("image search index unchanged since last scan, skipped")
+            return
         scopes: list[list[str] | None] = [None]
         for path in load_settings().search_paths:
             if Path(path).is_dir() and [path] not in scopes:
