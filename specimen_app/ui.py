@@ -6948,6 +6948,40 @@ class ImageSearchDialog(QDialog):
         self._build()
         self.app.image_index_updated.connect(self._on_automatic_index_updated)
         QTimer.singleShot(0, self._start_dialog_work)
+        # plan V1: 首屏渲染按钮文案 + enabled 状态，跟 current_voucher 一致
+        self._refresh_link_controls_enabled_state()
+
+    def _compose_link_action_label(self, voucher: str | None) -> str:
+        """plan V1：按钮 / 菜单文案生成器。
+
+        显式带入库编号让用户一眼看清关联目标。voucher 为空（理论上 V3 已挡住，
+        但保留防御性逻辑）时返回提示文案。
+        """
+        if voucher:
+            return f"关联到 {voucher}"
+        return "未选入库编号 — 不可关联"
+
+    def _refresh_link_controls_enabled_state(self) -> None:
+        """plan V1：同步顶部 + 底部「关联」按钮的文案 + enabled 状态。
+
+        基准：``self.app.current_voucher``。空时 disable 按钮 + tooltip 提示。
+        右键菜单每次重建（``_show_context_menu``），文案在那里直接 compose，
+        无需在此处刷新菜单项。
+        """
+        voucher = getattr(self.app, "current_voucher", None)
+        label_text = self._compose_link_action_label(voucher)
+        button_is_enabled = bool(voucher)
+        tooltip_text = "" if button_is_enabled else "请先在主窗口选中入库编号"
+        for button_attr_name in (
+            "_link_selected_images_button_top",
+            "_link_selected_images_button_bottom",
+        ):
+            button = getattr(self, button_attr_name, None)
+            if button is None:
+                continue
+            button.setText(label_text)
+            button.setEnabled(button_is_enabled)
+            button.setToolTip(tooltip_text)
 
     def _build(self) -> None:
         layout = QVBoxLayout(self)
@@ -6969,7 +7003,10 @@ class ImageSearchDialog(QDialog):
         self.limit_spin.valueChanged.connect(self._on_limit_changed)
         top.addWidget(self.limit_spin)
         top.addWidget(self._make_button("重新扫描", self.rescan_results))
-        top.addWidget(self._make_button("添加选中图片", self.add_selected))
+        # plan V1: 按钮文案显式带当前入库编号，让用户一眼看清关联目标。
+        # 旧：固定文案 "添加选中图片"，不知关联到哪。
+        self._link_selected_images_button_top = self._make_button("关联到当前入库编号", self.add_selected)
+        top.addWidget(self._link_selected_images_button_top)
         layout.addLayout(top)
 
         # Search paths row
@@ -7006,7 +7043,9 @@ class ImageSearchDialog(QDialog):
         bottom = QHBoxLayout()
         self.status_label = QLabel()
         bottom.addWidget(self.status_label, stretch=1)
-        bottom.addWidget(self._make_button("添加", self.add_selected))
+        # plan V1: 底部按钮同样动态显示当前关联目标，与顶部保持一致
+        self._link_selected_images_button_bottom = self._make_button("关联到当前入库编号", self.add_selected)
+        bottom.addWidget(self._link_selected_images_button_bottom)
         bottom.addWidget(self._make_button("关闭", self.close))
         layout.addLayout(bottom)
 
@@ -7354,7 +7393,13 @@ class ImageSearchDialog(QDialog):
             self.last_selected_index = index
             self._update_selection_visuals()
         menu = QMenu(self)
-        menu.addAction("添加选中图片", self.add_selected)
+        # plan V1: 右键菜单文案与按钮一致显示当前 voucher；voucher 空时菜单项禁用
+        current_voucher_for_label = getattr(self.app, "current_voucher", None)
+        link_action_label = self._compose_link_action_label(current_voucher_for_label)
+        link_action = menu.addAction(link_action_label, self.add_selected)
+        if not current_voucher_for_label:
+            link_action.setEnabled(False)
+            link_action.setToolTip("请先在主窗口选中入库编号")
         menu.addAction("打开原图", lambda: self._open_preview(index))
         menu.addAction("查看详情", lambda: self._show_image_detail(index))
         menu.addSeparator()
@@ -7395,6 +7440,14 @@ class ImageSearchDialog(QDialog):
             QApplication.clipboard().setText(self.results[index].relative_path)
 
     def add_selected(self) -> None:
+        # plan V2: 防御性校验——V3 已让 open_image_search 在无 voucher 时拦下，
+        # 这里再防一次以应对未来 non-modal 化的场景。
+        current_voucher = getattr(self.app, "current_voucher", None)
+        if not current_voucher:
+            QMessageBox.information(
+                self, "未选入库编号", "请先在主窗口选中入库编号再关联照片。"
+            )
+            return
         if not self.selected_indices:
             QMessageBox.information(self, "请选择图片", "请先选择要关联的图片。")
             return
@@ -7404,14 +7457,28 @@ class ImageSearchDialog(QDialog):
             if 0 <= idx < len(self.results) and not self.results[idx].is_linked
         ]
         if not paths:
-            QMessageBox.information(self, "无需添加", "选中的图片已经关联到当前标本。")
+            QMessageBox.information(self, "无需添加", "选中的图片已经关联到当前入库编号。")
             return
-        added = self.app.add_photo_paths(paths, ask_for_outside=False)
+        # plan V2: 捕获跨 voucher 关联导致的 ValueError，明确告知用户而不是 crash
+        try:
+            added = self.app.add_photo_paths(paths, ask_for_outside=False)
+        except ValueError as exc:
+            QMessageBox.warning(self, "关联失败", str(exc))
+            return
+        # 旧：状态消息仅 "已添加 {added} 张图片。"，未含目标 voucher，UX 不清晰
+        # 新：双通道（dialog status_label + 主窗口 statusBar）显式带 voucher
+        success_message = f"已成功关联 {added} 张照片到入库编号 {current_voucher}。"
+        self.status_label.setText(success_message)
+        try:
+            self.app.statusBar().showMessage(success_message, 5000)
+        except Exception:
+            pass  # statusBar 异常不应阻塞主流程
         self.selected_indices.clear()
         self.last_selected_index = None
         self._start_context_refresh()
         self.refresh_results()
-        self.status_label.setText(f"已添加 {added} 张图片。")
+        # 关联完成后刷新按钮态（voucher 大概率没变，但保险刷新）
+        self._refresh_link_controls_enabled_state()
 
     def _navigate_to_voucher(self, link: str) -> None:
         """Navigate the main window to the given voucher, keeping this dialog open."""
