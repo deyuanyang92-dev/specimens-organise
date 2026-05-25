@@ -686,6 +686,37 @@ class UpdateDownloadWorker(QThread):
             self.finished_download.emit(None, False, exc)
 
 
+class LockHeartbeatThread(QThread):
+    """plan B1：每 ``interval_seconds`` 秒调一次 ``store.write_lock_heartbeat_now()``。
+
+    `excel_store.py` 保持 stdlib-only（不引 PyQt5），所以心跳调度必须在 UI 层。
+    线程响应 ``requestInterruption()``，``closeEvent`` 必须 ``wait()`` 它退出。
+    NAS 慢写时心跳本身可能耗时，靠 ``isInterruptionRequested()`` 在两次心跳之间快速退出。
+    """
+
+    def __init__(self, store: "ExcelStore", interval_seconds: float = 60.0, parent=None) -> None:
+        super().__init__(parent)
+        self._store = store
+        self._interval_seconds = max(5.0, float(interval_seconds))
+
+    def run(self) -> None:
+        # 启动后稍等再写第一次心跳，避免开窗瞬间和 acquire_lock 重复写
+        slice_seconds = 1.0
+        accumulated = 0.0
+        while not self.isInterruptionRequested():
+            self.msleep(int(slice_seconds * 1000))
+            accumulated += slice_seconds
+            if accumulated < self._interval_seconds:
+                continue
+            accumulated = 0.0
+            try:
+                self._store.write_lock_heartbeat_now()
+            except Exception:
+                # 心跳失败不应让线程退出（下次再试），但失败累积会被
+                # store.assert_heartbeat_thread_is_alive() 在写前察觉并提示用户
+                pass
+
+
 # ---------------------------------------------------------------------------
 # Photo preview — single mode (QGraphicsView with zoom/pan/drag-drop)
 # ---------------------------------------------------------------------------
@@ -1071,6 +1102,7 @@ class SpecimenWindow(QMainWindow):
             self.workspace_root = None
             self.store = None
             self.matcher = None
+            self._lock_heartbeat_thread: LockHeartbeatThread | None = None  # plan B1: 无 store 时无心跳
         else:
             self.workspace_root, create_workspace_files = prepared
             # 只读副本不抢已存在的主窗口焦点(允许同工作区多只读副本共存)
@@ -1107,6 +1139,12 @@ class SpecimenWindow(QMainWindow):
 
             _startup_mark("SpecimenWindow: ExcelStore ready")
             self.matcher = _species_matcher()  # 旧：读 workspace_root/字段模版/，现读软件自带预设
+            # plan B1: 锁文件 heartbeat 由后台线程维持，主写入前由 store 自检。
+            # 只读副本不抢锁，自然不需要心跳。
+            self._lock_heartbeat_thread: LockHeartbeatThread | None = None
+            if not self.read_only and self.store is not None:
+                self._lock_heartbeat_thread = LockHeartbeatThread(self.store, interval_seconds=60.0, parent=self)
+                self._lock_heartbeat_thread.start()
 
         self.current_voucher: str | None = None
         self.current_photos: list[dict[str, str]] = []
@@ -1457,6 +1495,8 @@ class SpecimenWindow(QMainWindow):
                 except Exception as exc:
                     print(f"[closeEvent] terminate {label} 失败：{exc}", file=sys.stderr)
 
+        # plan B1: 先停心跳线程，再停其他 worker，防止 release_lock 时心跳还在写 lock 文件
+        _stop_worker(getattr(self, "_lock_heartbeat_thread", None), wait_ms=3000, label="lock_heartbeat")
         # Stop background index builder if running
         _stop_worker(getattr(self, "_index_build_worker", None), wait_ms=5000, label="index_builder")
         # Stop thumbnail worker

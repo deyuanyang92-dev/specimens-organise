@@ -6,7 +6,9 @@ import json
 import os
 import re
 import shutil
+import socket  # plan B1: 锁文件需要 hostname
 import sys
+import time  # plan B1: 心跳时间戳
 import uuid
 from collections import Counter, OrderedDict
 from contextlib import contextmanager
@@ -81,6 +83,7 @@ from .models import (
     SPECIMEN_REQUIRED,
     SUMMARY_COLUMNS,
     SUMMARY_COLUMN_SOURCE,
+    HeartbeatThreadStalled,
     SnapshotIntegrityCheckFailed,
     WORKSPACE_CONFIG_FILE,
     WorkbookWriteVerificationFailed,
@@ -97,6 +100,39 @@ from .app_settings import PHOTO_MANAGEMENT_OPTIONS
 from .accession_series import AccessionSeries, format_series_number, series_prefix_of
 from .parsing import derive_specimen_fields_from_tube_number, format_voucher, parse_voucher_serial
 from .startup_diag import mark as _startup_mark
+
+
+def load_or_create_persistent_host_id() -> str:
+    """plan B1：返回本机持久化 UUID。
+
+    存于 ``~/.specimen_inventory/host_id`` 单文件。首次调用并发安全（``O_CREAT|O_EXCL``
+    保证只有一个进程能创建，后续读取得到同一个值）。
+
+    用途：lock 文件 payload 里加上 ``host_id`` 字段，使跨机判活能精确区分"本机持有"
+    vs"外机持有"。``os.kill(pid, 0)`` 在 WSL/NTFS 等混合环境下不可信，必须靠 host_id
+    才能稳健决定是否自动 stale。
+    """
+    host_id_path = Path("~/.specimen_inventory/host_id").expanduser()
+    try:
+        host_id_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # 无家目录或不可写时 fallback：用进程级临时 UUID，保证 lock 行为不崩
+        # 牺牲的是跨进程持久性，安全语义仍正确（不会自动清外机锁）
+        return f"ephemeral-{uuid.uuid4().hex}"
+    try:
+        fd = os.open(host_id_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            return host_id_path.read_text(encoding="utf-8").strip() or f"ephemeral-{uuid.uuid4().hex}"
+        except OSError:
+            return f"ephemeral-{uuid.uuid4().hex}"
+    new_host_id = uuid.uuid4().hex
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(new_host_id)
+    except OSError:
+        return f"ephemeral-{uuid.uuid4().hex}"
+    return new_host_id
 
 
 def _voucher_sort_key(value: str) -> tuple[int, int, str]:
@@ -133,6 +169,10 @@ class ExcelStore:
         self._locked = False
         self._read_only = bool(read_only)
         self._create_if_missing = create_if_missing
+        # plan B1: 跨机锁需要的身份字段
+        self._persistent_host_id = load_or_create_persistent_host_id()
+        self._instance_id = uuid.uuid4().hex
+        self._last_heartbeat_write_monotonic: float = time.monotonic()
         # 规范化软件设计 2026-05 P1 审查修复:_row_cache 加 LRU 上限。
         # 2026-05 内存档位扩展:maxsize 由 memory_profile 驱动 (3/4/6/12/20)。
         # settings 不可用 fallback 到 8 (老默认)。
@@ -226,10 +266,18 @@ class ExcelStore:
     def acquire_lock(self) -> None:
         if self._locked:
             return
+        # plan B1: 扩展 payload；hostname / host_id / heartbeat_at / instance_id 让跨机判活更稳。
+        # 旧 payload 只有 pid+time+workspace，外机持有时 os.kill(pid, 0) 不可信 → 误判。
+        now_iso = datetime.now().isoformat(timespec="seconds")
         payload = {
             "pid": os.getpid(),
-            "time": datetime.now().isoformat(timespec="seconds"),
+            "time": now_iso,
             "workspace": str(self.root),
+            "hostname": socket.gethostname(),
+            "host_id": self._persistent_host_id,
+            "instance_id": self._instance_id,
+            "started_at": now_iso,
+            "heartbeat_at": now_iso,
         }
         try:
             fd = os.open(self.lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -252,16 +300,57 @@ class ExcelStore:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
         self._locked = True
+        self._last_heartbeat_write_monotonic = time.monotonic()
 
     def _lock_is_stale(self) -> bool:
+        """plan B1：跨内核 PID 判活不可信，必须靠 host_id + heartbeat 做硬决策。
+
+        判定优先级：
+          1. 解析失败 / 字段不全 → stale（损坏的锁不留）
+          2. ``host_id == self._persistent_host_id`` 即本机：
+             - 同进程同 instance_id → stale（自我覆盖）
+             - heartbeat_at 超 10 分钟未更新 → stale（同主机进程已死）
+             - 否则 → 不 stale（同主机另一活实例）
+          3. ``host_id != self._persistent_host_id`` 即外机：**永不自动 stale**，
+             ``acquire_lock`` 会向用户提示 "请人工接管"
+          4. 旧锁无 ``host_id`` 字段（v0.9.x 之前）：
+             - ``os.kill(pid, 0)`` 抛 ``ProcessLookupError`` → 唯一可信 stale 信号
+             - ``PermissionError`` 在 WSL 跨内核下既可能"活 Windows PID"也可能"死 PID"，
+               不可信 → 不 stale，让用户人工接管
+        """
         try:
             content = self.lock_file.read_text(encoding="utf-8")
             info = json.loads(content)
             pid = int(info.get("pid", 0))
-            lock_time = info.get("time", "")
         except (OSError, json.JSONDecodeError, ValueError, TypeError):
             return True
-        if pid <= 0 or pid == os.getpid():
+        if pid <= 0:
+            return True
+
+        lock_host_id = str(info.get("host_id", "")).strip()
+
+        if lock_host_id:
+            # 新格式锁
+            if lock_host_id != self._persistent_host_id:
+                # 外机持有：永不自动清；acquire_lock 会把 hostname 透回错误信息
+                return False
+            # 本机
+            lock_instance_id = str(info.get("instance_id", "")).strip()
+            if pid == os.getpid() and lock_instance_id == self._instance_id:
+                return True  # 同进程同实例残留：自己清自己
+            heartbeat_at = str(info.get("heartbeat_at", "")).strip()
+            if heartbeat_at:
+                try:
+                    last_heartbeat = datetime.fromisoformat(heartbeat_at)
+                    if (datetime.now() - last_heartbeat).total_seconds() > 600:
+                        return True
+                except (ValueError, TypeError):
+                    pass
+            return False
+
+        # 旧格式锁（无 host_id）：仅 ProcessLookupError 可信
+        lock_time = info.get("time", "")
+        if pid == os.getpid():
             return True
         if lock_time:
             try:
@@ -275,8 +364,58 @@ class ExcelStore:
         except ProcessLookupError:
             return True
         except PermissionError:
+            # 旧：return False（视为活）。新：仍 return False，但理由不同——
+            # WSL 跨内核下 PermissionError 不可信，所以不 stale，把决定权交人工。
             return False
         return False
+
+    def write_lock_heartbeat_now(self) -> None:
+        """plan B1：直接重写 lock file 把 ``heartbeat_at`` 字段刷新到当前时间。
+
+        由 UI 层 ``LockHeartbeatThread`` 每 60s 调一次。如果锁不存在或不是本机持有则
+        no-op（不抢锁、不抛异常）。本方法不去校验外机持锁——那由 ``_lock_is_stale``
+        统一守门。
+        """
+        if not self._locked:
+            return
+        try:
+            content = self.lock_file.read_text(encoding="utf-8")
+            info = json.loads(content)
+        except (OSError, json.JSONDecodeError, ValueError):
+            return  # 锁文件丢失或损坏；让 acquire/release 路径处理
+        if str(info.get("instance_id", "")) != self._instance_id:
+            return  # 锁已被别人接手，不动
+        info["heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
+        # 原子写：tmp + replace，避免心跳半写让 _lock_is_stale 解析失败误判 stale
+        tmp = self.lock_file.with_suffix(f".{os.getpid()}.heartbeat.tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as handle:
+                json.dump(info, handle, ensure_ascii=False, indent=2)
+            tmp.replace(self.lock_file)
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        self._last_heartbeat_write_monotonic = time.monotonic()
+
+    def assert_heartbeat_thread_is_alive(self, max_silence_seconds: float = 180.0) -> None:
+        """plan B1：每次 store 写之前调，挡住"心跳线程已死却继续写"的死亡场景。
+
+        如果心跳线程死了（异常退出 / 被卡在 NAS IO 上），lock heartbeat_at 不再更新，
+        过 10 分钟其他主机会把锁视为 stale 抢走，本机继续写就是跨机覆盖。
+        本检查在写前快速校验"上次心跳 < max_silence_seconds"，超时抛
+        ``HeartbeatThreadStalled``，UI 层应弹"请重启程序"。
+        """
+        if not self._locked or self._read_only:
+            return
+        elapsed = time.monotonic() - self._last_heartbeat_write_monotonic
+        if elapsed > max_silence_seconds:
+            raise HeartbeatThreadStalled(
+                f"心跳线程 {elapsed:.0f}s 未更新 lock heartbeat_at "
+                f"(阈值 {max_silence_seconds:.0f}s)。继续写有跨机覆盖风险，请重启程序。"
+            )
 
     def release_lock(self) -> None:
         if not self._locked:

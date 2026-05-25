@@ -6,6 +6,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -2003,6 +2004,109 @@ class Phase1DataSafetyTests(unittest.TestCase):
         # 不应抛
         store._verify_workbook_file_can_be_reopened(good)
         self.assertTrue(good.exists())
+
+
+class Phase2CrossHostLockTests(unittest.TestCase):
+    """plan v0.10.0 Phase 2 (P1 跨机锁加固)：B1 行为回归。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_lock_payload_has_host_id_heartbeat_instance(self) -> None:
+        from specimen_app.excel_store import ExcelStore
+        store = ExcelStore(self.tmp, lock=True)
+        import json as _json
+        payload = _json.loads(store.lock_file.read_text(encoding="utf-8"))
+        for field in ("pid", "hostname", "host_id", "instance_id", "started_at", "heartbeat_at"):
+            self.assertIn(field, payload, f"lock payload missing field: {field}")
+        self.assertTrue(payload["host_id"], "host_id should be non-empty")
+        self.assertTrue(payload["instance_id"], "instance_id should be non-empty")
+        store.release_lock()
+
+    def test_lock_cross_host_not_auto_stale_shows_takeover_msg(self) -> None:
+        from specimen_app.excel_store import ExcelStore
+        from specimen_app.models import WorkspaceLockedError
+        store = ExcelStore(self.tmp, lock=True)
+        # 模拟另一台机器持有锁：手工把 host_id 改成不同值
+        import json as _json
+        payload = _json.loads(store.lock_file.read_text(encoding="utf-8"))
+        payload["host_id"] = "OTHER_HOST_DIFFERENT_UUID"
+        payload["hostname"] = "remote-machine"
+        store.lock_file.write_text(_json.dumps(payload), encoding="utf-8")
+        # 另一进程视角下 _lock_is_stale 应永不自动 stale
+        other_store = ExcelStore(self.tmp, lock=False)
+        self.assertFalse(other_store._lock_is_stale())
+        # acquire_lock 应抛 WorkspaceLockedError
+        with self.assertRaises(WorkspaceLockedError) as ctx:
+            other_store.acquire_lock()
+        self.assertIn("被占用", str(ctx.exception))
+        store._locked = False  # 跳过 release（已不是本进程持有）
+
+    def test_lock_legacy_no_host_id_permission_error_not_auto_stale(self) -> None:
+        """plan B1 关键修正：WSL 跨内核下 PermissionError 不可信 → 不 stale。"""
+        from specimen_app.excel_store import ExcelStore
+        from unittest.mock import patch
+        store = ExcelStore(self.tmp, lock=False)
+        # 写老格式锁（无 host_id，pid 任意）
+        data_dir = self.tmp / "数据"
+        data_dir.mkdir(exist_ok=True)
+        import json as _json
+        store.lock_file.write_text(
+            _json.dumps({"pid": 99999, "time": datetime.now().isoformat(timespec="seconds"), "workspace": str(self.tmp)}),
+            encoding="utf-8",
+        )
+        # os.kill 抛 PermissionError 时（不可信判活）→ 不 stale
+        with patch("specimen_app.excel_store.os.kill", side_effect=PermissionError("EPERM")):
+            self.assertFalse(store._lock_is_stale())
+
+    def test_lock_legacy_no_host_id_process_lookup_error_is_stale(self) -> None:
+        from specimen_app.excel_store import ExcelStore
+        from unittest.mock import patch
+        store = ExcelStore(self.tmp, lock=False)
+        data_dir = self.tmp / "数据"
+        data_dir.mkdir(exist_ok=True)
+        import json as _json
+        store.lock_file.write_text(
+            _json.dumps({"pid": 99999, "time": datetime.now().isoformat(timespec="seconds"), "workspace": str(self.tmp)}),
+            encoding="utf-8",
+        )
+        # ProcessLookupError 是唯一可信的 stale 信号
+        with patch("specimen_app.excel_store.os.kill", side_effect=ProcessLookupError("ESRCH")):
+            self.assertTrue(store._lock_is_stale())
+
+    def test_host_id_file_atomic_concurrent_create(self) -> None:
+        from specimen_app.excel_store import load_or_create_persistent_host_id
+        # 调两次应返回同值（持久化）
+        first = load_or_create_persistent_host_id()
+        second = load_or_create_persistent_host_id()
+        self.assertEqual(first, second)
+        self.assertTrue(first, "host_id should be non-empty")
+
+    def test_heartbeat_thread_death_detected_before_write(self) -> None:
+        from specimen_app.excel_store import ExcelStore
+        from specimen_app.models import HeartbeatThreadStalled
+        import time as _time
+        store = ExcelStore(self.tmp, lock=True)
+        # 强行把心跳时间戳推回 300s 前，模拟心跳线程已死 5 分钟
+        store._last_heartbeat_write_monotonic = _time.monotonic() - 300
+        with self.assertRaises(HeartbeatThreadStalled):
+            store.assert_heartbeat_thread_is_alive(max_silence_seconds=180.0)
+        store.release_lock()
+
+    def test_heartbeat_write_updates_lock_file(self) -> None:
+        from specimen_app.excel_store import ExcelStore
+        store = ExcelStore(self.tmp, lock=True)
+        import json as _json
+        before = _json.loads(store.lock_file.read_text(encoding="utf-8"))["heartbeat_at"]
+        import time as _time
+        _time.sleep(1.1)
+        store.write_lock_heartbeat_now()
+        after = _json.loads(store.lock_file.read_text(encoding="utf-8"))["heartbeat_at"]
+        self.assertNotEqual(before, after, "heartbeat_at should advance after write_lock_heartbeat_now()")
+        store.release_lock()
 
 
 if __name__ == "__main__":

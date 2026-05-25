@@ -237,6 +237,14 @@ class WorkbookWriteVerificationFailed(WorkspaceError):
     """
 
 
+class HeartbeatThreadStalled(WorkspaceError):
+    """plan B1：心跳线程长时间未更新 lock heartbeat_at，主线程拒绝继续写入。
+
+    通常意味着 ``LockHeartbeatThread`` 已死（异常退出或被卡在 NAS IO 上），
+    继续写入会导致其他主机以为本机已离开而抢锁，引发跨机写覆盖。
+    """
+
+
 # 规范化软件设计 2026-05 P1 优化:frozen dataclass 加 slots=True 省 __dict__ overhead。
 # Python 3.10+ 原生支持;3.13 项目内可用。5000 凭证 × StatusFlags ~ 省 750KB。
 @dataclass(frozen=True, slots=True)
