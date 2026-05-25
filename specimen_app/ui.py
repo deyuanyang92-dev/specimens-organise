@@ -3319,31 +3319,36 @@ class SpecimenWindow(QMainWindow):
         """
         if self.store is None:
             return
+        # 阶段 1：确保 specimen 行存在。失败 → 保留 pending metadata 让用户重试。
         try:
             if self.store.get_specimen(voucher) is None:
                 self.store.create_specimen_with_voucher(voucher)
                 self.patch_voucher_row(voucher, "added")
-            # S3 自动填录入人员
-            if self._active_task is not None:
-                task_person = self._active_task.get("人员", "")
-                if task_person:
-                    try:
-                        self.store.set_fields(
-                            "specimen", voucher,
-                            {"信息录入人员": task_person},
-                            action_type="task_auto_assign_recorder",
-                        )
-                    except Exception:
-                        pass
-                # 加入本任务编号集合，end_task 计入认领/入库数
-                self._active_task["本任务编号"].add(voucher)
-                self._update_task_indicator()
         except Exception as exc:
             QMessageBox.warning(self, "建行失败", f"为 {voucher} 创建标本行失败：{exc}")
             return
-        # 清掉 pending 标记，刷新视觉
+        # 阶段 2：specimen 行已存在 → 必须立刻 pop pending metadata，否则下次再点会触发
+        # DuplicateVoucherError（zombie 灰条 bug）。后续 set_fields / 任务集合更新失败
+        # 不影响"行已存在"事实。
         if hasattr(self, "_reserved_pending_metadata"):
             self._reserved_pending_metadata.pop(voucher, None)
+        # 阶段 3：S3 自动填录入人员 + 加入本任务集合（失败不阻断进入编辑面板）
+        if self._active_task is not None:
+            task_person = self._active_task.get("人员", "")
+            if task_person:
+                try:
+                    self.store.set_fields(
+                        "specimen", voucher,
+                        {"信息录入人员": task_person},
+                        action_type="task_auto_assign_recorder",
+                    )
+                except Exception:
+                    pass
+            try:
+                self._active_task["本任务编号"].add(voucher)
+                self._update_task_indicator()
+            except Exception:
+                pass
         self.select_voucher(voucher)
 
     def _select_voucher_in_table(self, voucher: str) -> None:
