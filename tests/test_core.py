@@ -7,10 +7,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from openpyxl import Workbook, load_workbook
 from PIL import Image
 
+from specimen_app import env_detect
 from specimen_app.app_settings import DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT, load_settings, save_settings, settings_path
 from specimen_app.classification_fields import (
     CLASSIFICATION_COLUMNS,
@@ -29,11 +32,20 @@ from specimen_app.image_search import (
     image_file_filter,
     image_index_exists,
     image_search_results,
+    indexed_image_entries,
     is_supported_image,
     iter_workspace_images,
+    reconcile_image_index,
     suffixes_for_image_type,
 )
-from specimen_app.models import CLASSIFICATION_HEADERS, ImportConflictError, WorkspaceNotInitializedError
+from specimen_app.models import (
+    CHANGE_LOG_FILE,
+    CLASSIFICATION_HEADERS,
+    ImportConflictError,
+    SnapshotIntegrityCheckFailed,
+    WorkbookWriteVerificationFailed,
+    WorkspaceNotInitializedError,
+)
 from specimen_app.parsing import (
     derive_specimen_fields_from_tube_number,
     extract_bottle_label,
@@ -50,6 +62,7 @@ from specimen_app.parsing import (
 from specimen_app.release_manager import list_releases
 from specimen_app.species import FamilyMatch, SpeciesMatch, SpeciesMatcher
 from specimen_app.ui import (
+    SpecimenWindow,
     WindowManager,
     classification_column_value_from_taxonomy_match,
     default_photo_filename_fill_fields,
@@ -430,6 +443,65 @@ class CoreTests(unittest.TestCase):
         store.redo_last()
         self.assertEqual(store.get_specimen(voucher)["管内编号*"], "QD-LSD-SC001-1-R-250923")
 
+    def test_multi_field_update_records_detail_and_single_summary_change(self) -> None:
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+
+        store.set_fields("specimen", voucher, {"核对人员": "张三", "备注": "批次 A"})
+
+        wb = load_workbook(self.tmp / "数据" / CHANGE_LOG_FILE, read_only=True, data_only=True)
+        try:
+            detail_rows = list(wb["修改明细"].iter_rows(values_only=True))
+            summary_rows = list(wb["修改汇总"].iter_rows(values_only=True))
+        finally:
+            wb.close()
+        detail_headers = list(detail_rows[0])
+        field_index = detail_headers.index("字段名")
+        voucher_index = detail_headers.index("入库编号")
+        changed_fields = {
+            row[field_index]
+            for row in detail_rows[1:]
+            if row[voucher_index] == voucher
+        }
+        self.assertTrue({"核对人员", "备注"}.issubset(changed_fields))
+        summary_headers = list(summary_rows[0])
+        voucher_index = summary_headers.index("入库编号")
+        count_index = summary_headers.index("修改次数")
+        row = next(row for row in summary_rows[1:] if row[voucher_index] == voucher)
+        self.assertEqual(row[count_index], "1")
+
+    def test_pending_text_save_group_flushes_fields_once(self) -> None:
+        class FakeTimer:
+            def __init__(self) -> None:
+                self.stopped = False
+
+            def stop(self) -> None:
+                self.stopped = True
+
+        class FakeWindow:
+            current_voucher = "YZZ000001"
+
+            def __init__(self) -> None:
+                key = "YZZ000001:specimen"
+                self._save_timers = {key: FakeTimer()}
+                self._pending_save_fields = {key: {"核对人员", "备注"}}
+                self.calls: list[tuple[str, set[str], str]] = []
+
+            def _save_pending_group(self, key: str, voucher: str, category: str) -> int:
+                return SpecimenWindow._save_pending_group(self, key, voucher, category)
+
+            def _save_text_fields(self, category: str, fields: set[str], voucher: str) -> None:
+                self.calls.append((category, fields, voucher))
+
+        window = FakeWindow()
+
+        saved = SpecimenWindow._flush_pending_saves(window, "specimen")
+
+        self.assertEqual(saved, 2)
+        self.assertEqual(window.calls, [("specimen", {"核对人员", "备注"}, "YZZ000001")])
+        self.assertFalse(window._save_timers)
+        self.assertFalse(window._pending_save_fields)
+
     def test_redo_order_after_multiple_undo(self) -> None:
         store = ExcelStore(self.tmp)
         voucher = store.create_specimen()
@@ -801,6 +873,22 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(old_archived.exists())
         self.assertTrue(outside.exists())
 
+    def test_replace_photo_rejects_content_linked_to_another_voucher(self) -> None:
+        store = ExcelStore(self.tmp)
+        first = store.create_specimen()
+        second = store.create_specimen()
+        assigned = self.tmp / "assigned.jpg"
+        replacement = self.tmp / "replacement.jpg"
+        assigned.write_bytes(b"already-assigned")
+        replacement.write_bytes(b"old-second")
+        store.add_photo(first, assigned, allow_outside=True)
+        store.add_photo(second, replacement, allow_outside=True)
+
+        with self.assertRaisesRegex(ValueError, first):
+            store.replace_photo(second, 0, assigned, allow_outside=True)
+
+        self.assertEqual(store.get_photos(second)[0]["原始文件名"], "replacement.jpg")
+
     def test_import_workspace_archives_found_photos_and_reports_missing(self) -> None:
         source = self.tmp / "source_archive_import"
         target = self.tmp / "target_archive_import"
@@ -972,6 +1060,41 @@ class CoreTests(unittest.TestCase):
         finally:
             image_cache._MAX_DECODE_PIXELS = original_cap
 
+    def test_auto_memory_profile_constrains_four_gb_machine(self) -> None:
+        env_detect.is_low_memory.cache_clear()
+        try:
+            with patch("specimen_app.env_detect.total_ram_mb", return_value=4096):
+                self.assertTrue(env_detect.is_low_memory())
+                params = env_detect.memory_profile_params("auto")
+                self.assertEqual(params["thumb_cache_bytes"], 16 << 20)
+                self.assertEqual(params["thumb_workers"], 1)
+                self.assertEqual(params["row_cache_maxsize"], 4)
+                self.assertEqual(params["preview_max_size"], (800, 600))
+        finally:
+            env_detect.is_low_memory.cache_clear()
+
+    def test_low_memory_profile_caps_original_preview_size(self) -> None:
+        window = SimpleNamespace(_cached_preview_quality="original")
+        with patch("specimen_app.ui.load_settings", return_value=SimpleNamespace(memory_profile="low")):
+            self.assertEqual(SpecimenWindow._preview_size(window), (800, 600))
+
+    def test_preview_is_reduced_before_exif_transpose(self) -> None:
+        from specimen_app import image_cache
+
+        path = self.tmp / "rotated-preview.jpg"
+        source = Image.new("RGB", (1200, 800), "navy")
+        exif = source.getexif()
+        exif[274] = 6
+        source.save(path, exif=exif)
+        with patch(
+            "specimen_app.image_cache.ImageOps.exif_transpose",
+            wraps=image_cache.ImageOps.exif_transpose,
+        ) as transpose:
+            loaded = image_cache.load_source_image(path, max_size=(400, 300))
+        self.assertEqual(loaded.size, (200, 300))
+        image_before_transpose = transpose.call_args.args[0]
+        self.assertLessEqual(image_before_transpose.width * image_before_transpose.height, 400 * 300)
+
     def test_batch_photo_records_undo_and_redo_as_one_action(self) -> None:
         store = ExcelStore(self.tmp)
         voucher = store.create_specimen()
@@ -1032,6 +1155,34 @@ class CoreTests(unittest.TestCase):
         self.assertEqual([result.file_name for result in results], [first.name, second.name])
         self.assertEqual(results[0].matched_keywords, ("QD-CK-WenSC004",))
         self.assertTrue(results[1].is_linked)
+
+    def test_image_search_collapses_archived_photo_and_original_alias(self) -> None:
+        """已归档照片及其原图同时被扫描时，只显示一个已关联结果。"""
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+        external_dir = self.tmp / "实验室拍照电脑" / "广西"
+        external_dir.mkdir(parents=True)
+        original = external_dir / "GXRG-B-YC001-1.tif"
+        original.write_bytes(b"same-photo")
+        row = store.add_photo(voucher, original, allow_outside=True)
+        archived = store.resolve_photo_path(row)
+
+        results = image_search_results(
+            self.tmp,
+            voucher,
+            {},
+            {},
+            [archived],
+            query="GXRG-B-YC001",
+            extra_roots=[external_dir],
+            path_to_vouchers=store.get_all_photo_voucher_map(),
+            canonical_photo_paths=store.get_photo_search_alias_map(),
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].path.resolve(), archived.resolve())
+        self.assertTrue(results[0].is_linked)
+        self.assertEqual(results[0].linked_vouchers, [voucher])
 
     def test_image_search_can_switch_to_jpg_or_tif_jpg(self) -> None:
         photo_dir = self.tmp / "照片"
@@ -1234,6 +1385,51 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual([result.file_name for result in combined], [first.name, second.name, third.name])
 
+    def test_image_search_reconciles_external_photo_changes_incrementally(self) -> None:
+        photo_dir = self.tmp / "照片"
+        photo_dir.mkdir()
+        first = photo_dir / "QD-CK-WenSC004-1.tif"
+        second = photo_dir / "QD-CK-WenSC004-2.tif"
+        first.write_bytes(b"first")
+        image_search_results(self.tmp, "YZZ000001", {}, {}, [], query="QD-CK-WenSC004")
+
+        second.write_bytes(b"second")
+        stale = image_search_results(self.tmp, "YZZ000001", {}, {}, [], query="QD-CK-WenSC004")
+        self.assertEqual([result.file_name for result in stale], [first.name])
+        added = reconcile_image_index(self.tmp)
+        self.assertEqual((added.added, added.removed), (1, 0))
+        refreshed = image_search_results(self.tmp, "YZZ000001", {}, {}, [], query="QD-CK-WenSC004")
+        self.assertEqual([result.file_name for result in refreshed], [first.name, second.name])
+
+        first.unlink()
+        removed = reconcile_image_index(self.tmp)
+        self.assertEqual((removed.added, removed.removed), (0, 1))
+        final = image_search_results(self.tmp, "YZZ000001", {}, {}, [], query="QD-CK-WenSC004")
+        self.assertEqual([result.file_name for result in final], [second.name])
+
+    def test_image_search_clear_removes_persistent_scope(self) -> None:
+        photo_dir = self.tmp / "照片"
+        photo_dir.mkdir()
+        (photo_dir / "QD-CK-WenSC004-1.tif").write_bytes(b"image")
+        image_search_results(self.tmp, "YZZ000001", {}, {}, [], query="QD-CK-WenSC004")
+        self.assertTrue(image_index_exists(self.tmp))
+
+        clear_image_index(self.tmp)
+        self.assertFalse(image_index_exists(self.tmp))
+
+    def test_indexed_image_entries_uses_sqlite_not_large_json_cache(self) -> None:
+        photo_dir = self.tmp / "照片"
+        photo_dir.mkdir()
+        image = photo_dir / "QD-CK-WenSC004-1.tif"
+        image.write_bytes(b"image")
+
+        entries = indexed_image_entries([photo_dir], cache_root=self.tmp)
+
+        self.assertEqual([entry.path for entry in entries], [image])
+        cache_dir = self.tmp / "数据" / "图片搜索索引缓存"
+        self.assertTrue((cache_dir / "image_search.sqlite3").exists())
+        self.assertEqual(list(cache_dir.glob("*.json")), [])
+
     def test_image_search_uses_core_identifier_from_tube_number(self) -> None:
         photo_dir = self.tmp / "照片"
         photo_dir.mkdir()
@@ -1265,6 +1461,18 @@ class CoreTests(unittest.TestCase):
         third = cache.thumbnail(image_path, (40, 40))
         self.assertLessEqual(third.width, 40)
         self.assertEqual(len(list((self.tmp / "数据" / "缩略图缓存").glob("*.jpg"))), 2)
+
+    def test_thumbnail_cache_shrink_limit_evicts_resident_images(self) -> None:
+        source = self.tmp / "照片"
+        source.mkdir()
+        cache = ThumbnailCache(self.tmp, memory_limit_bytes=16 << 20)
+        for name, color in (("first.jpg", "red"), ("second.jpg", "blue")):
+            path = source / name
+            Image.new("RGB", (1000, 1000), color).save(path)
+            cache.thumbnail(path, (1000, 1000))
+        self.assertGreater(cache._memory_cache_bytes, 4 << 20)
+        cache.set_memory_limit(4 << 20)
+        self.assertLessEqual(cache._memory_cache_bytes, 4 << 20)
 
     def test_grid_shape_options(self) -> None:
         self.assertEqual(grid_shape(2), (2, 1))
@@ -1323,6 +1531,478 @@ class CoreTests(unittest.TestCase):
         releases = list_releases(self.tmp)
         self.assertEqual(releases[0].version, "v0.2.0")
         self.assertEqual(releases[0].exe_path, exe)
+
+    # ── 照片去重 (S1) ────────────────────────────────────────────────────
+    def test_add_photo_dedup_same_source_skips(self) -> None:
+        """同一张照片 add 两次（同 voucher / 默认 copy 模式） → 只保留一行。"""
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+        photo_dir = self.tmp / "外部"
+        photo_dir.mkdir()
+        photo = photo_dir / "shrimp.jpg"
+        photo.write_bytes(b"shrimp-jpeg-bytes")
+        store.add_photo(voucher, photo, allow_outside=True)
+        store.add_photo(voucher, photo, allow_outside=True)
+        photos = store.get_photos(voucher)
+        self.assertEqual(len(photos), 1)
+        self.assertEqual(photos[0]["文件名"], "shrimp.jpg")
+        self.assertEqual(photos[0]["归档状态"], "已归档")
+
+    def test_add_photos_rejects_content_already_linked_to_another_voucher(self) -> None:
+        """已入库照片不能通过批量添加再关联到另一个入库编号。"""
+        store = ExcelStore(self.tmp)
+        first = store.create_specimen()
+        second = store.create_specimen()
+        source = self.tmp / "external.jpg"
+        source.write_bytes(b"single-specimen-photo")
+        store.add_photo(first, source, allow_outside=True)
+
+        with self.assertRaisesRegex(ValueError, first):
+            store.add_photos(second, [source], allow_outside=True)
+
+        self.assertEqual(store.get_photos(second), [])
+
+    def test_add_photo_dedup_different_files_keeps_two(self) -> None:
+        """SHA256 不同 → 不去重，保留两行（向后兼容 test_multiple_photo_records_are_preserved 语义）。"""
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+        photo_dir = self.tmp / "外部"
+        photo_dir.mkdir()
+        first = photo_dir / "shrimp.jpg"
+        second = photo_dir / "crab.jpg"
+        first.write_bytes(b"shrimp-jpeg-bytes")
+        second.write_bytes(b"crab-jpeg-bytes")
+        store.add_photo(voucher, first, allow_outside=True)
+        store.add_photo(voucher, second, allow_outside=True)
+        self.assertEqual(len(store.get_photos(voucher)), 2)
+
+    def test_add_photo_dedup_upgrade_record_only_to_archived(self) -> None:
+        """先以 absolute_only 关联（仅记录），后以 copy_with_absolute 关联 → 升级同一行，不新增。"""
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+        photo_dir = self.tmp / "外部"
+        photo_dir.mkdir()
+        photo = photo_dir / "octopus.jpg"
+        photo.write_bytes(b"octopus-jpeg-bytes")
+        store.add_photo(voucher, photo, allow_outside=True, photo_management_mode="absolute_only")
+        before = store.get_photos(voucher)
+        self.assertEqual(len(before), 1)
+        self.assertEqual(before[0]["归档状态"], "仅记录")
+        store.add_photo(voucher, photo, allow_outside=True, photo_management_mode="copy_with_absolute")
+        after = store.get_photos(voucher)
+        self.assertEqual(len(after), 1)
+        self.assertEqual(after[0]["归档状态"], "已归档")
+        self.assertTrue(store.resolve_photo_path(after[0]).exists())
+
+    def test_add_photo_dedup_does_not_downgrade_archived(self) -> None:
+        """已归档行被重复以仅记录模式 add → 不降级，仍为已归档。"""
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+        photo_dir = self.tmp / "外部"
+        photo_dir.mkdir()
+        photo = photo_dir / "x.jpg"
+        photo.write_bytes(b"x")
+        store.add_photo(voucher, photo, allow_outside=True, photo_management_mode="copy_with_absolute")
+        store.add_photo(voucher, photo, allow_outside=True, photo_management_mode="absolute_only")
+        photos = store.get_photos(voucher)
+        self.assertEqual(len(photos), 1)
+        self.assertEqual(photos[0]["归档状态"], "已归档")
+
+    def test_upgrade_photo_archival_is_undoable(self) -> None:
+        """升级动作走 action_log，可 undo 回 仅记录 状态。"""
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+        photo_dir = self.tmp / "外部"
+        photo_dir.mkdir()
+        photo = photo_dir / "z.jpg"
+        photo.write_bytes(b"z")
+        store.add_photo(voucher, photo, allow_outside=True, photo_management_mode="absolute_only")
+        store.add_photo(voucher, photo, allow_outside=True, photo_management_mode="copy_with_absolute")
+        self.assertEqual(store.get_photos(voucher)[0]["归档状态"], "已归档")
+        self.assertTrue(store.undo_last())
+        self.assertEqual(store.get_photos(voucher)[0]["归档状态"], "仅记录")
+        self.assertTrue(store.redo_last())
+        self.assertEqual(store.get_photos(voucher)[0]["归档状态"], "已归档")
+
+    def test_dedupe_photo_links_merges_legacy_duplicates(self) -> None:
+        """批量清理工具：合并同 (voucher, SHA256, 原始文件名) 的多行，保留 已归档 > 仅记录。"""
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+        # 手工注入两条重复行（模拟历史脏数据，绕过 add_photo 的查重）
+        rows = store.read_rows("photo")
+        rows.append({
+            "入库编号*": voucher,
+            "文件名": "y.jpg", "相对路径": "", "绝对路径": "/tmp/y.jpg", "描述": "",
+            "来源工作区根路径": "", "原始文件名": "y.jpg", "原始路径": "/tmp/y.jpg",
+            "文件SHA256": "abc123", "文件大小": "5",
+            "归档时间": "", "归档状态": "仅记录",
+        })
+        rows.append({
+            "入库编号*": voucher,
+            "文件名": "y.jpg", "相对路径": "./照片/y.jpg", "绝对路径": str(self.tmp / "照片" / "y.jpg"),
+            "描述": "", "来源工作区根路径": "", "原始文件名": "y.jpg", "原始路径": "/tmp/y.jpg",
+            "文件SHA256": "abc123", "文件大小": "5",
+            "归档时间": "2026-05-01T00:00:00", "归档状态": "已归档",
+        })
+        store._write_rows("photo", rows)
+        self.assertEqual(len(store.get_photos(voucher)), 2)
+        # dry-run 不写
+        plan = store.dedupe_photo_links(dry_run=True)
+        self.assertEqual(plan, {"groups": 1, "removed": 1})
+        self.assertEqual(len(store.get_photos(voucher)), 2)
+        # 真清理
+        summary = store.dedupe_photo_links()
+        self.assertEqual(summary, {"groups": 1, "removed": 1})
+        remaining = store.get_photos(voucher)
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["归档状态"], "已归档")
+
+    def test_dedupe_photo_links_no_duplicates_returns_zero(self) -> None:
+        """无重复时 dedupe 返回 0/0，不写快照。"""
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+        photo_dir = self.tmp / "照片"
+        photo_dir.mkdir()
+        f = photo_dir / "a.jpg"
+        f.write_bytes(b"a")
+        store.add_photo(voucher, f)
+        summary = store.dedupe_photo_links()
+        self.assertEqual(summary, {"groups": 0, "removed": 0})
+
+    # ── 缓存索引 + max_serial + 启动预热 (S3.1+3.2+3.7) ──────────────────
+    def test_voucher_index_cache_invalidates_after_delete(self) -> None:
+        """删除 voucher 后 voucher_index 应同步 invalidate；后续 get_specimen 返 None。"""
+        store = ExcelStore(self.tmp)
+        v1 = store.create_specimen()
+        v2 = store.create_specimen()
+        self.assertIsNotNone(store.get_specimen(v1))
+        store.delete_specimen(v1)
+        self.assertIsNone(store.get_specimen(v1))
+        self.assertIsNotNone(store.get_specimen(v2))
+
+    def test_next_voucher_skips_existing_serial_via_index_set(self) -> None:
+        """next_voucher 在 INDEX 已存在该序号时应自增跳过（撞号兜底走 _index_voucher_set）。"""
+        store = ExcelStore(self.tmp)
+        # 第一条占用 YZZ000001；强行把 next_serial 倒回 1 模拟错配
+        v1 = store.create_specimen()
+        self.assertEqual(v1, "YZZ000001")
+        store.config["next_serial"] = 1
+        # 下次 next_voucher 应该跳过 1，生成 2
+        v2 = store.next_voucher()
+        self.assertEqual(v2, "YZZ000002")
+
+    def test_get_photos_uses_voucher_index(self) -> None:
+        """get_photos 走 photo voucher 索引 O(1)；多 voucher 互不干扰。"""
+        store = ExcelStore(self.tmp)
+        v1 = store.create_specimen()
+        v2 = store.create_specimen()
+        photo_dir = self.tmp / "照片"
+        photo_dir.mkdir()
+        p1 = photo_dir / "p1.jpg"; p1.write_bytes(b"p1")
+        p2 = photo_dir / "p2.jpg"; p2.write_bytes(b"p2")
+        store.add_photo(v1, p1)
+        store.add_photo(v2, p2)
+        self.assertEqual(len(store.get_photos(v1)), 1)
+        self.assertEqual(store.get_photos(v1)[0]["文件名"], "p1.jpg")
+        self.assertEqual(len(store.get_photos(v2)), 1)
+        self.assertEqual(store.get_photos(v2)[0]["文件名"], "p2.jpg")
+
+    def test_max_serial_recovers_after_missing_next_serial(self) -> None:
+        """工作区缺 next_serial 配置时，__init__ 走 _sync_next_serial 重建。"""
+        store = ExcelStore(self.tmp)
+        store.create_specimen()  # YZZ000001
+        store.create_specimen()  # YZZ000002
+        store.close()
+        # 第二个 store 强制清 next_serial（模拟旧工作区无该键）
+        store2 = ExcelStore(self.tmp)
+        # 重新打开应正确推进到 3
+        self.assertEqual(store2.next_voucher(), "YZZ000003")
+
+    # ── 增量 append (S3.3) ────────────────────────────────────────────────
+    def test_incremental_append_preserves_existing_rows(self) -> None:
+        """连续 append 100 + 1 行后，文件内容 / 顺序 / voucher 索引一致。"""
+        store = ExcelStore(self.tmp)
+        vs = [store.create_specimen() for _ in range(50)]
+        # 立即新增第 51 个 → 仍是单调递增 + 索引可查
+        v_last = store.create_specimen()
+        all_vs = vs + [v_last]
+        self.assertEqual(store.list_vouchers(), all_vs)
+        # 索引命中：每个 voucher 都可查
+        for v in all_vs:
+            self.assertIsNotNone(store.get_specimen(v))
+        # voucher 单调递增（YZZ000001 ... YZZ000051）
+        self.assertEqual(all_vs[0], "YZZ000001")
+        self.assertEqual(all_vs[-1], "YZZ000051")
+
+    def test_append_keeps_voucher_index_consistent(self) -> None:
+        """append 后立即调 _find_one 应命中（缓存增量更新 vs 整文件 invalidate）。"""
+        store = ExcelStore(self.tmp)
+        store.create_specimen()
+        v = store.create_specimen()
+        # 刚写入即查询，必须命中（O(1) 索引；不应回退到线性扫）
+        spec = store.get_specimen(v)
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec["入库编号*"], v)
+
+    # ── 任务量统计 (S2) ────────────────────────────────────────────────────
+    def test_is_voucher_ingestion_complete_requires_all_three(self) -> None:
+        """is_complete = specimen 必填 + 照片 + 分类必填 全 OK。"""
+        store = ExcelStore(self.tmp)
+        v = store.create_specimen()
+        # 三项都缺 → 不完整
+        self.assertFalse(store.is_voucher_ingestion_complete(v))
+        # 仅挂照片 → 仍不完整（必填字段空）
+        photo_dir = self.tmp / "照片"
+        photo_dir.mkdir()
+        f = photo_dir / "x.jpg"; f.write_bytes(b"x")
+        store.add_photo(v, f)
+        self.assertFalse(store.is_voucher_ingestion_complete(v))
+        # specimen 必填 + 照片 + 分类必填 全填 → 完整
+        store.set_fields("specimen", v, {"管内编号*": "QD-LSD-SC001-1-R-250923", "采集地点缩写*": "QD"})
+        from specimen_app.classification_fields import REQUIRED_CLASSIFICATION_COLUMNS
+        cls = {field: "X" for field in REQUIRED_CLASSIFICATION_COLUMNS if field != "入库编号*"}
+        store.set_fields("classification", v, cls)
+        self.assertTrue(store.is_voucher_ingestion_complete(v))
+
+    def test_list_unfinished_reserved_vouchers(self) -> None:
+        """alloc_log 批量领取段内未完成入库的编号被列出；已完成的被剔除。"""
+        store = ExcelStore(self.tmp)
+        # 模拟批量领取 YZZ000001~YZZ000003
+        store.log_alloc_event({
+            "记录ID": "alloc1", "时间": "2026-05-20T10:00:00",
+            "类型": "批量领取", "人员": "张三",
+            "编号系列": "YZZ", "编号起始": "YZZ000001", "编号结束": "YZZ000003",
+            "数量": "3",
+        })
+        # YZZ000001 完成入库，YZZ000002 未完成（未建行），YZZ000003 部分填（未完）
+        v1 = store.create_specimen_with_voucher("YZZ000001")
+        photo_dir = self.tmp / "照片"; photo_dir.mkdir()
+        p = photo_dir / "a.jpg"; p.write_bytes(b"a")
+        store.add_photo(v1, p)
+        store.set_fields("specimen", v1, {"管内编号*": "T1", "采集地点缩写*": "QD"})
+        from specimen_app.classification_fields import REQUIRED_CLASSIFICATION_COLUMNS
+        store.set_fields("classification", v1, {f: "X" for f in REQUIRED_CLASSIFICATION_COLUMNS if f != "入库编号*"})
+        self.assertTrue(store.is_voucher_ingestion_complete(v1))
+        # 调 list_unfinished_reserved_vouchers
+        unfinished = store.list_unfinished_reserved_vouchers()
+        vs = {v for v, _, _ in unfinished}
+        self.assertNotIn("YZZ000001", vs)
+        self.assertIn("YZZ000002", vs)
+        self.assertIn("YZZ000003", vs)
+        # 领取人记录正确
+        for v, person, _ in unfinished:
+            if v in ("YZZ000002", "YZZ000003"):
+                self.assertEqual(person, "张三")
+
+    def test_alloc_log_legacy_schema_auto_upgrades_columns(self) -> None:
+        """旧工作区只有 11 列 alloc_log，打开后自动扩到 15 列；旧行末尾补 ""。"""
+        from specimen_app.models import ALLOC_LOG_FILE
+        # 手工建 11 列旧 alloc_log
+        data_dir = self.tmp / "数据"
+        data_dir.mkdir(exist_ok=True)
+        old_headers = [
+            "记录ID", "时间", "类型", "人员", "用途", "备注",
+            "编号系列", "编号起始", "编号结束", "数量", "关联任务ID",
+        ]
+        wb = Workbook()
+        ws = wb.active
+        ws.append(old_headers)
+        ws.append(["a1", "2026-05-01T10:00:00", "批量领取", "李四", "u", "n",
+                   "YZZ", "YZZ000001", "YZZ000005", "5", ""])
+        wb.save(data_dir / ALLOC_LOG_FILE)
+        wb.close()
+        # 打开 store 应触发 _ensure_workbook 自动扩列
+        store = ExcelStore(self.tmp)
+        log_path = store.data_dir / ALLOC_LOG_FILE
+        wb2 = load_workbook(log_path)
+        try:
+            headers_now = [c.value for c in next(wb2.active.iter_rows(max_row=1))]
+        finally:
+            wb2.close()
+        # 应含全部 15 列
+        self.assertIn("新建数量", headers_now)
+        self.assertIn("接管数量", headers_now)
+        self.assertIn("完成入库数", headers_now)
+        self.assertIn("接管编号", headers_now)
+        # 旧行仍可读
+        rows = store.read_alloc_log()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].get("人员", ""), "李四")
+        self.assertEqual(rows[0].get("数量", ""), "5")
+
+
+class Phase1DataSafetyTests(unittest.TestCase):
+    """plan v0.10.0 Phase 1 (P0 数据安全)：A1/A2/A4/A5 行为回归。"""
+
+    def setUp(self) -> None:
+        clear_image_index()
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        clear_image_index()
+
+    # ---- A1: undo 归档恢复 + 三态降级 -----------------------------------------
+
+    def _make_photo_source(self, name: str = "src.jpg") -> Path:
+        src = self.tmp / name
+        Image.new("RGB", (32, 32), color="red").save(src, "JPEG")
+        return src
+
+    def test_undo_delete_photo_restores_archive_from_original(self) -> None:
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+        src = self._make_photo_source()
+        store.add_photo(voucher, src)
+        photo_rows = [r for r in store.read_rows("photo") if r.get("入库编号*") == voucher]
+        self.assertEqual(len(photo_rows), 1)
+        archive_path = store._resolve_relative(store.root, photo_rows[0]["相对路径"])
+        self.assertTrue(archive_path.exists())
+        store.delete_photo(voucher, 0)
+        self.assertFalse(archive_path.exists())  # 归档被删
+        store.undo_last()
+        self.assertTrue(archive_path.exists())  # plan A1 路径 1：从原始路径重建
+        self.assertNotEqual(
+            [r for r in store.read_rows("photo") if r.get("入库编号*") == voucher][0].get("归档状态"),
+            "损坏",
+        )
+
+    def test_undo_delete_specimen_restores_photo_archives(self) -> None:
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+        src = self._make_photo_source("specimen.jpg")
+        store.add_photo(voucher, src)
+        photo_row = [r for r in store.read_rows("photo") if r.get("入库编号*") == voucher][0]
+        archive_path = store._resolve_relative(store.root, photo_row["相对路径"])
+        self.assertTrue(archive_path.exists())
+        store.delete_specimen(voucher)
+        self.assertFalse(archive_path.exists())
+        store.undo_last()
+        self.assertTrue(archive_path.exists())  # plan A1 路径 3
+
+    def test_undo_when_both_missing_marks_corrupt_and_continues(self) -> None:
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+        src = self._make_photo_source("missing_later.jpg")
+        store.add_photo(voucher, src)
+        photo_row = [r for r in store.read_rows("photo") if r.get("入库编号*") == voucher][0]
+        archive_path = store._resolve_relative(store.root, photo_row["相对路径"])
+        store.delete_photo(voucher, 0)
+        # 模拟原始也被用户删了
+        src.unlink()
+        self.assertFalse(archive_path.exists())
+        store.undo_last()  # 不应抛
+        rows_after = [r for r in store.read_rows("photo") if r.get("入库编号*") == voucher]
+        self.assertEqual(len(rows_after), 1)
+        self.assertEqual(rows_after[0].get("归档状态"), "损坏")  # plan A1 降级 3
+
+    # ---- A2: 只读模式完整封死 -------------------------------------------------
+
+    def test_readonly_blocks_photo_writes(self) -> None:
+        writer = ExcelStore(self.tmp)
+        voucher = writer.create_specimen()
+        writer.release_lock()
+        reader = ExcelStore(self.tmp, read_only=True)
+        with self.assertRaises(PermissionError):
+            reader.add_photo(voucher, self._make_photo_source())
+        with self.assertRaises(PermissionError):
+            reader.delete_photo(voucher, 0)
+        with self.assertRaises(PermissionError):
+            reader.replace_photo(voucher, 0, self._make_photo_source("replace.jpg"))
+        with self.assertRaises(PermissionError):
+            reader.set_photo_filename(voucher, 0, "x.jpg")
+        with self.assertRaises(PermissionError):
+            reader.set_photo_description(voucher, 0, "desc")
+
+    def test_readonly_workspace_init_no_file_creation(self) -> None:
+        # 第一次正常打开建出全部数据文件
+        writer = ExcelStore(self.tmp)
+        writer.release_lock()
+        data_dir = writer.data_dir
+        # 删一个非关键文件模拟"缺失"
+        change_log = data_dir / CHANGE_LOG_FILE
+        change_log.unlink()
+        snapshot_before = sorted(p.name for p in data_dir.iterdir())
+        # 只读模式打开：ensure_files 必须 short-circuit，不补回 change_log
+        reader = ExcelStore(self.tmp, read_only=True)
+        snapshot_after = sorted(p.name for p in data_dir.iterdir())
+        self.assertEqual(snapshot_before, snapshot_after)
+        self.assertFalse(change_log.exists())
+        del reader
+
+    # ---- A4: 快照完整性 manifest ---------------------------------------------
+
+    def test_snapshot_writes_manifest_and_complete_marker(self) -> None:
+        store = ExcelStore(self.tmp)
+        store.create_specimen()
+        snapshot_dir = store.create_data_snapshot("test")
+        manifest_path = snapshot_dir / "snapshot_manifest.json"
+        marker_path = snapshot_dir / ".snapshot.complete"
+        self.assertTrue(manifest_path.exists())
+        self.assertTrue(marker_path.exists())
+        import json as _json
+        manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertIn("files", manifest)
+        self.assertTrue(any(name.endswith(".xlsx") for name in manifest["files"]))
+        for entry in manifest["files"].values():
+            self.assertIn("sha256", entry)
+            self.assertIn("size", entry)
+
+    def test_restore_rejects_snapshot_missing_complete_marker(self) -> None:
+        store = ExcelStore(self.tmp)
+        store.create_specimen()
+        snapshot_dir = store.create_data_snapshot("test")
+        (snapshot_dir / ".snapshot.complete").unlink()
+        with self.assertRaises(SnapshotIntegrityCheckFailed):
+            store.restore_data_snapshot(snapshot_dir)
+
+    def test_restore_rejects_snapshot_with_sha_mismatch(self) -> None:
+        store = ExcelStore(self.tmp)
+        store.create_specimen()
+        snapshot_dir = store.create_data_snapshot("test")
+        # 篡改一个 xlsx 文件，模拟磁盘损坏 / 外部改动
+        any_xlsx = next(p for p in snapshot_dir.iterdir() if p.suffix == ".xlsx")
+        with any_xlsx.open("ab") as h:
+            h.write(b"tampered")
+        with self.assertRaises(SnapshotIntegrityCheckFailed):
+            store.restore_data_snapshot(snapshot_dir)
+
+    def test_startup_cleans_incomplete_snapshot_dirs(self) -> None:
+        store = ExcelStore(self.tmp)
+        store.create_specimen()
+        # 手动造一个不完整快照目录（无 marker 无 manifest）
+        from specimen_app.models import DATA_VERSION_DIR
+        bad_dir = store.data_dir / DATA_VERSION_DIR / "incomplete_test"
+        bad_dir.mkdir(parents=True)
+        (bad_dir / "garbage.xlsx").write_bytes(b"junk")
+        # 同时造一个完整的，测试不被误删
+        good_dir = store.create_data_snapshot("good")
+        store.release_lock()
+        ExcelStore(self.tmp)  # 触发 ensure_files → cleanup_incomplete_snapshot_directories
+        self.assertFalse(bad_dir.exists())  # 不完整被清
+        self.assertTrue(good_dir.exists())  # 完整保留
+
+    # ---- A5: openpyxl 写后 ZIP 校验 -------------------------------------------
+
+    def test_excel_write_verify_catches_truncated_tmp(self) -> None:
+        store = ExcelStore(self.tmp)
+        truncated = self.tmp / "broken.xlsx"
+        truncated.write_bytes(b"PK\x03\x04 not actually a complete zip")
+        with self.assertRaises(WorkbookWriteVerificationFailed):
+            store._verify_workbook_file_can_be_reopened(truncated)
+        # helper 失败时应已 unlink tmp（防 replace 上去）
+        self.assertFalse(truncated.exists())
+
+    def test_excel_write_verify_normal_path_still_works(self) -> None:
+        store = ExcelStore(self.tmp)
+        good = self.tmp / "good.xlsx"
+        wb = Workbook()
+        wb.active.append(["x", "y"])
+        wb.save(good)
+        wb.close()
+        # 不应抛
+        store._verify_workbook_file_can_be_reopened(good)
+        self.assertTrue(good.exists())
 
 
 if __name__ == "__main__":

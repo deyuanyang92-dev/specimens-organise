@@ -107,8 +107,14 @@ ALLOC_LOG_HEADERS = [
     "编号系列",
     "编号起始",
     "编号结束",
-    "数量",
+    "数量",        # 「任务结束」事件：本任务新建数（与 "新建数量" 一致，老报表兼容）
     "关联任务ID",  # 任务结束时指向对应的任务开始记录ID
+    # 2026-05 S2 接管功能新增列。打开旧工作区时由 _ensure_workbook 自动扩列、旧行末尾补 ""，
+    # 老软件读到不识别的列也会忽略不影响。
+    "新建数量",     # 本任务新建（self-created）的入库编号数
+    "接管数量",     # 本任务接管补完（别人已领取但未入库）的入库编号数
+    "完成入库数",   # 新建+接管 中 status_for(v).is_complete 的数量（反映真实工作量）
+    "接管编号",     # 接管的编号列表，分号分隔，供审计/反查 creator
 ]
 
 SPECIMEN_REQUIRED = ["入库编号*", "管内编号*", "采集地点缩写*"]
@@ -215,6 +221,22 @@ class ImportConflictError(WorkspaceError):
         self.report_path = report_path
 
 
+class SnapshotIntegrityCheckFailed(WorkspaceError):
+    """plan A4：快照在还原前的完整性校验失败。
+
+    触发场景：
+      - 缺 ``.snapshot.complete`` 标记 → 上次快照写入中途中断（疑似 NAS 断网 / 进程被杀）
+      - manifest 中记录的 SHA256 / 文件大小与磁盘当前文件不一致 → 数据已被外部改动或损坏
+    """
+
+
+class WorkbookWriteVerificationFailed(WorkspaceError):
+    """plan A5：openpyxl ``wb.save(tmp)`` 完成后，重新打开校验时发现 ZIP 截断或损坏。
+
+    意味着写入半途出问题（OOM / 磁盘满 / SMB 抖断），调用方应已删除 tmp 并向上抛此异常。
+    """
+
+
 # 规范化软件设计 2026-05 P1 优化:frozen dataclass 加 slots=True 省 __dict__ overhead。
 # Python 3.10+ 原生支持;3.13 项目内可用。5000 凭证 × StatusFlags ~ 省 750KB。
 @dataclass(frozen=True, slots=True)
@@ -229,6 +251,11 @@ class StatusFlags:
             self.has_photo,
             self.classification_complete,
         ))
+
+    @property
+    def is_complete(self) -> bool:
+        """三项全 True 才算入库完成（S2 任务量统计 + UI 入库计数依据）。"""
+        return self.specimen_complete and self.has_photo and self.classification_complete
 
 
 @dataclass(frozen=True, slots=True)  # P1 优化:slots 省 __dict__ overhead

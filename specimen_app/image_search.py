@@ -4,8 +4,11 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import threading
+import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -43,9 +46,8 @@ EXCLUDED_PATH_PARTS = {("数据", "数据版本"), ("数据", "缩略图缓存")
 IDENTIFIER_SEPARATOR_RE = re.compile(r"[-_]+")
 NATURAL_SORT_RE = re.compile(r"(\d+)")
 IMAGE_INDEX_CACHE_LIMIT = 3
-# 新增格式和通用兜底检索后，旧磁盘索引需要失效重建。
-IMAGE_INDEX_DISK_VERSION = 4
 IMAGE_INDEX_CACHE_DIR_NAME = "图片搜索索引缓存"
+IMAGE_INDEX_SQLITE_FILE_NAME = "image_search.sqlite3"
 _IMAGE_INDEX_CACHE: OrderedDict[tuple[tuple[str, ...], int], list["ImageIndexEntry"]] = OrderedDict()
 _IMAGE_INDEX_LOCK = threading.RLock()
 _SEARCH_INDEX_CACHE: OrderedDict[tuple[tuple[str, ...], int], "ImageSearchIndex"] = OrderedDict()
@@ -70,6 +72,19 @@ class ImageIndexEntry:
     file_name: str
     stem: str
     suffix: str
+
+
+@dataclass(frozen=True)
+class ImageIndexUpdate:
+    scanned: int = 0
+    added: int = 0
+    removed: int = 0
+    changed: int = 0
+    cancelled: bool = False
+
+    @property
+    def modified(self) -> bool:
+        return bool(self.added or self.removed or self.changed)
 
 
 class ImageSearchIndex:
@@ -202,6 +217,296 @@ class ImageSearchIndex:
         return index
 
 
+class ImageIndexStore:
+    """Disk-backed index which keeps large search scopes out of application RAM."""
+
+    def __init__(self, workspace: Path | str):
+        self.workspace = Path(workspace).resolve()
+        self.path = self.workspace / "数据" / IMAGE_INDEX_CACHE_DIR_NAME / IMAGE_INDEX_SQLITE_FILE_NAME
+
+    def _connect(self) -> sqlite3.Connection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self.path), timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS scopes (
+                scope_key TEXT PRIMARY KEY,
+                roots_json TEXT NOT NULL,
+                max_depth INTEGER NOT NULL,
+                last_scan REAL NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS entries (
+                scope_key TEXT NOT NULL,
+                path TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                stem TEXT NOT NULL,
+                suffix TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                mtime_ns INTEGER NOT NULL,
+                PRIMARY KEY (scope_key, path)
+            );
+            CREATE TABLE IF NOT EXISTS tokens (
+                scope_key TEXT NOT NULL,
+                token TEXT NOT NULL,
+                path TEXT NOT NULL,
+                PRIMARY KEY (scope_key, token, path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_image_tokens_lookup
+                ON tokens (scope_key, token, path);
+            CREATE INDEX IF NOT EXISTS idx_image_entries_scope_name
+                ON entries (scope_key, file_name);
+            """
+        )
+        return conn
+
+    @contextmanager
+    def _connection(self):
+        conn = self._connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    @staticmethod
+    def scope_key(roots: list[Path | str], max_depth: int) -> str:
+        key = _image_index_key(roots, max_depth)
+        payload = json.dumps({"roots": key[0], "max_depth": key[1]}, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha1(payload.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+    def has_scope(self, roots: list[Path | str], max_depth: int) -> bool:
+        if not self.path.exists():
+            return False
+        scope_key = self.scope_key(roots, max_depth)
+        try:
+            with self._connection() as conn:
+                return conn.execute(
+                    "SELECT 1 FROM scopes WHERE scope_key = ?", (scope_key,)
+                ).fetchone() is not None
+        except sqlite3.Error:
+            return False
+
+    def reconcile_scope(
+        self,
+        roots: list[Path | str],
+        max_depth: int = 0,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> ImageIndexUpdate:
+        paths = iter_images(roots, max_depth=max_depth, suffixes=SUPPORTED_IMAGE_SUFFIXES, should_stop=should_stop)
+        if should_stop and should_stop():
+            return ImageIndexUpdate(cancelled=True)
+        current: dict[str, tuple[ImageIndexEntry, int, int]] = {}
+        for path in paths:
+            if should_stop and should_stop():
+                return ImageIndexUpdate(cancelled=True)
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            current[_dedupe_key(path)] = (_entry_from_path(path), int(stat.st_size), int(stat.st_mtime_ns))
+        scope_key = self.scope_key(roots, max_depth)
+        try:
+            with self._connection() as conn:
+                old_rows = conn.execute(
+                    "SELECT path, size, mtime_ns FROM entries WHERE scope_key = ?", (scope_key,)
+                ).fetchall()
+                existing = {str(path): (int(size), int(mtime_ns)) for path, size, mtime_ns in old_rows}
+                current_by_path = {
+                    str(entry.path): (entry, size, mtime_ns)
+                    for entry, size, mtime_ns in current.values()
+                }
+                removed = set(existing).difference(current_by_path)
+                added = set(current_by_path).difference(existing)
+                changed = {
+                    path
+                    for path in set(existing).intersection(current_by_path)
+                    if existing[path] != current_by_path[path][1:]
+                }
+                for path in removed | changed:
+                    conn.execute("DELETE FROM tokens WHERE scope_key = ? AND path = ?", (scope_key, path))
+                    conn.execute("DELETE FROM entries WHERE scope_key = ? AND path = ?", (scope_key, path))
+                for path in added | changed:
+                    entry, size, mtime_ns = current_by_path[path]
+                    self._insert_entry(conn, scope_key, entry, size, mtime_ns)
+                roots_json = json.dumps(
+                    [str(Path(root).resolve()) for root in roots], ensure_ascii=False, separators=(",", ":")
+                )
+                conn.execute(
+                    """
+                    INSERT INTO scopes(scope_key, roots_json, max_depth, last_scan)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(scope_key) DO UPDATE SET
+                        roots_json=excluded.roots_json,
+                        max_depth=excluded.max_depth,
+                        last_scan=excluded.last_scan
+                    """,
+                    (scope_key, roots_json, max_depth, time.time()),
+                )
+            return ImageIndexUpdate(
+                scanned=len(current_by_path),
+                added=len(added),
+                removed=len(removed),
+                changed=len(changed),
+            )
+        except sqlite3.Error:
+            return ImageIndexUpdate(cancelled=True)
+
+    def upsert_paths(
+        self,
+        roots: list[Path | str],
+        paths: Iterable[Path | str],
+        max_depth: int = 0,
+    ) -> int:
+        if not self.has_scope(roots, max_depth):
+            return 0
+        scope_key = self.scope_key(roots, max_depth)
+        count = 0
+        try:
+            with self._connection() as conn:
+                for raw_path in paths:
+                    path = Path(raw_path).resolve()
+                    if not path.is_file() or not _path_in_index_scope(path, [Path(root).resolve() for root in roots], max_depth):
+                        continue
+                    if path.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
+                        continue
+                    stat = path.stat()
+                    prior = conn.execute(
+                        "SELECT size, mtime_ns FROM entries WHERE scope_key = ? AND path = ?",
+                        (scope_key, str(path)),
+                    ).fetchone()
+                    if prior == (int(stat.st_size), int(stat.st_mtime_ns)):
+                        continue
+                    conn.execute("DELETE FROM tokens WHERE scope_key = ? AND path = ?", (scope_key, str(path)))
+                    conn.execute("DELETE FROM entries WHERE scope_key = ? AND path = ?", (scope_key, str(path)))
+                    self._insert_entry(conn, scope_key, _entry_from_path(path), int(stat.st_size), int(stat.st_mtime_ns))
+                    if prior is None:
+                        count += 1
+            return count
+        except (OSError, sqlite3.Error):
+            return 0
+
+    def entries(self, roots: list[Path | str], max_depth: int = 0) -> list[ImageIndexEntry]:
+        if not self.path.exists():
+            return []
+        scope_key = self.scope_key(roots, max_depth)
+        try:
+            with self._connection() as conn:
+                rows = conn.execute(
+                    "SELECT path, file_name, stem, suffix FROM entries WHERE scope_key = ?", (scope_key,)
+                ).fetchall()
+        except sqlite3.Error:
+            return []
+        return [
+            ImageIndexEntry(path=Path(path), file_name=str(name), stem=str(stem), suffix=str(suffix))
+            for path, name, stem, suffix in rows
+        ]
+
+    def search_entries(
+        self,
+        roots: list[Path | str],
+        query: str,
+        limit: int,
+        max_depth: int = 0,
+    ) -> tuple[list[ImageIndexEntry], str, int]:
+        query_tokens = ImageSearchIndex._tokenize(query)
+        if not query_tokens or not self.path.exists():
+            return [], query, 100
+        scope_key = self.scope_key(roots, max_depth)
+        candidate_limit = max(2000, limit * 20)
+        try:
+            with self._connection() as conn:
+                current_tokens = list(query_tokens)
+                while current_tokens:
+                    rows = self._query_tokens(conn, scope_key, current_tokens, candidate_limit)
+                    entries = [self._row_entry(row) for row in rows]
+                    entries = [entry for entry in entries if self._verify_entry(entry, current_tokens)]
+                    if entries:
+                        entries.sort(key=lambda entry: natural_sort_key(entry.file_name))
+                        matched_query = query if current_tokens == query_tokens else "-".join(current_tokens)
+                        return entries[: limit * 3], matched_query, 100
+                    if len(current_tokens) <= 1:
+                        break
+                    current_tokens.pop()
+                needle = query.lower().strip()
+                like = f"%{needle}%"
+                rows = conn.execute(
+                    """
+                    SELECT path, file_name, stem, suffix FROM entries
+                    WHERE scope_key = ? AND (lower(file_name) LIKE ? OR lower(stem) LIKE ?)
+                    ORDER BY lower(file_name), file_name LIMIT ?
+                    """,
+                    (scope_key, like, like, candidate_limit),
+                ).fetchall()
+        except sqlite3.Error:
+            return [], query, 100
+        entries = [self._row_entry(row) for row in rows]
+        entries.sort(key=lambda entry: natural_sort_key(entry.file_name))
+        return entries[: limit * 3], query, 60
+
+    def clear_scope(self, roots: list[Path | str], max_depth: int = 0) -> None:
+        if not self.path.exists():
+            return
+        scope_key = self.scope_key(roots, max_depth)
+        try:
+            with self._connection() as conn:
+                conn.execute("DELETE FROM tokens WHERE scope_key = ?", (scope_key,))
+                conn.execute("DELETE FROM entries WHERE scope_key = ?", (scope_key,))
+                conn.execute("DELETE FROM scopes WHERE scope_key = ?", (scope_key,))
+        except sqlite3.Error:
+            return
+
+    @staticmethod
+    def _insert_entry(
+        conn: sqlite3.Connection, scope_key: str, entry: ImageIndexEntry, size: int, mtime_ns: int
+    ) -> None:
+        path = str(entry.path)
+        conn.execute(
+            "INSERT INTO entries(scope_key, path, file_name, stem, suffix, size, mtime_ns) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (scope_key, path, entry.file_name, entry.stem, entry.suffix, size, mtime_ns),
+        )
+        prefixes = {
+            prefix
+            for token in ImageSearchIndex._tokenize(entry.stem)
+            for prefix in ImageSearchIndex._prefixes(token)
+        }
+        conn.executemany(
+            "INSERT OR IGNORE INTO tokens(scope_key, token, path) VALUES (?, ?, ?)",
+            [(scope_key, prefix, path) for prefix in prefixes],
+        )
+
+    @staticmethod
+    def _row_entry(row: tuple[str, str, str, str]) -> ImageIndexEntry:
+        return ImageIndexEntry(path=Path(row[0]), file_name=row[1], stem=row[2], suffix=row[3])
+
+    @staticmethod
+    def _verify_entry(entry: ImageIndexEntry, query_tokens: list[str]) -> bool:
+        stem_tokens = ImageSearchIndex._tokenize(entry.stem)
+        for start in range(len(stem_tokens) - len(query_tokens) + 1):
+            if all(
+                stem_tokens[start + offset].startswith(token)
+                and not stem_tokens[start + offset][len(token):].isdigit()
+                for offset, token in enumerate(query_tokens)
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _query_tokens(
+        conn: sqlite3.Connection, scope_key: str, tokens: list[str], limit: int
+    ) -> list[tuple[str, str, str, str]]:
+        joins = " ".join(
+            f"JOIN tokens t{i} ON t{i}.scope_key = e.scope_key AND t{i}.path = e.path AND t{i}.token = ?"
+            for i in range(len(tokens))
+        )
+        sql = (
+            f"SELECT e.path, e.file_name, e.stem, e.suffix FROM entries e {joins} "
+            "WHERE e.scope_key = ? ORDER BY lower(e.file_name), e.file_name LIMIT ?"
+        )
+        return conn.execute(sql, (*tokens, scope_key, limit)).fetchall()
+
+
 def iter_workspace_images(root: Path | str) -> list[Path]:
     workspace = Path(root).resolve()
     results: list[Path] = []
@@ -308,12 +613,16 @@ def indexed_image_entries(
             _IMAGE_INDEX_CACHE.move_to_end(key)
             return _filter_index_entries(_IMAGE_INDEX_CACHE[key], allowed_suffixes, should_stop)
 
-    if cache_root is not None and not force_rebuild:
-        disk_entries = _load_image_index_from_disk(cache_root, key)
-        if disk_entries is not None:
-            with _IMAGE_INDEX_LOCK:
-                _remember_image_index(key, disk_entries)
-            return _filter_index_entries(disk_entries, allowed_suffixes, should_stop)
+    if cache_root is not None:
+        store = ImageIndexStore(cache_root)
+        if force_rebuild or not store.has_scope(roots, max_depth):
+            update = store.reconcile_scope(roots, max_depth, should_stop)
+            if update.cancelled:
+                return []
+        entries = store.entries(roots, max_depth)
+        with _IMAGE_INDEX_LOCK:
+            _remember_image_index(key, entries)
+        return _filter_index_entries(entries, allowed_suffixes, should_stop)
 
     entries = _entries_from_paths(iter_images(
         roots,
@@ -325,8 +634,6 @@ def indexed_image_entries(
         return []
     with _IMAGE_INDEX_LOCK:
         _remember_image_index(key, entries)
-    if cache_root is not None:
-        _save_image_index_to_disk(cache_root, key, entries)
     return _filter_index_entries(entries, allowed_suffixes, should_stop)
 
 
@@ -337,12 +644,34 @@ def image_index_exists(
 ) -> bool:
     workspace = Path(root).resolve()
     roots = image_search_roots(workspace, extra_roots)
-    effective_depth = effective_image_search_depth(roots, max_depth)
+    effective_depth = image_search_depth(workspace, extra_roots, roots, max_depth)
     key = _image_index_key(roots, effective_depth)
     with _IMAGE_INDEX_LOCK:
         if key in _IMAGE_INDEX_CACHE:
             return True
-    return _image_index_disk_version_matches(_image_index_disk_path(workspace, key))
+    return ImageIndexStore(workspace).has_scope(roots, effective_depth)
+
+
+def reconcile_image_index(
+    root: Path | str,
+    extra_roots: list[Path | str] | None = None,
+    max_depth: int = 0,
+    should_stop: Callable[[], bool] | None = None,
+) -> ImageIndexUpdate:
+    """Check one search scope for external additions, deletes and renames."""
+    workspace = Path(root).resolve()
+    roots = image_search_roots(workspace, extra_roots)
+    effective_depth = image_search_depth(workspace, extra_roots, roots, max_depth)
+    if not roots:
+        return ImageIndexUpdate()
+    update = ImageIndexStore(workspace).reconcile_scope(roots, effective_depth, should_stop)
+    if update.modified:
+        key = _image_index_key(roots, effective_depth)
+        with _IMAGE_INDEX_LOCK:
+            _IMAGE_INDEX_CACHE.pop(key, None)
+        with _SEARCH_INDEX_LOCK:
+            _SEARCH_INDEX_CACHE.pop(key, None)
+    return update
 
 
 def append_images_to_index(
@@ -353,40 +682,16 @@ def append_images_to_index(
 ) -> int:
     workspace = Path(root).resolve()
     roots = image_search_roots(workspace, extra_roots)
-    effective_depth = effective_image_search_depth(roots, max_depth)
+    effective_depth = image_search_depth(workspace, extra_roots, roots, max_depth)
     key = _image_index_key(roots, effective_depth)
-
-    with _IMAGE_INDEX_LOCK:
-        existing_entries = _IMAGE_INDEX_CACHE.get(key)
-    if existing_entries is None:
-        existing_entries = _load_image_index_from_disk(workspace, key)
-    if existing_entries is None:
+    count = ImageIndexStore(workspace).upsert_paths(roots, image_paths, effective_depth)
+    if not count:
         return 0
-
-    existing_by_key = {_dedupe_key(entry.path) for entry in existing_entries}
-    additions: list[ImageIndexEntry] = []
-    for raw_path in image_paths:
-        path = Path(raw_path).resolve()
-        if not _path_in_index_scope(path, roots, effective_depth):
-            continue
-        if path.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
-            continue
-        dedupe_key = _dedupe_key(path)
-        if dedupe_key in existing_by_key:
-            continue
-        existing_by_key.add(dedupe_key)
-        additions.append(_entry_from_path(path))
-
-    if not additions:
-        return 0
-
-    updated = sorted([*existing_entries, *additions], key=lambda entry: natural_sort_key(entry.file_name))
     with _IMAGE_INDEX_LOCK:
-        _remember_image_index(key, updated)
-    _save_image_index_to_disk(workspace, key, updated)
+        _IMAGE_INDEX_CACHE.pop(key, None)
     with _SEARCH_INDEX_LOCK:
         _SEARCH_INDEX_CACHE.pop(key, None)
-    return len(additions)
+    return count
 
 
 def _image_index_key(roots: list[Path | str], max_depth: int) -> tuple[tuple[str, ...], int]:
@@ -449,86 +754,32 @@ def _dedupe_key(path: Path) -> str:
 
 
 def _image_index_disk_path(cache_root: Path | str, key: tuple[tuple[str, ...], int]) -> Path:
+    """Location of pre-SQLite JSON caches, retained only for explicit cleanup."""
     payload = json.dumps({"roots": key[0], "max_depth": key[1]}, ensure_ascii=False, sort_keys=True)
     digest = hashlib.sha1(payload.encode("utf-8", errors="surrogatepass")).hexdigest()
     return Path(cache_root).resolve() / "数据" / IMAGE_INDEX_CACHE_DIR_NAME / f"{digest}.json"
 
 
-def _image_index_disk_version_matches(path: Path) -> bool:
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            prefix = handle.read(128)
-    except OSError:
-        return False
-    return f'"version":{IMAGE_INDEX_DISK_VERSION}' in prefix.replace(" ", "")
-
-
-def _load_image_index_from_disk(cache_root: Path | str, key: tuple[tuple[str, ...], int]) -> list[ImageIndexEntry] | None:
-    path = _image_index_disk_path(cache_root, key)
-    if not path.exists():
-        return None
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        return None
-    try:
-        if payload.get("version") != IMAGE_INDEX_DISK_VERSION:
-            return None
-        if tuple(payload.get("roots", ())) != key[0] or int(payload.get("max_depth", -1)) != key[1]:
-            return None
-        entries = []
-        for item in payload.get("entries", []):
-            raw_entry_path = str(item.get("path", ""))
-            if not raw_entry_path:
-                continue
-            entry_path = Path(raw_entry_path)
-            entries.append(
-                ImageIndexEntry(
-                    path=entry_path,
-                    file_name=str(item.get("file_name") or entry_path.name),
-                    stem=str(item.get("stem") or entry_path.stem),
-                    suffix=str(item.get("suffix") or entry_path.suffix.lower()).lower(),
-                )
-            )
-        return entries
-    except (TypeError, ValueError):
-        return None
-
-
-def _save_image_index_to_disk(cache_root: Path | str, key: tuple[tuple[str, ...], int], entries: list[ImageIndexEntry]) -> None:
-    path = _image_index_disk_path(cache_root, key)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # P1 审查修复:tmp 后缀加 uuid4 防同 PID 短期内多写竞争。
-        import uuid as _uuid
-        tmp = path.with_suffix(f".{os.getpid()}.{_uuid.uuid4().hex[:8]}.tmp")
-        payload = {
-            "version": IMAGE_INDEX_DISK_VERSION,
-            "roots": list(key[0]),
-            "max_depth": key[1],
-            "entries": [
-                {
-                    "path": str(entry.path),
-                    "file_name": entry.file_name,
-                    "stem": entry.stem,
-                    "suffix": entry.suffix,
-                }
-                for entry in entries
-            ],
-        }
-        with tmp.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
-        tmp.replace(path)
-    except OSError:
-        return
-
-
-def clear_image_index() -> None:
+def clear_image_index(
+    root: Path | str | None = None,
+    extra_roots: list[Path | str] | None = None,
+    max_depth: int = 0,
+) -> None:
     with _IMAGE_INDEX_LOCK:
         _IMAGE_INDEX_CACHE.clear()
     with _SEARCH_INDEX_LOCK:
         _SEARCH_INDEX_CACHE.clear()
+    if root is None:
+        return
+    workspace = Path(root).resolve()
+    roots = image_search_roots(workspace, extra_roots)
+    effective_depth = image_search_depth(workspace, extra_roots, roots, max_depth)
+    ImageIndexStore(workspace).clear_scope(roots, effective_depth)
+    old_path = _image_index_disk_path(workspace, _image_index_key(roots, effective_depth))
+    try:
+        old_path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def is_supported_image(path: Path | str) -> bool:
@@ -586,6 +837,7 @@ def image_search_results(
     search_index: ImageSearchIndex | None = None,
     force_rebuild: bool = False,
     path_to_vouchers: dict[str, list[str]] | None = None,
+    canonical_photo_paths: dict[str, str] | None = None,
 ) -> list[ImageSearchResult]:
     workspace = Path(root).resolve()
     query = query.strip()
@@ -593,7 +845,7 @@ def image_search_results(
         return []
 
     all_roots = image_search_roots(workspace, extra_roots)
-    effective_depth = effective_image_search_depth(all_roots, max_depth)
+    effective_depth = image_search_depth(workspace, extra_roots, all_roots, max_depth)
     allowed_suffixes = suffixes if suffixes is not None else TIF_IMAGE_SUFFIXES
 
     key = _image_index_key(all_roots, effective_depth)
@@ -601,57 +853,75 @@ def image_search_results(
     # 原代码直接复用界面启动时的索引；切换到整个工作区或自定义目录时会拿错范围，导致 A- 等新目录图片搜不到。
     if index is not None and index.source_key is not None and index.source_key != key:
         index = None
-    if index is None or force_rebuild:
-        index = _get_or_build_search_index(
-            all_roots,
-            max_depth=effective_depth,
-            should_stop=should_stop,
-            force_rebuild=force_rebuild,
-            cache_root=workspace,
-        )
     if index is None:
-        return []
-
-    matched_indices = index.search(query, limit=limit * 3)
-    matched_query = query
-    matched_score = 100
-    if not matched_indices:
-        # Progressive fallback: drop trailing tokens to find broader matches
-        tokens = ImageSearchIndex._tokenize(query)
-        while len(tokens) > 1 and not matched_indices:
-            tokens.pop()
-            matched_query = "-".join(tokens)
-            matched_indices = index.search(matched_query, limit=limit * 3)
-    if not matched_indices:
-        # 原代码只支持按分隔符 token 前缀检索；这里保留原逻辑，找不到时再按完整文件名做通用包含匹配。
+        store = ImageIndexStore(workspace)
+        if force_rebuild or not store.has_scope(all_roots, effective_depth):
+            update = store.reconcile_scope(all_roots, effective_depth, should_stop)
+            if update.cancelled:
+                return []
+        matched_entries, matched_query, matched_score = store.search_entries(
+            all_roots, query, limit, effective_depth
+        )
+    else:
+        matched_indices = index.search(query, limit=limit * 3)
         matched_query = query
-        matched_score = 60
-        matched_indices = index.contains_search(query, limit=limit * 3)
-    if not matched_indices:
+        matched_score = 100
+        if not matched_indices:
+            # Progressive fallback: drop trailing tokens to find broader matches
+            tokens = ImageSearchIndex._tokenize(query)
+            while len(tokens) > 1 and not matched_indices:
+                tokens.pop()
+                matched_query = "-".join(tokens)
+                matched_indices = index.search(matched_query, limit=limit * 3)
+        if not matched_indices:
+            # 保留原匹配语义：前缀无结果后再进行文件名包含匹配。
+            matched_query = query
+            matched_score = 60
+            matched_indices = index.contains_search(query, limit=limit * 3)
+        matched_entries = [index.entries[idx] for idx in matched_indices]
+    if not matched_entries:
         return []
 
-    linked = {path.resolve() for path in linked_paths}
+    linked = {str(path.resolve()) for path in linked_paths}
+    canonical_by_path = {
+        str(Path(path).resolve()): str(Path(canonical).resolve())
+        for path, canonical in (canonical_photo_paths or {}).items()
+    }
+    matched_path_keys = {
+        str(entry.path.resolve())
+        for entry in matched_entries
+        if entry.suffix in allowed_suffixes and entry.path.exists()
+    }
+    seen_canonical: set[str] = set()
     results: list[ImageSearchResult] = []
-    for idx in matched_indices:
+    for entry in matched_entries:
         if should_stop and should_stop():
             break
-        entry = index.entries[idx]
         if entry.suffix not in allowed_suffixes:
             continue
         path = entry.path
         if not path.exists():
             continue
-        relative = relative_display(path, workspace)
-        is_linked = path.resolve() in linked
+        path_key = str(path.resolve())
+        canonical_key = canonical_by_path.get(path_key, path_key)
+        if path_key != canonical_key and canonical_key in matched_path_keys:
+            continue
+        if canonical_key in seen_canonical:
+            continue
+        seen_canonical.add(canonical_key)
+        display_path = Path(canonical_key) if path_key != canonical_key and Path(canonical_key).exists() else path
+        relative = relative_display(display_path, workspace)
+        is_linked = canonical_key in linked or path_key in linked
         # 原代码：linked_vouchers 仅在 is_linked 为 True 时才查询，导致关联到
         # 其他标本的照片不显示入库编号。修复：无条件查询 path_to_vouchers，
         # 让用户看到所有关联到的入库编号（不仅是当前标本的）。
-        linked_vouchers = (path_to_vouchers or {}).get(str(path.resolve()), []) or None
+        vouchers = path_to_vouchers or {}
+        linked_vouchers = (vouchers.get(canonical_key) or vouchers.get(path_key) or []) or None
         results.append(
             ImageSearchResult(
-                path=path,
+                path=display_path,
                 relative_path=relative,
-                file_name=entry.file_name,
+                file_name=display_path.name,
                 score=matched_score,
                 matched_keywords=(matched_query,),
                 is_linked=is_linked,
@@ -670,7 +940,12 @@ def _get_or_build_search_index(
     force_rebuild: bool = False,
     cache_root: Path | str | None = None,
 ) -> ImageSearchIndex | None:
-    """Return a cached ImageSearchIndex, building it if necessary."""
+    """Compatibility API for callers requiring an in-memory index.
+
+    Interactive UI searches query ImageIndexStore directly so large scopes are
+    not materialised in RAM. Tests and callers passing an explicit index keep
+    the historic object API.
+    """
     key = _image_index_key(roots, max_depth)
     with _SEARCH_INDEX_LOCK:
         if force_rebuild:
@@ -679,21 +954,20 @@ def _get_or_build_search_index(
             _SEARCH_INDEX_CACHE.move_to_end(key)
             return _SEARCH_INDEX_CACHE[key]
 
-    if cache_root is not None and not force_rebuild:
-        disk_index = _load_search_index_from_disk(cache_root, key)
-        if disk_index is not None:
-            with _SEARCH_INDEX_LOCK:
-                _remember_search_index(key, disk_index)
-            return disk_index
-
-    entries = indexed_image_entries(
-        roots,
-        max_depth=max_depth,
-        suffixes=SUPPORTED_IMAGE_SUFFIXES,
-        should_stop=should_stop,
-        force_rebuild=force_rebuild,
-        cache_root=cache_root,
-    )
+    if cache_root is not None:
+        store = ImageIndexStore(cache_root)
+        if force_rebuild or not store.has_scope(roots, max_depth):
+            update = store.reconcile_scope(roots, max_depth, should_stop)
+            if update.cancelled:
+                return None
+        entries = store.entries(roots, max_depth)
+    else:
+        entries = _entries_from_paths(iter_images(
+            roots,
+            max_depth=max_depth,
+            suffixes=SUPPORTED_IMAGE_SUFFIXES,
+            should_stop=should_stop,
+        ))
     if should_stop and should_stop():
         return None
 
@@ -701,8 +975,6 @@ def _get_or_build_search_index(
     index.build(entries, source_key=key)
     with _SEARCH_INDEX_LOCK:
         _remember_search_index(key, index)
-    if cache_root is not None:
-        _save_search_index_to_disk(cache_root, key, index)
     return index
 
 
@@ -715,79 +987,21 @@ def _remember_search_index(
         _SEARCH_INDEX_CACHE.popitem(last=False)
 
 
-def _save_search_index_to_disk(
-    cache_root: Path | str,
-    key: tuple[tuple[str, ...], int],
-    index: ImageSearchIndex,
-) -> None:
-    path = _image_index_disk_path(cache_root, key)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # P1 审查修复:tmp 后缀加 uuid4 防同 PID 短期内多写竞争。
-        import uuid as _uuid
-        tmp = path.with_suffix(f".{os.getpid()}.{_uuid.uuid4().hex[:8]}.tmp")
-        payload = {
-            "version": IMAGE_INDEX_DISK_VERSION,
-            "roots": list(key[0]),
-            "max_depth": key[1],
-            "entries": [
-                {
-                    "path": str(entry.path),
-                    "file_name": entry.file_name,
-                    "stem": entry.stem,
-                    "suffix": entry.suffix,
-                }
-                for entry in index.entries
-            ],
-            "token_index": index.to_dict(),
-        }
-        with tmp.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
-        tmp.replace(path)
-    except OSError:
-        return
-
-
-def _load_search_index_from_disk(
-    cache_root: Path | str,
-    key: tuple[tuple[str, ...], int],
-) -> ImageSearchIndex | None:
-    path = _image_index_disk_path(cache_root, key)
-    if not path.exists():
-        return None
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        return None
-    token_data = payload.get("token_index")
-    if not token_data or payload.get("version") != IMAGE_INDEX_DISK_VERSION:
-        return None
-    if tuple(payload.get("roots", ())) != key[0] or int(payload.get("max_depth", -1)) != key[1]:
-        return None
-    entries = []
-    for item in payload.get("entries", []):
-        raw_entry_path = str(item.get("path", ""))
-        if not raw_entry_path:
-            continue
-        entry_path = Path(raw_entry_path)
-        entries.append(
-            ImageIndexEntry(
-                path=entry_path,
-                file_name=str(item.get("file_name") or entry_path.name),
-                stem=str(item.get("stem") or entry_path.stem),
-                suffix=str(item.get("suffix") or entry_path.suffix.lower()).lower(),
-            )
-        )
-    return ImageSearchIndex.from_dict(entries, token_data, source_key=key)
-
-
 def effective_image_search_depth(roots: list[Path | str], max_depth: int = 0) -> int:
     if any(Path(r).resolve() == Path("/") for r in roots) and max_depth == 0:
         return 4
     if any(Path(r).resolve() == Path("/") for r in roots):
         return min(max_depth, 4)
     return max_depth
+
+
+def image_search_depth(
+    workspace: Path, extra_roots: list[Path | str] | None, roots: list[Path | str], max_depth: int = 0
+) -> int:
+    depth = effective_image_search_depth(roots, max_depth)
+    if extra_roots is None and not (workspace / "照片").is_dir() and depth == 0:
+        return 4
+    return depth
 
 
 def image_search_roots(workspace: Path, extra_roots: list[Path | str] | None = None) -> list[Path]:

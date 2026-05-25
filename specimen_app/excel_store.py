@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator
+from zipfile import BadZipFile, ZipFile  # plan A5: 写后校验 xlsx ZIP 完整性
 
 # 规范化软件设计 2026-05 P1 优化:openpyxl 改 lazy import。
 # 旧:模块顶层 import,加载 lxml + XML 字符串表 ~10-15MB,模块加载即占。
@@ -80,12 +81,18 @@ from .models import (
     SPECIMEN_REQUIRED,
     SUMMARY_COLUMNS,
     SUMMARY_COLUMN_SOURCE,
+    SnapshotIntegrityCheckFailed,
     WORKSPACE_CONFIG_FILE,
+    WorkbookWriteVerificationFailed,
     WorkspaceLockedError,
     WorkspaceNotInitializedError,
     Row,
     StatusFlags,
 )
+
+# plan A4 常量：snapshot 完整性
+SNAPSHOT_MANIFEST_FILENAME = "snapshot_manifest.json"
+SNAPSHOT_COMPLETE_MARKER_FILENAME = ".snapshot.complete"
 from .app_settings import PHOTO_MANAGEMENT_OPTIONS
 from .accession_series import AccessionSeries, format_series_number, series_prefix_of
 from .parsing import derive_specimen_fields_from_tube_number, format_voucher, parse_voucher_serial
@@ -131,13 +138,25 @@ class ExcelStore:
         # settings 不可用 fallback 到 8 (老默认)。
         self._row_cache: OrderedDict[str, list[Row]] = OrderedDict()
         self._file_mtimes: dict[str, float] = {}
+        # S3.1: voucher -> sparse row index 缓存。读 specimen/classification 表时同步建立；
+        # _invalidate_cache 删除对应类目。_find_one 由 O(n) 线性扫降到 O(1) 字典查。
+        self._voucher_index: dict[str, dict[str, int]] = {}
+        # S3.1: photo 表一对多专用：voucher -> [行下标列表]。
+        self._photo_voucher_index: dict[str, list[int]] = {}
+        # S3.2: INDEX 表 voucher set 缓存（lazy + mtime 校验）；next_voucher 撞号检测 O(1)。
+        self._index_voucher_set: set[str] | None = None
+        self._index_voucher_set_mtime: float = -1.0
+        # S3.3 加强：修改汇总表 voucher set 缓存，让 _ensure_summary_row 不再全量重写整张表。
+        self._summary_voucher_set: set[str] | None = None
+        self._summary_voucher_set_mtime: float = -1.0
         try:
             from .app_settings import load_settings
             from .env_detect import memory_profile_params
             profile = load_settings().memory_profile
             self._row_cache_maxsize = memory_profile_params(profile)["row_cache_maxsize"]
         except Exception:
-            self._row_cache_maxsize = 8
+            # S3.7: fallback 默认从 8 提到 32，让 specimen/classification/photo/index 都常驻
+            self._row_cache_maxsize = 32
         if not self.data_dir.exists():
             if not create_if_missing:
                 raise WorkspaceNotInitializedError(f"该工作目录尚未初始化，缺少数据目录：{self.data_dir}")
@@ -195,6 +214,10 @@ class ExcelStore:
             "downgrade_schema_version", "batch_reserve_vouchers",
             "log_alloc_event", "set_active_series",
             "ensure_assignee_series", "upgrade_to_multi_user_protocol",
+            # plan A2: 原列表漏了照片相关写方法，只读模式下 UI 灰化前仍可被 Python 调用绕过
+            "add_photo", "add_photos", "delete_photo", "replace_photo",
+            "set_photo_filename", "set_photo_description",
+            "clear_photos", "move_photos",
         ]
         for name in write_methods:
             if hasattr(self, name):
@@ -292,12 +315,21 @@ class ExcelStore:
         # 不 join — 让 daemon 线程在主进程退出时自动死
 
     def ensure_files(self) -> None:
+        # plan A2: 只读模式整段 short-circuit。各 _ensure_* 已加守卫，但走过去仍浪费 IO。
+        # 旧：read_only 也会删 stale tmp + 调 _ensure_workbook → 工作区里建文件，破坏只读契约。
+        if self._read_only:
+            return
         # 工作区锁保证单进程访问，启动时遗留的 .tmp 文件都是上次崩溃留下的，安全删除。
         for _stale in self.data_dir.glob("*.tmp"):
             try:
                 _stale.unlink()
             except OSError:
                 pass
+        # plan A4：清掉缺 .snapshot.complete 标记的不完整快照目录（上次崩溃留下的垃圾）
+        try:
+            self.cleanup_incomplete_snapshot_directories()
+        except OSError:
+            pass
         self._ensure_workbook(self.data_dir / SPECIMEN_FILE, SPECIMEN_HEADERS)
         self._ensure_workbook(self.data_dir / PHOTO_FILE, PHOTO_HEADERS)
         self._ensure_workbook(self.data_dir / CLASSIFICATION_FILE, CLASSIFICATION_HEADERS)
@@ -549,7 +581,13 @@ class ExcelStore:
 
     def get_photos(self, voucher: str) -> list[Row]:
         """返回该入库编号关联的全部照片信息行（一对多，可能为空 list）。"""
-        return [row for row in self.read_rows("photo") if self._value(row, "入库编号*") == voucher]
+        # 旧：read_rows("photo") + 全表过滤 O(n)。新：走 _photo_voucher_index O(1) + 直接取索引行。
+        rows = self.read_rows("photo")
+        indices = self._photo_voucher_index.get(voucher)
+        if indices is not None:
+            return [rows[i] for i in indices if i < len(rows) and self._value(rows[i], "入库编号*") == voucher]
+        # fallback：索引未建（缓存被驱逐 + 重读流程间隙），降级线性
+        return [row for row in rows if self._value(row, "入库编号*") == voucher]
 
     def get_all_photo_voucher_map(self) -> dict[str, list[str]]:
         """Return mapping from resolved photo path to list of voucher numbers.
@@ -565,6 +603,28 @@ class ExcelStore:
             resolved = str(self.resolve_photo_path(row))
             result.setdefault(resolved, []).append(voucher)
         return result
+
+    def get_photo_search_alias_map(self) -> dict[str, str]:
+        """Map archived/original search paths to the canonical stored photo path.
+
+        Copy-mode photo rows retain the source path in ``原始路径``. When both
+        source and archived copy are within the search scope, this mapping lets
+        the UI show one linked photo without hashing every search result.
+        """
+        aliases: dict[str, str] = {}
+        for row in self.read_rows("photo"):
+            try:
+                canonical = str(self.resolve_photo_path(row).resolve())
+            except OSError:
+                continue
+            aliases[canonical] = canonical
+            original = self._value(row, "原始路径")
+            if original:
+                try:
+                    aliases[str(Path(original).resolve())] = canonical
+                except OSError:
+                    pass
+        return aliases
 
     def create_specimen(self) -> str:
         voucher = self.next_voucher()
@@ -715,6 +775,16 @@ class ExcelStore:
         photo_management_mode: str = "copy_with_absolute",
         photo_library_path: Path | str | None = None,
     ) -> Row:
+        self._reject_photos_linked_to_other_vouchers(voucher, [photo_path])
+        # 旧：直接 _photo_row + _append_row 不查重 → 同张照片用不同 photo_management_mode 关联两次产生重复行
+        # （一条"仅记录"+一条"已归档"，磁盘也出现 2 份文件，ImageSearchDialog 显示一已关联一未关联）。
+        # 新：按 (voucher, 文件SHA256, 原始文件名) 三元组查重；命中升级（仅记录→已归档）或跳过。
+        dup = self._find_photo_duplicate_for_source(voucher, photo_path)
+        if dup is not None:
+            return self._maybe_upgrade_photo_archival(
+                voucher, dup, photo_path,
+                photo_management_mode, photo_library_path,
+            )
         row = self._photo_row(
             voucher,
             photo_path,
@@ -735,51 +805,220 @@ class ExcelStore:
         photo_management_mode: str = "copy_with_absolute",
         photo_library_path: Path | str | None = None,
     ) -> list[Row]:
-        rows_to_add = [
-            self._photo_row(
-                voucher,
-                path,
-                allow_outside=allow_outside,
-                photo_management_mode=photo_management_mode,
-                photo_library_path=photo_library_path,
+        self._reject_photos_linked_to_other_vouchers(voucher, photo_paths)
+        # 旧：每个 path 直 _photo_row + 一次 extend+write，不查重。新：先逐个查重，命中则升级或跳过。
+        rows_to_add: list[Row] = []
+        upgraded_rows: list[Row] = []
+        for path in photo_paths:
+            dup = self._find_photo_duplicate_for_source(voucher, path)
+            if dup is not None:
+                up = self._maybe_upgrade_photo_archival(
+                    voucher, dup, path,
+                    photo_management_mode, photo_library_path,
+                )
+                # 升级时 up 与 dup 的 归档状态 不同，视为本次"已处理"返回
+                if self._value(up, "归档状态") != self._value(dup, "归档状态"):
+                    upgraded_rows.append(up)
+                continue
+            rows_to_add.append(
+                self._photo_row(
+                    voucher,
+                    path,
+                    allow_outside=allow_outside,
+                    photo_management_mode=photo_management_mode,
+                    photo_library_path=photo_library_path,
+                )
             )
-            for path in photo_paths
-        ]
-        if not rows_to_add:
-            return []
+        if rows_to_add:
+            rows = self.read_rows("photo")
+            rows.extend(rows_to_add)
+            self._write_rows("photo", rows)
+            self._update_summary_modified(voucher)
+            self._record_action("add_photos", voucher, "photo", "", {}, rows_to_add)
+        return rows_to_add + upgraded_rows
+
+    def _reject_photos_linked_to_other_vouchers(
+        self, target_voucher: str, photo_paths: list[Path | str],
+    ) -> None:
+        conflicts = self.find_photo_conflicts(photo_paths, target_voucher)
+        if not conflicts:
+            return
+        examples = ", ".join(
+            f"{Path(path).name} -> {voucher}"
+            for path, voucher in list(conflicts.items())[:3]
+        )
+        suffix = f"（另有 {len(conflicts) - 3} 张）" if len(conflicts) > 3 else ""
+        raise ValueError(
+            "照片已关联到其他入库编号，不能重复关联到"
+            f" {target_voucher}：{examples}{suffix}"
+        )
+
+    def _find_photo_duplicate_for_source(self, voucher: str, photo_path: Path | str) -> Row | None:
+        """按 (voucher, SHA256, 原始文件名) 三元组查 voucher 下已有同源照片。
+
+        命中条件：源文件可读取 SHA256 + 已有行 SHA256/原始文件名 完全匹配。
+        旧行没有 SHA256（极老数据） → 不参与判定，走原 append 路径（向后兼容）。
+        """
+        try:
+            src = Path(photo_path)
+            if not src.is_file():
+                return None
+            new_sha = self._file_sha256(src)
+        except OSError:
+            return None
+        if not new_sha:
+            return None
+        orig_name = src.name
+        for row in self.get_photos(voucher):
+            if (
+                self._value(row, "文件SHA256") == new_sha
+                and self._value(row, "原始文件名") == orig_name
+            ):
+                return row
+        return None
+
+    def _maybe_upgrade_photo_archival(
+        self,
+        voucher: str,
+        dup_row: Row,
+        photo_path: Path | str,
+        mode: str,
+        library_path: Path | str | None,
+    ) -> Row:
+        """处理查重命中：「仅记录 → 已归档」时升级同一行；否则原样返回 dup_row。"""
+        if self._value(dup_row, "归档状态") != "仅记录" or mode == "absolute_only":
+            return dup_row
+        upgraded = self._photo_row(
+            voucher,
+            photo_path,
+            allow_outside=True,
+            photo_management_mode=mode,
+            photo_library_path=library_path,
+        )
         rows = self.read_rows("photo")
-        rows.extend(rows_to_add)
-        self._write_rows("photo", rows)
-        self._update_summary_modified(voucher)
-        self._record_action("add_photos", voucher, "photo", "", {}, rows_to_add)
-        return rows_to_add
+        new_sha = self._value(dup_row, "文件SHA256")
+        orig_name = self._value(dup_row, "原始文件名")
+        for idx, row in enumerate(rows):
+            if (
+                self._value(row, "入库编号*") == voucher
+                and self._value(row, "文件SHA256") == new_sha
+                and self._value(row, "原始文件名") == orig_name
+                and self._value(row, "归档状态") == "仅记录"
+            ):
+                old_row = row.copy()
+                # 升级：覆盖归档相关字段，其他字段（描述等）保留
+                for key in ("文件名", "相对路径", "绝对路径", "归档时间", "归档状态", "文件大小"):
+                    new_value = upgraded.get(key, "")
+                    if new_value:
+                        row[key] = new_value
+                self._write_rows("photo", rows)
+                self._update_summary_modified(voucher)
+                self._record_action(
+                    "upgrade_photo_archival", voucher, "photo", "", old_row, row.copy(),
+                )
+                return row.copy()
+        return dup_row
+
+    def dedupe_photo_links(self, *, dry_run: bool = False) -> dict:
+        """批量清理 voucher 下重复的照片行（按 SHA256+原始文件名 分组）。
+
+        - 保留优先级：归档状态 "已归档" > "仅记录"；同级取归档时间最早。
+        - 调用前强制 create_data_snapshot（dry_run 例外），出错可走「版本回退」复原。
+        - 不写 action_log 单步 undo（批量操作语义不适合精细回滚）。
+
+        返回：{"groups": N, "removed": M}；无重复返回 0/0 且不写快照。
+        """
+        rows = self.read_rows("photo")
+        groups: dict[tuple[str, str, str], list[Row]] = {}
+        for r in rows:
+            v = self._value(r, "入库编号*")
+            sha = self._value(r, "文件SHA256")
+            name = self._value(r, "原始文件名")
+            if not v or not sha:
+                continue
+            groups.setdefault((v, sha, name), []).append(r)
+        dup_groups = {k: g for k, g in groups.items() if len(g) > 1}
+        summary = {
+            "groups": len(dup_groups),
+            "removed": sum(len(g) - 1 for g in dup_groups.values()),
+        }
+        if dry_run or not dup_groups:
+            return summary
+        self.create_data_snapshot(
+            "清理重复照片关联前快照",
+            f"将合并 {summary['groups']} 组，删除 {summary['removed']} 条重复照片行",
+        )
+        winners_by_key: dict[tuple[str, str, str], int] = {}
+        for key, group in dup_groups.items():
+            winner = max(
+                group,
+                key=lambda x: (
+                    1 if self._value(x, "归档状态") == "已归档" else 0,
+                    -self._timestamp_or_zero(self._value(x, "归档时间")),
+                ),
+            )
+            winners_by_key[key] = id(winner)
+        keep_rows: list[Row] = []
+        removed_rows: list[Row] = []
+        for r in rows:
+            sha = self._value(r, "文件SHA256")
+            v = self._value(r, "入库编号*")
+            name = self._value(r, "原始文件名")
+            key = (v, sha, name)
+            if key in winners_by_key:
+                if id(r) == winners_by_key[key]:
+                    keep_rows.append(r)
+                else:
+                    removed_rows.append(r)
+            else:
+                keep_rows.append(r)
+        self._write_rows("photo", keep_rows)
+        for r in removed_rows:
+            try:
+                self._delete_unreferenced_photo_file(r, keep_rows)
+            except Exception:
+                pass
+        affected_vouchers = {self._value(r, "入库编号*") for r in removed_rows}
+        for v in affected_vouchers:
+            self._update_summary_modified(v)
+        return summary
+
+    @staticmethod
+    def _timestamp_or_zero(value: str) -> float:
+        if not value:
+            return 0.0
+        try:
+            return datetime.fromisoformat(value).timestamp()
+        except (ValueError, TypeError):
+            return 0.0
 
     def find_photo_conflicts(self, photo_paths: list[Path | str], target_voucher: str) -> dict[str, str]:
         resolved_inputs = {Path(p).resolve() for p in photo_paths}
         if not resolved_inputs:
             return {}
-        input_hashes: dict[str, str] = {}
-        for path in resolved_inputs:
-            try:
-                input_hashes[str(path)] = self._file_sha256(path)
-            except OSError:
-                continue
-        conflicts: dict[str, str] = {}
+        hashes_to_voucher: dict[str, str] = {}
+        paths_to_voucher: dict[str, str] = {}
         for row in self.read_rows("photo"):
             voucher = self._value(row, "入库编号*")
-            if voucher == target_voucher:
+            if not voucher or voucher == target_voucher:
                 continue
             row_hash = self._value(row, "文件SHA256")
             if row_hash:
-                for input_path, input_hash in input_hashes.items():
-                    if input_hash == row_hash:
-                        conflicts[input_path] = voucher
-                continue
-            row_path = self.resolve_photo_path(row)
-            if row_path:
-                resolved = Path(row_path).resolve()
-                if resolved in resolved_inputs:
-                    conflicts[str(resolved)] = voucher
+                hashes_to_voucher.setdefault(row_hash, voucher)
+            else:
+                paths_to_voucher.setdefault(str(self.resolve_photo_path(row).resolve()), voucher)
+        conflicts: dict[str, str] = {}
+        for path in resolved_inputs:
+            resolved = str(path)
+            try:
+                input_hash = self._file_sha256(path)
+            except OSError:
+                input_hash = ""
+            linked_voucher = hashes_to_voucher.get(input_hash) if input_hash else None
+            if linked_voucher is None:
+                linked_voucher = paths_to_voucher.get(resolved)
+            if linked_voucher is not None:
+                conflicts[resolved] = linked_voucher
         return conflicts
 
     def find_archive_name_conflicts(self, photo_paths: list[Path | str]) -> dict[str, str]:
@@ -1004,6 +1243,7 @@ class ExcelStore:
         photo_management_mode: str = "copy_with_absolute",
         photo_library_path: Path | str | None = None,
     ) -> Row | None:
+        self._reject_photos_linked_to_other_vouchers(voucher, [photo_path])
         rows = self.read_rows("photo")
         matching_positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == voucher]
         if photo_index < 0 or photo_index >= len(matching_positions):
@@ -1070,18 +1310,47 @@ class ExcelStore:
         )
         return len(moved_rows)
 
+    def _ensure_index_voucher_set(self) -> set[str]:
+        """lazy 构建 INDEX 表 voucher set 缓存，mtime 校验失效。
+
+        旧：每次 next_voucher / 重复检测都全扫 INDEX 表 _read_plain_rows。
+        新：set 缓存 + mtime 校验，next_voucher 撞号检测降到 O(1)。
+        """
+        path = self.data_dir / INDEX_FILE
+        try:
+            current_mtime = path.stat().st_mtime
+        except OSError:
+            current_mtime = 0.0
+        if self._index_voucher_set is not None and self._index_voucher_set_mtime == current_mtime:
+            return self._index_voucher_set
+        rows = self._read_plain_rows(path, INDEX_HEADERS) if path.exists() else []
+        self._index_voucher_set = {
+            self._value(r, "入库编号") for r in rows if self._value(r, "入库编号")
+        }
+        self._index_voucher_set_mtime = current_mtime
+        return self._index_voucher_set
+
     def next_voucher(self) -> str:
-        self.assert_unique_vouchers()
+        # 旧：assert_unique_vouchers() O(3n) + _max_existing_serial() O(4n) 每次扫 7 表。
+        # 新：信任 config["next_serial"]（__init__ 时 _sync_next_serial 重建为权威），
+        # 运行时撞号兜底走 _ensure_index_voucher_set O(1) set 查；
+        # 跨进程外部修改 xlsx 的极少场景由 mtime 校验自动失效缓存。
         active = self.config.get("active_series_name", "YZZ")
         if active == "YZZ":
-            # 旧：max(existing+1, 1)，不考虑批量预留
-            # 新：若曾批量预留，reserved_through_serial 记录上次预留的最末编号；
+            # 若曾批量预留，reserved_through_serial 记录上次预留的最末编号；
             # 下一个创建的编号必须在预留段之后，避免与已打印标签冲突。
             reserved = int(self.config.get("reserved_through_serial", 0))
-            return format_voucher(max(self._max_existing_serial() + 1, reserved + 1))
+            next_serial = max(int(self.config.get("next_serial", 1)), reserved + 1)
+            index_set = self._ensure_index_voucher_set()
+            candidate = format_voucher(next_serial)
+            # 撞号兜底（极少触发）：若候选已在 INDEX，自增到唯一为止
+            while candidate in index_set:
+                next_serial += 1
+                candidate = format_voucher(next_serial)
+            return candidate
         series = self._get_series_config(active)
         if series is None:
-            return format_voucher(max(self._max_existing_serial() + 1, 1))
+            return format_voucher(max(int(self.config.get("next_serial", 1)), 1))
         return format_series_number(series)
 
     def assert_unique_vouchers(self) -> None:
@@ -1284,11 +1553,19 @@ class ExcelStore:
             snapshot_dir = self.data_dir / DATA_VERSION_DIR / f"{version_id}_{suffix}"
             suffix += 1
         snapshot_dir.mkdir(parents=True)
+        # plan A4：边拷贝边算 SHA256 + size，写入 manifest，最后写 .snapshot.complete 标记。
+        # 缺标记 = 上次拷贝中途中断（NAS 抖断 / 进程被杀），下次 restore 前由 verify 拦下。
+        snapshot_files: dict[str, dict[str, Any]] = {}
         for path in self.data_dir.iterdir():
             if path.name == DATA_VERSION_DIR or path.name == ".workspace.lock":
                 continue
             if path.is_file() and path.suffix.lower() in {".xlsx", ".json"}:
-                shutil.copy2(path, snapshot_dir / path.name)
+                target = snapshot_dir / path.name
+                shutil.copy2(path, target)
+                snapshot_files[path.name] = {
+                    "sha256": self._file_sha256(target),
+                    "size": target.stat().st_size,
+                }
         manifest = {
             "version_id": snapshot_dir.name,
             "created_at": self._now(),
@@ -1297,11 +1574,92 @@ class ExcelStore:
             "data_schema_version": self.config.get("data_schema_version", CURRENT_DATA_SCHEMA_VERSION),
             "summary": summary,
             "workspace": str(self.root),
+            # plan A4: 新字段；老 snapshot 没有，verify 时按"老快照不校验内容"宽松处理。
+            "files": snapshot_files,
         }
-        with (snapshot_dir / "snapshot_manifest.json").open("w", encoding="utf-8") as handle:
+        with (snapshot_dir / SNAPSHOT_MANIFEST_FILENAME).open("w", encoding="utf-8") as handle:
             json.dump(manifest, handle, ensure_ascii=False, indent=2)
+        # plan A4：标记文件必须最后写，写完才算完整快照。
+        (snapshot_dir / SNAPSHOT_COMPLETE_MARKER_FILENAME).touch()
         self._record_data_version(operation_type, summary or operation_type, snapshot_dir)
         return snapshot_dir
+
+    def verify_snapshot_integrity(self, snapshot_path: Path) -> None:
+        """plan A4：还原前的快照完整性校验。
+
+        三类失败统一抛 ``SnapshotIntegrityCheckFailed``：
+          1. 缺 ``.snapshot.complete`` 标记 → 上次写入中途中断
+          2. 缺 manifest 或 manifest 损坏 → 无法判断快照是否可信
+          3. manifest 中某文件的 SHA256 / size 与磁盘当前文件不符 → 内容被改
+
+        老快照（无 ``files`` 字段）按"宽松"处理：只校验 ``.snapshot.complete`` 标记是否存在。
+        """
+        snapshot_path = Path(snapshot_path)
+        marker_path = snapshot_path / SNAPSHOT_COMPLETE_MARKER_FILENAME
+        if not marker_path.exists():
+            raise SnapshotIntegrityCheckFailed(
+                f"快照缺完成标记 ({SNAPSHOT_COMPLETE_MARKER_FILENAME})，"
+                f"疑似上次写入中途中断：{snapshot_path}"
+            )
+        manifest_path = snapshot_path / SNAPSHOT_MANIFEST_FILENAME
+        if not manifest_path.exists():
+            raise SnapshotIntegrityCheckFailed(f"快照缺 manifest：{snapshot_path}")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SnapshotIntegrityCheckFailed(f"manifest 解析失败：{exc}") from exc
+        files_section = manifest.get("files")
+        if not isinstance(files_section, dict):
+            return  # 老快照宽松通过
+        for filename, expected in files_section.items():
+            actual_path = snapshot_path / filename
+            if not actual_path.exists():
+                raise SnapshotIntegrityCheckFailed(
+                    f"快照文件丢失：{filename} (manifest 中存在)"
+                )
+            expected_size = int(expected.get("size", -1))
+            actual_size = actual_path.stat().st_size
+            if expected_size >= 0 and actual_size != expected_size:
+                raise SnapshotIntegrityCheckFailed(
+                    f"快照文件大小不一致：{filename} (期望 {expected_size}，实际 {actual_size})"
+                )
+            expected_sha = str(expected.get("sha256", ""))
+            if expected_sha:
+                actual_sha = self._file_sha256(actual_path)
+                if actual_sha != expected_sha:
+                    raise SnapshotIntegrityCheckFailed(
+                        f"快照文件 SHA256 不一致：{filename}"
+                    )
+
+    def cleanup_incomplete_snapshot_directories(self) -> list[Path]:
+        """plan A4：启动时扫 ``数据版本/``，把缺 ``.snapshot.complete`` 标记的目录删掉。
+
+        返回被删除的目录路径列表，便于日志/测试。
+        只读模式下跳过（不应改工作区）。
+        """
+        if self._read_only:
+            return []
+        root = self.data_dir / DATA_VERSION_DIR
+        if not root.exists():
+            return []
+        deleted: list[Path] = []
+        for sub in root.iterdir():
+            if not sub.is_dir():
+                continue
+            marker = sub / SNAPSHOT_COMPLETE_MARKER_FILENAME
+            if marker.exists():
+                continue
+            # 老快照（v0.10.0 之前）没有 .snapshot.complete，但 manifest 存在 → 视为已完成；
+            # manifest 也不存在才删除。
+            manifest = sub / SNAPSHOT_MANIFEST_FILENAME
+            if manifest.exists():
+                continue
+            try:
+                shutil.rmtree(sub)
+                deleted.append(sub)
+            except OSError:
+                pass
+        return deleted
 
     def list_data_versions(self) -> list[Row]:
         rows = self._read_plain_rows(self.data_dir / DATA_VERSION_LOG_FILE, DATA_VERSION_LOG_HEADERS)
@@ -1318,6 +1676,8 @@ class ExcelStore:
             raise ValueError(f"快照路径不在数据版本目录内：{snapshot}")
         if not snapshot.exists() or not snapshot.is_dir():
             raise FileNotFoundError(f"数据版本不存在：{snapshot}")
+        # plan A4：还原前先校验快照完整性，挡掉 NAS 半残快照导致的静默还原坏数据
+        self.verify_snapshot_integrity(snapshot)
         self.create_data_snapshot("回退前快照", f"回退到 {snapshot.name} 前自动保存当前状态")
         for path in snapshot.iterdir():
             if not path.is_file():
@@ -1574,6 +1934,65 @@ class ExcelStore:
                 return False
         return self._delete_archive_file_if_safe(path)
 
+    def recover_photo_archive_after_undo(self, photo_row: Row) -> str:
+        """撤回时回填工作区 ``照片/`` 归档副本。
+
+        三态降级（plan A1）：
+          - ``"archive_already_present"``     归档副本仍在或本行从未归档，无需动作
+          - ``"recopied_from_original_path"`` 原始文件仍在硬盘 -> 重新复制到归档
+          - ``"marked_corrupt"``              原始和归档都缺 -> 把行的 ``归档状态`` 标为 ``"损坏"`` 并写一条修改记录，但不阻塞撤回
+        """
+        relative_path = self._value(photo_row, "相对路径")
+        if not relative_path:
+            return "archive_already_present"
+        workspace_archive = self._resolve_relative(self.root, relative_path)
+        if workspace_archive.exists():
+            return "archive_already_present"
+        original_path_value = self._value(photo_row, "原始路径")
+        if original_path_value:
+            original = Path(original_path_value).expanduser()
+            if original.is_file():
+                try:
+                    archive_dir = workspace_archive.parent
+                    archive_dir.mkdir(parents=True, exist_ok=True)
+                    tmp = archive_dir / f".{uuid.uuid4().hex}.tmp{workspace_archive.suffix.lower()}"
+                    shutil.copy2(original, tmp)
+                    tmp.replace(workspace_archive)
+                    return "recopied_from_original_path"
+                except OSError:
+                    pass
+        self._mark_photo_archive_as_corrupt(photo_row)
+        return "marked_corrupt"
+
+    def _mark_photo_archive_as_corrupt(self, photo_row: Row) -> None:
+        """把照片行的 ``归档状态`` 字段写成 ``"损坏"``，并在 ``修改记录.xlsx`` 留一条 audit。
+
+        恢复失败的兜底；调用方已 best-effort 处理过原始路径，这里只记录状态。
+        日志写失败不抛 —— 不能阻塞 undo 主流程。
+        """
+        voucher = self._value(photo_row, "入库编号*")
+        if not voucher:
+            return
+        rows = self.read_rows("photo")
+        index = self._find_photo_row_index(rows, photo_row)
+        if index is None:
+            return
+        old_row = dict(rows[index])
+        new_row = dict(rows[index])
+        new_row["归档状态"] = "损坏"
+        rows[index] = self._fit_headers(new_row, PHOTO_HEADERS)
+        self._write_rows("photo", rows)
+        try:
+            self._write_changes_and_summary(
+                voucher=voucher,
+                category="photo",
+                old_row=old_row,
+                new_row=new_row,
+                action_type="undo_archive_recovery_failed",
+            )
+        except Exception:
+            pass
+
     def _delete_archive_file_if_safe(self, path: Path) -> bool:
         path = path.resolve()
         if not path.exists():
@@ -1638,16 +2057,47 @@ class ExcelStore:
         self._row_cache[file_key] = rows
         self._row_cache.move_to_end(file_key)
         self._file_mtimes[file_key] = current_mtime
+        # S3.1: cache miss 时同步建立 voucher → row_index 字典，_find_one / get_photos 用之
+        self._build_voucher_index_for(file_key, rows)
         # LRU 驱逐:超 maxsize 时弹最旧项(popitem(last=False))
         while len(self._row_cache) > self._row_cache_maxsize:
             evicted_key, _ = self._row_cache.popitem(last=False)
             self._file_mtimes.pop(evicted_key, None)
+            self._voucher_index.pop(evicted_key, None)
+            if evicted_key == PHOTO_FILE:
+                self._photo_voucher_index = {}
         return [row.copy() for row in rows]
+
+    def _build_voucher_index_for(self, file_key: str, sparse_rows: list[Row]) -> None:
+        """填充缓存后为 specimen/classification/photo 表建 voucher 索引（按 sparse 行下标）。"""
+        if file_key == PHOTO_FILE:
+            multi: dict[str, list[int]] = {}
+            for i, r in enumerate(sparse_rows):
+                v = r.get("入库编号*", "")
+                if v:
+                    multi.setdefault(v, []).append(i)
+            self._photo_voucher_index = multi
+            return
+        if file_key in (SPECIMEN_FILE, CLASSIFICATION_FILE):
+            idx: dict[str, int] = {}
+            for i, r in enumerate(sparse_rows):
+                v = r.get("入库编号*", "")
+                # 重复 voucher：保留首条索引；assert_unique_vouchers 会另行检测
+                if v and v not in idx:
+                    idx[v] = i
+            self._voucher_index[file_key] = idx
+            return
 
     def _invalidate_cache(self, *file_keys: str) -> None:
         for key in file_keys:
             self._row_cache.pop(key, None)
             self._file_mtimes.pop(key, None)
+            self._voucher_index.pop(key, None)
+            if key == PHOTO_FILE:
+                self._photo_voucher_index = {}
+            if key == INDEX_FILE:
+                self._index_voucher_set = None
+                self._index_voucher_set_mtime = -1.0
 
     def _enforce_row_cache_size(self) -> None:
         """规范化软件设计 2026-05 内存档位:用户改小档位后立即驱逐多余项,缩内存到位。
@@ -1825,6 +2275,10 @@ class ExcelStore:
             raise
 
     def _ensure_workbook(self, path: Path, headers: list[str]) -> None:
+        # plan A2: 只读模式下不得在工作区里创建/迁移文件——破坏"只读=零侧效应"契约。
+        # 旧：read_only 也会走到这里 → 缺文件自动建表头 → 用户以为只看，其实写了。
+        if self._read_only:
+            return
         if not path.exists():
             _ensure_openpyxl()
             wb = Workbook()
@@ -1835,6 +2289,7 @@ class ExcelStore:
             # 但内容损坏。现：用原子替换。
             tmp = path.with_suffix(f".{os.getpid()}.tmp")
             wb.save(tmp)
+            self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
             tmp.replace(path)
             return
         rows = self._read_plain_rows(path)
@@ -1844,6 +2299,9 @@ class ExcelStore:
             self._write_plain_rows(path, existing_headers + missing, rows)
 
     def _ensure_change_log(self) -> None:
+        # plan A2: 只读契约——见 _ensure_workbook 同源注释。
+        if self._read_only:
+            return
         path = self.data_dir / CHANGE_LOG_FILE
         if path.exists():
             return
@@ -1857,10 +2315,41 @@ class ExcelStore:
         # 原：直接写，改用原子替换，与 _ensure_workbook 保持一致。
         tmp = path.with_suffix(f".{os.getpid()}.tmp")
         wb.save(tmp)
+        self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
         tmp.replace(path)
 
     def _ensure_alloc_log(self) -> None:
+        # plan A2: 只读契约由 _ensure_workbook 守门，这里无需重复判断。
         self._ensure_workbook(self.data_dir / ALLOC_LOG_FILE, ALLOC_LOG_HEADERS)
+
+    def _verify_workbook_file_can_be_reopened(self, workbook_path: Path) -> None:
+        """plan A5：把 openpyxl 刚写完的 xlsx 当 ZIP 打开校验完整性。
+
+        触发场景：openpyxl ``wb.save(tmp)`` 在 OOM/磁盘满/SMB 抖断时会留下截断的 ZIP，
+        随后 ``tmp.replace(target)`` 原子换上去，用户工作区就坏了。本 helper 在 replace
+        之前用 stdlib ``ZipFile.testzip()`` 检：central directory 残缺、文件 CRC 不符、
+        member 缺失都会被发现 → 抛 ``WorkbookWriteVerificationFailed``，同时删 tmp。
+
+        用 stdlib ``zipfile`` 而非 ``openpyxl.load_workbook``——后者按文件扩展名拒
+        ``.tmp``，且解析整本 sheet 太慢；前者只校验 ZIP 字节结构，几 ms 完成。
+
+        所有 ``wb.save(tmp) → tmp.replace(target)`` 路径中间必须插一次本函数调用。
+        """
+        try:
+            with ZipFile(workbook_path, "r") as archive:
+                corrupted_member_name = archive.testzip()
+            if corrupted_member_name is not None:
+                raise WorkbookWriteVerificationFailed(
+                    f"Excel 写入校验失败：{workbook_path.name} 内 ZIP 成员 CRC 错: {corrupted_member_name}"
+                )
+        except (BadZipFile, OSError) as exc:
+            try:
+                workbook_path.unlink()
+            except OSError:
+                pass
+            raise WorkbookWriteVerificationFailed(
+                f"Excel 写入校验失败 (疑似存储介质问题): {workbook_path.name}: {exc}"
+            ) from exc
 
     # ── 编号分发日志 ──────────────────────────────────────────────────────────
 
@@ -1898,6 +2387,57 @@ class ExcelStore:
         """读取全部分发记录。"""
         return self._read_plain_rows(self.data_dir / ALLOC_LOG_FILE, ALLOC_LOG_HEADERS)
 
+    # ── S2: 入库完成度判定 / 未入库编号枚举 ────────────────────────────────
+
+    def is_voucher_ingestion_complete(self, voucher: str) -> bool:
+        """判定某入库编号是否「入库已完成」= specimen 必填全有 + 至少 1 张照片 + 分类必填全有。
+
+        派生自现有 status_for(voucher).is_complete，不持久化新字段，零兼容性影响。
+        voucher 行可能根本未创建 specimen 行（只是批量领取段内的编号），
+        此时 get_specimen 返 None → 各字段 _value 返 "" → specimen_complete=False。
+        """
+        return self.status_for(voucher).is_complete
+
+    def list_unfinished_reserved_vouchers(self) -> list[tuple[str, str, str]]:
+        """列出系统中所有「已批量领取 + 未完成入库」的编号。
+
+        返回 [(voucher, 领取人, 领取时间), ...]，按领取时间倒序。
+        - 数据源：编号分发记录.xlsx 内所有「类型=批量领取」的事件 → 编号段
+        - 过滤：段内 is_voucher_ingestion_complete(v) == True 的剔除
+        - 仅支持 YZZ 序列段（其他 series 段后续可扩展，本期先聚焦 YZZ）
+        """
+        result: list[tuple[str, str, str]] = []
+        seen: set[str] = set()
+        for row in reversed(self.read_alloc_log()):
+            if self._value(row, "类型") != "批量领取":
+                continue
+            series = self._value(row, "编号系列") or "YZZ"
+            start_str = self._value(row, "编号起始")
+            end_str = self._value(row, "编号结束")
+            person = self._value(row, "人员")
+            ts = self._value(row, "时间")
+            for v in self._expand_voucher_range(series, start_str, end_str):
+                if v in seen:
+                    continue
+                seen.add(v)
+                if self.is_voucher_ingestion_complete(v):
+                    continue
+                result.append((v, person, ts))
+        return result
+
+    def _expand_voucher_range(self, series: str, start: str, end: str) -> list[str]:
+        """展开 alloc_log 编号起始/结束的段为完整编号列表。YZZ 走 parse_voucher_serial。"""
+        if not start or not end:
+            return []
+        if series == "YZZ" or series == "":
+            s_serial = parse_voucher_serial(start)
+            e_serial = parse_voucher_serial(end)
+            if s_serial is None or e_serial is None or e_serial < s_serial:
+                return []
+            return [format_voucher(i) for i in range(s_serial, e_serial + 1)]
+        # 非 YZZ 系列：段内编号枚举较复杂（自定义分隔符/年份），暂返回空，后续按需扩展。
+        return []
+
     def _record_data_version(self, operation_type: str, summary: str, snapshot_path: Path | None = None) -> None:
         rows = self._read_plain_rows(self.data_dir / DATA_VERSION_LOG_FILE, DATA_VERSION_LOG_HEADERS)
         rows.append(
@@ -1917,55 +2457,56 @@ class ExcelStore:
     def _write_changes_and_summary(self, voucher: str, category: str, old_row: Row, new_row: Row, action_type: str) -> None:
         """Append field changes and update summary in a single file write."""
         now = self._now()
-        detail_rows = self._read_change_detail_rows()
-        summary_rows = self._read_summary_rows()
-        for field in CATEGORY_HEADERS[category]:
-            old = self._value(old_row, field)
-            new = self._value(new_row, field)
-            if old != new:
-                detail_rows.append(
-                    {
-                        "入库编号": voucher,
-                        "信息类别": DISPLAY_CATEGORY_NAMES[category],
-                        "字段名": field,
-                        "旧值": old,
-                        "新值": new,
-                        "修改时间": now,
-                        "操作类型": action_type,
-                    }
-                )
-        if not any(self._value(row, "入库编号") == voucher for row in summary_rows):
-            summary_rows.append(
-                {
-                    "入库编号": voucher,
-                    "创建时间": now,
-                    "第一次修改时间": "",
-                    "第二次修改时间": "",
-                    "最近修改时间": "",
-                    "修改次数": 0,
-                }
-            )
-        for row in summary_rows:
-            if self._value(row, "入库编号") == voucher:
-                count = int(row.get("修改次数") or 0) + 1
-                row["修改次数"] = count
-                if count == 1:
-                    row["第一次修改时间"] = now
-                elif count == 2:
-                    row["第二次修改时间"] = now
-                row["最近修改时间"] = now
-                break
         path = self.data_dir / CHANGE_LOG_FILE
         self._ensure_change_log()
         with self._open_workbook(path) as wb:
             if "修改明细" not in wb.sheetnames:
                 wb.create_sheet("修改明细")
-            self._replace_sheet(wb["修改明细"], CHANGE_LOG_HEADERS, detail_rows)
             if "修改汇总" not in wb.sheetnames:
                 wb.create_sheet("修改汇总")
+            detail_rows = self._rows_from_sheet(wb["修改明细"], CHANGE_LOG_HEADERS)
+            summary_rows = self._rows_from_sheet(wb["修改汇总"], CHANGE_SUMMARY_HEADERS)
+            for field in CATEGORY_HEADERS[category]:
+                old = self._value(old_row, field)
+                new = self._value(new_row, field)
+                if old != new:
+                    detail_rows.append(
+                        {
+                            "入库编号": voucher,
+                            "信息类别": DISPLAY_CATEGORY_NAMES[category],
+                            "字段名": field,
+                            "旧值": old,
+                            "新值": new,
+                            "修改时间": now,
+                            "操作类型": action_type,
+                        }
+                    )
+            if not any(self._value(row, "入库编号") == voucher for row in summary_rows):
+                summary_rows.append(
+                    {
+                        "入库编号": voucher,
+                        "创建时间": now,
+                        "第一次修改时间": "",
+                        "第二次修改时间": "",
+                        "最近修改时间": "",
+                        "修改次数": 0,
+                    }
+                )
+            for row in summary_rows:
+                if self._value(row, "入库编号") == voucher:
+                    count = int(row.get("修改次数") or 0) + 1
+                    row["修改次数"] = count
+                    if count == 1:
+                        row["第一次修改时间"] = now
+                    elif count == 2:
+                        row["第二次修改时间"] = now
+                    row["最近修改时间"] = now
+                    break
+            self._replace_sheet(wb["修改明细"], CHANGE_LOG_HEADERS, detail_rows)
             self._replace_sheet(wb["修改汇总"], CHANGE_SUMMARY_HEADERS, summary_rows)
             tmp = path.with_suffix(f".{os.getpid()}.tmp")
             wb.save(tmp)
+            self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
             tmp.replace(path)
 
     def _read_change_detail_rows(self) -> list[Row]:
@@ -1981,6 +2522,7 @@ class ExcelStore:
             self._replace_sheet(ws, CHANGE_LOG_HEADERS, rows)
             tmp = path.with_suffix(f".{os.getpid()}.tmp")
             wb.save(tmp)
+            self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
             tmp.replace(path)
 
     def _read_summary_rows(self) -> list[Row]:
@@ -1995,23 +2537,69 @@ class ExcelStore:
             self._replace_sheet(ws, CHANGE_SUMMARY_HEADERS, rows)
             tmp = path.with_suffix(f".{os.getpid()}.tmp")
             wb.save(tmp)
+            self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
             tmp.replace(path)
 
+    def _ensure_summary_voucher_set(self) -> set[str]:
+        """lazy 构建 修改汇总 表 voucher set 缓存，避免 _ensure_summary_row 全量重写。"""
+        path = self.data_dir / CHANGE_LOG_FILE
+        try:
+            cur_mtime = path.stat().st_mtime
+        except OSError:
+            cur_mtime = 0.0
+        if self._summary_voucher_set is not None and self._summary_voucher_set_mtime == cur_mtime:
+            return self._summary_voucher_set
+        rows = self._read_summary_rows() if path.exists() else []
+        self._summary_voucher_set = {
+            self._value(r, "入库编号") for r in rows if self._value(r, "入库编号")
+        }
+        self._summary_voucher_set_mtime = cur_mtime
+        return self._summary_voucher_set
+
     def _ensure_summary_row(self, voucher: str, created_at: str | None = None) -> None:
-        rows = self._read_summary_rows()
-        if any(self._value(row, "入库编号") == voucher for row in rows):
+        # 旧：每次都 _read_summary_rows + any 查重 + _write_summary_rows 整表重写
+        # （N 行 _replace_sheet → delete_rows + N append，5000 行 ~150ms）。
+        # 新：_summary_voucher_set O(1) 查重 + load_workbook + ws.append 单行。
+        s = self._ensure_summary_voucher_set()
+        if voucher in s:
             return
-        rows.append(
-            {
-                "入库编号": voucher,
-                "创建时间": created_at or self._now(),
-                "第一次修改时间": "",
-                "第二次修改时间": "",
-                "最近修改时间": "",
-                "修改次数": 0,
-            }
-        )
-        self._write_summary_rows(rows)
+        new_row = {
+            "入库编号": voucher,
+            "创建时间": created_at or self._now(),
+            "第一次修改时间": "",
+            "第二次修改时间": "",
+            "最近修改时间": "",
+            "修改次数": 0,
+        }
+        path = self.data_dir / CHANGE_LOG_FILE
+        try:
+            _ensure_openpyxl()
+            wb = load_workbook(path)
+            try:
+                if "修改汇总" not in wb.sheetnames:
+                    wb.create_sheet("修改汇总")
+                    wb["修改汇总"].append(CHANGE_SUMMARY_HEADERS)
+                ws = wb["修改汇总"]
+                ws.append([str(new_row.get(h, "")) for h in CHANGE_SUMMARY_HEADERS])
+                tmp = path.with_suffix(f".{os.getpid()}.tmp")
+                wb.save(tmp)
+                self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
+                tmp.replace(path)
+            finally:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+        except Exception:
+            # 降级：全量重写兜底
+            rows = self._read_summary_rows()
+            rows.append(new_row)
+            self._write_summary_rows(rows)
+        s.add(voucher)
+        try:
+            self._summary_voucher_set_mtime = path.stat().st_mtime
+        except OSError:
+            self._summary_voucher_set_mtime = -1.0
 
     def _update_summary_modified(self, voucher: str) -> None:
         rows = self._read_summary_rows()
@@ -2040,21 +2628,41 @@ class ExcelStore:
         old_value: Any,
         new_value: Any,
     ) -> None:
-        rows = self._read_plain_rows(self.data_dir / ACTION_LOG_FILE, ACTION_LOG_HEADERS)
-        rows.append(
-            {
-                "操作ID": str(uuid.uuid4()),
-                "时间": self._now(),
-                "操作类型": action_type,
-                "入库编号": voucher,
-                "信息类别": category,
-                "字段名": field,
-                "旧值JSON": json.dumps(old_value, ensure_ascii=False, default=str),
-                "新值JSON": json.dumps(new_value, ensure_ascii=False, default=str),
-                "是否撤销": "",
-            }
-        )
-        self._write_plain_rows(self.data_dir / ACTION_LOG_FILE, ACTION_LOG_HEADERS, rows)
+        # 旧：_read_plain_rows + append + _write_plain_rows 全量重写（小表也要 50-80ms）。
+        # 新：openpyxl load_workbook + ws.append + 原子 replace，省全量序列化。
+        # 失败回退全量重写。
+        path = self.data_dir / ACTION_LOG_FILE
+        new_row = {
+            "操作ID": str(uuid.uuid4()),
+            "时间": self._now(),
+            "操作类型": action_type,
+            "入库编号": voucher,
+            "信息类别": category,
+            "字段名": field,
+            "旧值JSON": json.dumps(old_value, ensure_ascii=False, default=str),
+            "新值JSON": json.dumps(new_value, ensure_ascii=False, default=str),
+            "是否撤销": "",
+        }
+        try:
+            _ensure_openpyxl()
+            wb = load_workbook(path)
+            try:
+                ws = wb.active
+                ws.append([new_row.get(h, "") for h in ACTION_LOG_HEADERS])
+                tmp = path.with_suffix(f".{os.getpid()}.tmp")
+                wb.save(tmp)
+                self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
+                tmp.replace(path)
+            finally:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+        except Exception:
+            # 降级：全量重写
+            rows = self._read_plain_rows(path, ACTION_LOG_HEADERS)
+            rows.append(new_row)
+            self._write_plain_rows(path, ACTION_LOG_HEADERS, rows)
 
     def _apply_action(self, action: Row, undo: bool) -> None:
         action_type = self._value(action, "操作类型")
@@ -2090,6 +2698,19 @@ class ExcelStore:
                         target["来源工作区根路径"] = ""
                 rows[idx] = self._fit_headers(target, PHOTO_HEADERS)
                 self._write_rows("photo", rows)
+                # plan A1 路径 2：撤回 replace_photo 时，旧归档副本已被 replace_photo:1244 删掉，从原始路径重建
+                if undo and field != "文件名":
+                    self.recover_photo_archive_after_undo(target)
+        elif action_type == "upgrade_photo_archival":
+            # 升级动作：归档相关字段从 old_value → new_value（同一行，未新增/删除）
+            rows = self.read_rows("photo")
+            target = old_value if undo else new_value
+            opposite = new_value if undo else old_value
+            idx = self._find_photo_row_index(rows, opposite)
+            if idx is not None:
+                rows[idx] = self._fit_headers(target, PHOTO_HEADERS)
+                self._write_rows("photo", rows)
+                self._update_summary_modified(voucher)
         elif action_type == "add_photo":
             if undo:
                 self._remove_photo_row(old_value=new_value)
@@ -2107,6 +2728,8 @@ class ExcelStore:
         elif action_type == "delete_photo":
             if undo:
                 self._append_row("photo", old_value)
+                # plan A1 路径 1：取消关联→无引用时归档副本被删；撤回时三态降级恢复
+                self.recover_photo_archive_after_undo(old_value)
             else:
                 self._remove_photo_row(old_value=old_value)
         elif action_type == "create_specimen":
@@ -2128,6 +2751,8 @@ class ExcelStore:
                     self._append_row("classification", classification)
                 for photo in photos:
                     self._append_row("photo", photo)
+                    # plan A1 路径 3：删除标本会级联清空照片归档；逐条尝试恢复
+                    self.recover_photo_archive_after_undo(photo)
                 if index:
                     self._append_index_row(index)
             else:
@@ -2139,6 +2764,8 @@ class ExcelStore:
             if undo:
                 for photo in old_value.get("photos") or []:
                     self._append_row("photo", photo)
+                    # plan A1 路径 4：清空所有照片关联会级联删除归档；逐条尝试恢复（plan 未列，与路径 3 同源）
+                    self.recover_photo_archive_after_undo(photo)
                 self._invalidate_cache(PHOTO_FILE)
             else:
                 self._delete_rows("photo", voucher)
@@ -2180,9 +2807,55 @@ class ExcelStore:
         return None
 
     def _append_row(self, category: str, row: Row) -> None:
-        rows = self.read_rows(category)
-        rows.append(self._fit_headers(row, CATEGORY_HEADERS[category]))
-        self._write_rows(category, rows)
+        # 旧：read_rows 全读 + _write_rows 整本重写（5000 行 ~300-800ms）。
+        # 新：_append_row_incremental 走 openpyxl load_workbook + ws.append + 原子 replace（~50-100ms），
+        # 失败时自动降级回旧路径，保证一致性。
+        self._append_row_incremental(category, row)
+
+    def _append_row_incremental(self, category: str, row: Row) -> None:
+        """单行增量 append xlsx；缓存增量更新而非全文件 invalidate。"""
+        file_key = CATEGORY_FILES[category]
+        headers = CATEGORY_HEADERS[category]
+        path = self.data_dir / file_key
+        fitted = self._fit_headers(row, headers)
+        try:
+            _ensure_openpyxl()
+            wb = load_workbook(path)
+            try:
+                ws = wb.active
+                ws.append([fitted.get(h, "") for h in headers])
+                tmp = path.with_suffix(f".{os.getpid()}.tmp")
+                wb.save(tmp)
+                self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
+                tmp.replace(path)
+            finally:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+        except Exception:
+            # 失败回退：load/save 异常 → 全量重写兜底
+            rows = self.read_rows(category)
+            rows.append(fitted)
+            self._write_rows(category, rows)
+            return
+        # 缓存增量更新：保持 _row_cache + voucher_index/photo_voucher_index 与磁盘一致
+        if file_key in self._row_cache:
+            cached = self._row_cache[file_key]
+            # 缓存内是 sparse dict（_read_plain_rows 只保留非空字段）
+            sparse_new = {k: v for k, v in fitted.items() if v != ""}
+            cached.append(sparse_new)
+            new_idx = len(cached) - 1
+            voucher = fitted.get("入库编号*", "")
+            if voucher:
+                if file_key == PHOTO_FILE:
+                    self._photo_voucher_index.setdefault(voucher, []).append(new_idx)
+                elif file_key in (SPECIMEN_FILE, CLASSIFICATION_FILE):
+                    self._voucher_index.setdefault(file_key, {}).setdefault(voucher, new_idx)
+            try:
+                self._file_mtimes[file_key] = path.stat().st_mtime
+            except OSError:
+                self._file_mtimes[file_key] = 0.0
 
     def _write_rows(self, category: str, rows: list[Row]) -> None:
         self._write_plain_rows(self.data_dir / CATEGORY_FILES[category], CATEGORY_HEADERS[category], rows)
@@ -2193,7 +2866,18 @@ class ExcelStore:
         self._write_rows(category, rows)
 
     def _find_one(self, category: str, voucher: str) -> Row | None:
-        for row in self.read_rows(category):
+        # 旧：线性 O(n) 扫 read_rows(category) 找 voucher。新：走 _voucher_index 字典 O(1)。
+        # 索引未建/失效时降级线性，保证语义不变。
+        rows = self.read_rows(category)
+        file_key = CATEGORY_FILES.get(category, "")
+        idx_map = self._voucher_index.get(file_key) or {}
+        i = idx_map.get(voucher)
+        if i is not None and i < len(rows):
+            row = rows[i]
+            if self._value(row, "入库编号*") == voucher:
+                return row
+        # fallback：索引层失配（理论上不应发生），降级线性
+        for row in rows:
             if self._value(row, "入库编号*") == voucher:
                 return row
         return None
@@ -2217,12 +2901,43 @@ class ExcelStore:
         )
 
     def _append_index_row(self, row: Row) -> None:
-        rows = self._read_plain_rows(self.data_dir / INDEX_FILE, INDEX_HEADERS)
+        # 旧：read_plain_rows 全读 + any 查重 + _write_plain_rows 整本重写。
+        # 新：先用 _ensure_index_voucher_set O(1) 查重；非重复时走 openpyxl load+ws.append 增量写。
+        # 失败回退全量重写保持一致性。
         voucher = self._value(row, "入库编号")
-        if any(self._value(existing, "入库编号") == voucher for existing in rows):
-            return
-        rows.append(self._fit_headers(row, INDEX_HEADERS))
-        self._write_plain_rows(self.data_dir / INDEX_FILE, INDEX_HEADERS, rows)
+        if voucher:
+            index_set = self._ensure_index_voucher_set()
+            if voucher in index_set:
+                return
+        path = self.data_dir / INDEX_FILE
+        fitted = self._fit_headers(row, INDEX_HEADERS)
+        try:
+            _ensure_openpyxl()
+            wb = load_workbook(path)
+            try:
+                ws = wb.active
+                ws.append([fitted.get(h, "") for h in INDEX_HEADERS])
+                tmp = path.with_suffix(f".{os.getpid()}.tmp")
+                wb.save(tmp)
+                self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
+                tmp.replace(path)
+            finally:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+        except Exception:
+            # 降级：load 失败 → 全量重写
+            rows = self._read_plain_rows(path, INDEX_HEADERS)
+            rows.append(fitted)
+            self._write_plain_rows(path, INDEX_HEADERS, rows)
+        # 增量维护 _index_voucher_set
+        if self._index_voucher_set is not None and voucher:
+            self._index_voucher_set.add(voucher)
+            try:
+                self._index_voucher_set_mtime = path.stat().st_mtime
+            except OSError:
+                self._index_voucher_set_mtime = -1.0
 
     def _find_index(self, voucher: str) -> Row | None:
         for row in self._read_plain_rows(self.data_dir / INDEX_FILE, INDEX_HEADERS):
@@ -2233,6 +2948,13 @@ class ExcelStore:
     def _delete_index(self, voucher: str) -> None:
         rows = [row for row in self._read_plain_rows(self.data_dir / INDEX_FILE, INDEX_HEADERS) if self._value(row, "入库编号") != voucher]
         self._write_plain_rows(self.data_dir / INDEX_FILE, INDEX_HEADERS, rows)
+        # S3.2: 增量维护
+        if self._index_voucher_set is not None:
+            self._index_voucher_set.discard(voucher)
+            try:
+                self._index_voucher_set_mtime = (self.data_dir / INDEX_FILE).stat().st_mtime
+            except OSError:
+                self._index_voucher_set_mtime = -1.0
 
     def _update_index_fingerprint(self, voucher: str) -> None:
         rows = self._read_plain_rows(self.data_dir / INDEX_FILE, INDEX_HEADERS)
@@ -2544,30 +3266,30 @@ class ExcelStore:
         try:
             if sheet_name not in wb.sheetnames:
                 return []
-            ws = wb[sheet_name]
-            # 同 _read_plain_rows: 流式 iter,不 list() 物化(避免 2GB 机内存峰值)。
-            rows_iter = ws.iter_rows(values_only=True)
-            try:
-                header_row = next(rows_iter)
-            except StopIteration:
-                return []
-            headers = [self._string(value) for value in header_row] or fallback_headers
-            data: list[Row] = []
-            for raw in rows_iter:
-                row: Row = {}
-                for idx, header in enumerate(headers):
-                    if not header:
-                        continue
-                    if idx >= len(raw):
-                        continue
-                    value = self._string(raw[idx])
-                    if value != "":
-                        row[header] = value
-                if row:
-                    data.append(row)
-            return data
+            return self._rows_from_sheet(wb[sheet_name], fallback_headers)
         finally:
             wb.close()
+
+    def _rows_from_sheet(self, ws: Any, fallback_headers: list[str]) -> list[Row]:
+        """Read sparse rows from an already-open worksheet."""
+        rows_iter = ws.iter_rows(values_only=True)
+        try:
+            header_row = next(rows_iter)
+        except StopIteration:
+            return []
+        headers = [self._string(value) for value in header_row] or fallback_headers
+        data: list[Row] = []
+        for raw in rows_iter:
+            row: Row = {}
+            for idx, header in enumerate(headers):
+                if not header or idx >= len(raw):
+                    continue
+                value = self._string(raw[idx])
+                if value != "":
+                    row[header] = value
+            if row:
+                data.append(row)
+        return data
 
     def _write_plain_rows(self, path: Path, headers: list[str], rows: list[Row]) -> None:
         _ensure_openpyxl()
@@ -2582,6 +3304,7 @@ class ExcelStore:
                 ws.append([fitted.get(header, "") for header in headers])
             tmp = path.with_suffix(f".{os.getpid()}.tmp")
             wb.save(tmp)
+            self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
             tmp.replace(path)
         finally:
             try:

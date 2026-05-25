@@ -2,7 +2,7 @@
 
 设计要点：
 - **不影响应用启动**：所有 IO 失败都被静默吞，仅尝试输出到 stderr
-- **跨平台**：路径用 `app_config_dir()`（macOS 走 `~/.specimen_inventory/`，Windows 走 `%APPDATA%\标本入库管理\`）
+- **跨平台**：路径用 `app_config_dir()`（macOS 走 `~/.specimen_inventory/`，Windows 走 `%APPDATA%/标本入库管理/`）
 - **零第三方依赖**：仅用 stdlib (sys / threading / traceback / platform)
 - **不在主线程兜底**：threading.excepthook 也覆盖（Py3.8+），覆盖 QThread 漏抓的异常
 
@@ -210,16 +210,27 @@ def mark_app_exiting_clean() -> None:
         pass
 
 
-def list_recent_crash_logs(limit: int = 5) -> list[Path]:
-    """返回最近 `limit` 个 crash log 路径（按 mtime 倒序）。"""
+def list_recent_crash_logs(limit: int = 5, context: str | None = None) -> list[Path]:
+    """返回最近的 crash log，可按写入时的异常上下文过滤。"""
     cfg = _config_dir()
     if cfg is None or not cfg.exists():
         return []
     try:
-        return sorted(
+        paths = sorted(
             cfg.glob("crash_*.log"),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
-        )[:limit]
+        )
+        if context is not None:
+            marker = f"Context:  {context}"
+            filtered: list[Path] = []
+            for path in paths:
+                try:
+                    if marker in path.read_text(encoding="utf-8", errors="replace")[:2048]:
+                        filtered.append(path)
+                except OSError:
+                    continue
+            paths = filtered
+        return paths[:limit]
     except OSError:
         return []

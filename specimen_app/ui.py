@@ -81,7 +81,6 @@ from .image_cache import ThumbnailCache
 from .image_search import (
     ImageSearchIndex,
     ImageSearchResult,
-    _get_or_build_search_index,
     append_images_to_index,
     clear_image_index,
     default_image_query,
@@ -89,6 +88,7 @@ from .image_search import (
     image_index_exists,
     image_search_results,
     is_supported_image,
+    reconcile_image_index,
     suffixes_for_image_type,
 )
 from .accession_series import AccessionSeries, BUILTIN_PRESETS, format_series_number
@@ -1034,6 +1034,8 @@ _DEFERRED_WORKSPACE = object()
 
 
 class SpecimenWindow(QMainWindow):
+    image_index_updated = pyqtSignal(object)  # list[ImageIndexUpdate]
+
     # voucher_table 列宽/字体基准值（系统默认字号下的原始值）。
     # 全局字体缩放时按 (当前字号 - 默认字号) 的差值同比放大，避免文字被覆盖。
     # 列0(入库编号)基准宽 110:YZZ000001 等 9 字 Consolas 在 85px 下挤,加宽到不截断。
@@ -1125,6 +1127,9 @@ class SpecimenWindow(QMainWindow):
         # 改为有工作区时才创建；未绑定时由 _load_workspace_into_window 首次载入时创建。
         self.search_index: ImageSearchIndex | None = None
         self._index_build_worker: IndexBuildWorker | None = None
+        self._image_index_timer = QTimer(self)
+        self._image_index_timer.setInterval(120000)
+        self._image_index_timer.timeout.connect(self._build_search_index_background)
         if self.workspace_root is not None:
             self.thumbnail_cache = ThumbnailCache(self.workspace_root)
             self._thumb_worker = ThumbnailWorker(self.thumbnail_cache, self)
@@ -1151,6 +1156,7 @@ class SpecimenWindow(QMainWindow):
         self._taxonomy_candidate_rows: dict[str, list[tuple[str, SpeciesMatch | FamilyMatch]]] = {}
 
         self._save_timers: dict[str, QTimer] = {}
+        self._pending_save_fields: dict[str, set[str]] = {}
         # 自动保存开关：True=输入停 0.5s 自动写；False=只在点「保存」按钮时写。工具栏可勾选切换。
         self.auto_save_enabled = load_settings().auto_save_enabled
         self._list_refresh_timer = QTimer(self)
@@ -1229,12 +1235,11 @@ class SpecimenWindow(QMainWindow):
         # 分类预设缺失时显示持久黄色警告条（旧：8 秒状态栏消息，极易错过）。
         if self.matcher is not None and not list(self.matcher.all_rows()):
             self._preset_warning_banner.show()
-        # 旧（v0.5.0 及以前）：启动后 1.2s 自动 _build_search_index_background()，
-        # 用户多数从不开图片搜索却平白多吃 ~20MB + ~1.2s。
-        # 现（规范化软件设计 2026-05 起）：图片索引改为**按需**——open_image_search() 内
-        # 首次打开时 dlg 自带后台 worker 建索引。本启动钩子改为仅触发 gc.collect()
-        # 强制回收 openpyxl 读 Excel 用的临时对象（zip / xml DOM 等），实测可省 10–30MB。
+        # 先让主窗口可交互，再以低优先级维护持久图片索引。检索窗口只读取已有
+        # SQLite 缓存，增量扫描不会阻挡其首次显示。
         QTimer.singleShot(200, self._post_load_gc)
+        QTimer.singleShot(3000, self._build_search_index_background)
+        self._image_index_timer.start()
         # D3+D11+D19 升级中心启动钩子链:
         # 1. arm sentinel 清除定时器(新版活过 30s 视为健康,清掉 sentinel)
         # 2. 1.5s: 检 pending_update 弹"立即安装并重启?"
@@ -1255,11 +1260,10 @@ class SpecimenWindow(QMainWindow):
         # 高档位:__init__ 已立 start,这里跳过。
         if self._thumb_worker is not None and not self._thumb_worker.isRunning():
             QTimer.singleShot(2000, self._thumb_worker.start)
-        # K 章 高档位:数据预热 + 图片索引预建 (低档位不做)
+        # K 章 高档位:仅数据预热；图片索引已统一由后台增量维护器调度。
         if fast:
-            _startup_mark("fast profile: scheduling preheat + search index prebuild")
+            _startup_mark("fast profile: scheduling preheat")
             QTimer.singleShot(500, self._preheat_caches)
-            QTimer.singleShot(1200, self._build_search_index_background)
 
     def _apply_read_only_ui(self) -> None:
         """规范化软件设计 2026-05 多窗口:只读副本禁所有写入 UI。
@@ -1434,6 +1438,9 @@ class SpecimenWindow(QMainWindow):
                 mem_timer.stop()
             except Exception:
                 pass
+        index_timer = getattr(self, "_image_index_timer", None)
+        if index_timer is not None:
+            index_timer.stop()
 
         # E3 helper：wait 超时后强杀，保证主进程一定能退（特别是 Windows 上 QThread 卡死场景）。
         def _stop_worker(worker, wait_ms: int = 2000, label: str = "") -> None:
@@ -1785,6 +1792,12 @@ class SpecimenWindow(QMainWindow):
         self._new_voucher_btn.setToolTip("请先开始录入任务")
         self._new_voucher_btn.clicked.connect(self.new_specimen)
         voucher_layout.addWidget(self._new_voucher_btn)
+        # S2 接管按钮：列出「他人已批量领取但未入库」的编号，批量接管计入本任务工作量。
+        self._takeover_btn = QPushButton("⇩ 接管未入库编号…")
+        self._takeover_btn.setEnabled(False)
+        self._takeover_btn.setToolTip("请先开始录入任务")
+        self._takeover_btn.clicked.connect(self._open_takeover_dialog)
+        voucher_layout.addWidget(self._takeover_btn)
         # 行2：编号系列 标签 + 小下拉框 + 「编号系列管理」按钮 —— 整组居中,
         # 两侧加 addStretch 留白,不再左挤显得拥挤。
         series_row = QHBoxLayout()
@@ -2134,6 +2147,7 @@ class SpecimenWindow(QMainWindow):
         _add(tools_menu, "从 EXIF 批量回填采集日期…", self._bulk_apply_exif)
         tools_menu.addSeparator()
         _add(tools_menu, "降低工作区兼容版本…", self._downgrade_workspace_schema)
+        _add(tools_menu, "清理重复照片关联…", self._clean_duplicate_photo_links)
         tools_menu.addSeparator()
         _add(tools_menu, "打开合并/导入操作示例…", self._open_import_examples)
         tools_menu.addSeparator()
@@ -2607,8 +2621,14 @@ class SpecimenWindow(QMainWindow):
         self.refresh_list()
 
     def _cancel_pending_classification_saves(self, updates: dict[str, str]) -> None:
-        for field in updates:
-            timer = self._save_timers.pop(f"classification:{field}", None)
+        for key, fields in list(self._pending_save_fields.items()):
+            if not key.endswith(":classification"):
+                continue
+            fields.difference_update(updates)
+            if fields:
+                continue
+            self._pending_save_fields.pop(key, None)
+            timer = self._save_timers.pop(key, None)
             if timer is not None:
                 timer.stop()
 
@@ -2634,6 +2654,48 @@ class SpecimenWindow(QMainWindow):
             self._select_voucher_in_table(current)
         self._update_dashboard()
         # 照片关联/取消关联后都会走 refresh_list，借此实时刷新任务指示器的「入库」数。
+        self._update_task_indicator()
+
+    def patch_voucher_row(self, voucher: str, action: str) -> None:
+        """局部刷新主列表（新建/删除/字段变化），避免 refresh_list 全量重读 + 大字典重建。
+
+        旧：new_specimen / delete_specimen / 字段编辑保存后都调 refresh_list() →
+            workspace_overview 流式扫 3 表 + 重建 5 个大字典 + _apply_voucher_filter
+            （5000 行工作区一次 100-500ms 同步阻塞 UI）。
+        新：按 action 仅维护 _all_* 字典对应 voucher 项，然后只调 _apply_voucher_filter
+            重渲染当前页（~5-20ms）。
+
+        action ∈ {"added", "removed", "updated"}
+        """
+        if self.store is None:
+            return
+        if action == "added":
+            if voucher not in self._all_flags:
+                self._all_vouchers.append(voucher)
+            self._all_flags[voucher] = self.store.status_for(voucher)
+            self._all_photo_counts.setdefault(voucher, 0)
+            spec = self.store.get_specimen(voucher) or {}
+            self._all_tube_numbers[voucher] = str(spec.get("管内编号*", ""))
+            self._all_photo_filenames.setdefault(voucher, [])
+        elif action == "removed":
+            if voucher in self._all_vouchers:
+                self._all_vouchers.remove(voucher)
+            self._all_flags.pop(voucher, None)
+            self._all_photo_counts.pop(voucher, None)
+            self._all_tube_numbers.pop(voucher, None)
+            self._all_photo_filenames.pop(voucher, None)
+        else:  # "updated"
+            if voucher in self._all_flags:
+                self._all_flags[voucher] = self.store.status_for(voucher)
+                spec = self.store.get_specimen(voucher) or {}
+                self._all_tube_numbers[voucher] = str(spec.get("管内编号*", ""))
+                photos = self.store.get_photos(voucher)
+                self._all_photo_counts[voucher] = len(photos)
+                self._all_photo_filenames[voucher] = [
+                    str(p.get("文件名", "")) for p in photos if p.get("文件名")
+                ]
+        self._apply_voucher_filter()
+        self._update_dashboard()
         self._update_task_indicator()
 
     def _refresh_series_selector(self) -> None:
@@ -2723,8 +2785,11 @@ class SpecimenWindow(QMainWindow):
             "备注": dlg.note,
             "开始时间": now,
             # 本任务创建的所有入库编号集合。认领数 = len();
-            # 入库数 = 其中已关联照片的个数(实时按 get_photos 计算)。
+            # 入库数 = status_for(v).is_complete 的个数（旧逻辑错用 get_photos(v) 非空，已修）。
             "本任务编号": set(),
+            # S2 新增：本任务接管补完的「他人已领取但未入库」编号；并入入库计数。
+            "接管编号": set(),
+            "接管来源": {},   # voucher -> 原领取人（来自 alloc_log "批量领取" 事件「人员」），供审计
         }
         self.store.log_alloc_event({
             "记录ID": task_id,
@@ -2736,17 +2801,82 @@ class SpecimenWindow(QMainWindow):
         })
         self._update_task_indicator()
 
+    def _open_takeover_dialog(self) -> None:
+        """打开接管未入库编号选择器。
+
+        过滤：排除本任务已新建/已接管，排除「本人即原领取人」的段。
+        接管后若 specimen 行尚未创建，则先 create_specimen_with_voucher 建空行，
+        让用户能在主界面继续填字段。
+        """
+        if self._active_task is None or self.store is None:
+            QMessageBox.information(self, "未开始任务", "请先「开始录入任务」再接管编号。")
+            return
+        self_person = self._active_task.get("人员", "")
+        already_in_task = self._active_task["本任务编号"] | (self._active_task.get("接管编号") or set())
+        try:
+            all_candidates = self.store.list_unfinished_reserved_vouchers()
+        except Exception as exc:
+            QMessageBox.critical(self, "扫描失败", f"读取分发记录失败：{exc}")
+            return
+        # 过滤：排除已在本任务、排除本人领取的（自己领的不需要接管）
+        candidates = [
+            row for row in all_candidates
+            if row[0] not in already_in_task
+            and (row[1] or "") != self_person
+        ]
+        if not candidates:
+            QMessageBox.information(
+                self, "没有可接管编号",
+                "目前没有「他人已领取但未入库」的编号可接管。\n\n"
+                "（按 (voucher, 状态) 判定：specimen 必填 / 至少 1 张照片 / 分类必填 全 OK 即视为入库完成）",
+            )
+            return
+        dlg = TakeoverPickerDialog(self, candidates)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        added_count = 0
+        for voucher, reserver, _ts in dlg.selected:
+            try:
+                if self.store.get_specimen(voucher) is None:
+                    # 接管时如果 voucher 还没建 specimen 行（仅在 alloc_log 预留段内），先建空行
+                    self.store.create_specimen_with_voucher(voucher)
+                    self.patch_voucher_row(voucher, "added")
+                self._active_task["接管编号"].add(voucher)
+                self._active_task["接管来源"][voucher] = reserver
+                added_count += 1
+            except Exception as exc:
+                QMessageBox.warning(self, "接管失败", f"接管 {voucher} 失败：{exc}")
+        self._update_task_indicator()
+        QMessageBox.information(
+            self, "接管完成",
+            f"已接管 {added_count} 个未入库编号到本任务。\n"
+            "请在主界面填完字段（必填 / 照片 / 分类），完成入库后将计入本任务的「入库」数。",
+        )
+
     def _end_task(self) -> None:
         if self._active_task is None:
             return
         from datetime import datetime as _dt
+        # S2: 任务结束时同时记录「新建数量 / 接管数量 / 完成入库数 / 接管编号」4 列；
+        # 「数量」字段口径保持「认领数=本任务新建数」，旧报表向后兼容。
+        created = self._active_task["本任务编号"]
+        taken_over = self._active_task.get("接管编号") or set()
+        all_handled = created | taken_over
+        ingested = sum(
+            1 for v in all_handled
+            if self.store is not None and self.store.is_voucher_ingestion_complete(v)
+        )
         self.store.log_alloc_event({
             "记录ID": self._active_task["记录ID"] + "_end",
             "时间": _dt.now().isoformat(timespec="seconds"),
             "类型": "任务结束",
             "人员": self._active_task["人员"],
-            "数量": str(len(self._active_task["本任务编号"])),
+            "数量": str(len(created)),
             "关联任务ID": self._active_task["记录ID"],
+            "新建数量": str(len(created)),
+            "接管数量": str(len(taken_over)),
+            "完成入库数": str(ingested),
+            "接管编号": ";".join(sorted(taken_over)),
         })
         self._active_task = None
         self._update_task_indicator()
@@ -2760,18 +2890,25 @@ class SpecimenWindow(QMainWindow):
         if self._active_task:
             person = self._active_task["人员"]
             purpose = self._active_task["用途"]
-            # 用途词转状态形式（入库→入库中），与后面计数「入库 M」区分开。
+            # 用途词转状态形式（入库→入库中），与后面计数「入库 K」区分开。
             status = f"{purpose}中" if purpose in ("入库", "整理", "核查") else (purpose or "录入中")
-            # 认领 = 本任务创建的编号数;入库 = 其中已关联照片的编号数。
-            # 新增编号只认领,关联照片后才算入库 —— 实时按 get_photos 计算。
-            vouchers = self._active_task["本任务编号"]
-            claimed = len(vouchers)
+            # S2.1bis 修复：
+            # 旧：入库 = 本任务编号中 get_photos(v) 非空的个数 —— 只看挂没挂照片，
+            #     即使必填字段全空、分类全空也算入库 → 严重高估工作量。
+            # 新：入库 = (本任务编号 ∪ 接管编号) 中 status_for(v).is_complete 的个数
+            #     （specimen 必填 + 照片 + 分类必填 全 OK）。
+            created = self._active_task["本任务编号"]
+            taken_over = self._active_task.get("接管编号") or set()
+            all_handled = created | taken_over
+            claimed = len(created)
+            taken = len(taken_over)
             ingested = sum(
-                1 for v in vouchers
-                if self.store is not None and self.store.get_photos(v)
+                1 for v in all_handled
+                if self.store is not None and self.store.is_voucher_ingestion_complete(v)
             )
+            extra = f" · 接管 {taken}" if taken else ""
             self._task_label.setText(
-                f"● {person} · {status} · 认领 {claimed} · 入库 {ingested}"
+                f"● {person} · {status} · 认领 {claimed}{extra} · 入库 {ingested}"
             )
             self._task_label.setStyleSheet("color: #1a7a1a; font-weight: bold;")
             self._task_indicator.setStyleSheet("#task_indicator { background: #d4edda; border-radius: 3px; }")
@@ -2779,6 +2916,9 @@ class SpecimenWindow(QMainWindow):
             self._task_end_btn.setVisible(True)
             self._new_voucher_btn.setEnabled(True)
             self._new_voucher_btn.setToolTip("")
+            if hasattr(self, "_takeover_btn"):
+                self._takeover_btn.setEnabled(True)
+                self._takeover_btn.setToolTip("接管他人已领取但未入库的编号，补完后计入本任务的入库数")
         else:
             self._task_label.setText("未开始任务")
             self._task_label.setStyleSheet("color: #888;")
@@ -2787,6 +2927,9 @@ class SpecimenWindow(QMainWindow):
             self._task_end_btn.setVisible(False)
             self._new_voucher_btn.setEnabled(False)
             self._new_voucher_btn.setToolTip("请先开始录入任务")
+            if hasattr(self, "_takeover_btn"):
+                self._takeover_btn.setEnabled(False)
+                self._takeover_btn.setToolTip("请先开始录入任务")
 
     def _open_batch_generate(self) -> None:
         if self.store is None:
@@ -3195,11 +3338,14 @@ class SpecimenWindow(QMainWindow):
             return
         try:
             from .env_detect import current_rss_mb
+            from .env_detect import memory_profile_params
             from .app_settings import load_settings, MEMORY_PROFILE_OPTIONS
             profile = load_settings().memory_profile
             display_full = MEMORY_PROFILE_OPTIONS.get(profile, profile)
             # 取首段(空格前) — "极低 / 低 / 自动 / 高 / 极高"
             display = display_full.split(" ")[0] if display_full else profile
+            if profile == "auto" and memory_profile_params(profile).get("preview_max_size"):
+                display = "自动(低内存)"
             rss = current_rss_mb()
             rss_txt = f"{rss}MB" if rss is not None else "?"
             label.setText(f"档位:{display} | RSS:{rss_txt}")
@@ -3293,11 +3439,14 @@ class SpecimenWindow(QMainWindow):
         if self._loading or not self.current_voucher:
             return
         voucher = self.current_voucher
-        key = f"{category}:{field}"
+        # 同一编号同一面板的连续编辑共用一次落盘。Excel 持久化包含多本 xlsx
+        # 的原子替换，在 WSL + Windows 挂载目录中单次就可能耗时数百毫秒。
+        key = f"{voucher}:{category}"
+        self._pending_save_fields.setdefault(key, set()).add(field)
         if key not in self._save_timers:
             timer = QTimer(self)
             timer.setSingleShot(True)
-            timer.timeout.connect(lambda v=voucher, c=category, f=field: self.save_field(c, f, v))
+            timer.timeout.connect(lambda k=key, v=voucher, c=category: self._save_pending_group(k, v, c))
             self._save_timers[key] = timer
         # 旧逻辑：无条件 start(500) 自动保存。现按开关：自动保存关时 timer 仅登记不启动，
         # 这样手动「保存」按钮的 _flush_pending_saves 仍能把改动捞出来写（关开关照样能存）。
@@ -3308,19 +3457,79 @@ class SpecimenWindow(QMainWindow):
         for timer in self._save_timers.values():
             timer.stop()
         self._save_timers.clear()
+        self._pending_save_fields.clear()
 
     def _flush_pending_saves(self, category: str | None = None) -> int:
         saved = 0
         for key, timer in list(self._save_timers.items()):
-            if category is not None and not key.startswith(category + ":"):
+            voucher, key_category = key.rsplit(":", 1)
+            if category is not None and key_category != category:
                 continue
             timer.stop()
-            parts = key.split(":", 1)
-            if len(parts) == 2:
-                self.save_field(parts[0], parts[1], self.current_voucher)
-                saved += 1
-            self._save_timers.pop(key, None)
+            saved += self._save_pending_group(key, voucher, key_category)
         return saved
+
+    def _save_pending_group(self, key: str, voucher: str, category: str) -> int:
+        timer = self._save_timers.pop(key, None)
+        if timer is not None:
+            timer.stop()
+        fields = self._pending_save_fields.pop(key, set())
+        if not fields or voucher != self.current_voucher:
+            return 0
+        if category in ("specimen", "classification"):
+            self._save_text_fields(category, fields, voucher)
+        else:
+            for field in sorted(fields):
+                self.save_field(category, field, voucher)
+        return len(fields)
+
+    def _save_text_fields(self, category: str, fields: set[str], voucher: str) -> None:
+        try:
+            if category == "specimen":
+                updates = {}
+                for field in fields:
+                    widget = self.specimen_widgets[field]
+                    updates[field] = widget.currentText() if isinstance(widget, QComboBox) else widget.text()
+                changed = self.store.set_fields("specimen", voucher, updates)
+                if changed:
+                    specimen = self.store.get_specimen(voucher) or {}
+                    self._loading = True
+                    try:
+                        for auto_field in ("采集日期", "采集地点缩写*", "保存方式"):
+                            widget = self.specimen_widgets[auto_field]
+                            widget.blockSignals(True)
+                            value = str(specimen.get(auto_field, ""))
+                            if isinstance(widget, QComboBox):
+                                widget.setCurrentText(value)
+                            else:
+                                widget.setText(value)
+                            widget.blockSignals(False)
+                    finally:
+                        self._loading = False
+            else:
+                updates = {field: self.class_widgets[field].text() for field in fields}
+                self.store.set_fields("classification", voucher, updates)
+            self.patch_voucher_row(voucher, "updated")
+        except Exception as exc:
+            try:
+                row = (
+                    self.store.get_specimen(voucher)
+                    if category == "specimen"
+                    else self.store.get_classification(voucher)
+                ) or {}
+                widgets = self.specimen_widgets if category == "specimen" else self.class_widgets
+                for field in fields:
+                    widget = widgets[field]
+                    widget.blockSignals(True)
+                    stored = str(row.get(field, ""))
+                    if isinstance(widget, QComboBox):
+                        widget.setCurrentText(stored)
+                    else:
+                        widget.setText(stored)
+                    widget.blockSignals(False)
+            except Exception:
+                pass
+            QMessageBox.critical(self, "保存失败", str(exc))
 
     def save_field(self, category: str, field: str, voucher: str | None = None) -> None:
         if voucher is None:
@@ -3368,7 +3577,11 @@ class SpecimenWindow(QMainWindow):
                     if cell is not None and self.current_photo_index < len(self.current_photos):
                         cell.set_filename(str(self.current_photos[self.current_photo_index].get("文件名", "")))
                     self._refresh_image_index_after_photo_change()
-            self._schedule_list_refresh()
+            # 旧：_schedule_list_refresh() 300ms 后调 refresh_list() 全量重读 3 表。
+            # 新：直接 patch_voucher_row("updated") 仅刷新本 voucher 的 flags/tube/photo 计数；
+            # 单点改动不再触发整张表重建。
+            if voucher:
+                self.patch_voucher_row(voucher, "updated")
         except Exception as exc:
             # Roll back widget to last-known-good value from the store
             try:
@@ -3458,8 +3671,9 @@ class SpecimenWindow(QMainWindow):
                 self.store.set_fields("specimen", voucher, carry)
             if self._active_task:
                 self._active_task["本任务编号"].add(voucher)
-                self._update_task_indicator()
-            self.refresh_list()
+            # 旧：调 self.refresh_list() 全量重读 3 表 + 重建 5 个大字典，5000 行 100-500ms。
+            # 新：patch_voucher_row 仅维护新 voucher 项，再 _apply_voucher_filter 重渲染当前页（~5-20ms）。
+            self.patch_voucher_row(voucher, "added")
             self.select_voucher(voucher)
         except Exception as exc:
             QMessageBox.critical(self, "新增失败", str(exc))
@@ -3482,7 +3696,9 @@ class SpecimenWindow(QMainWindow):
         count = self.store.clear_photos(self.current_voucher)
         self.statusBar().showMessage(f"已清除 {self.current_voucher} 的 {count} 张照片关联", 3000)
         self._refresh_image_index_after_photo_change()
-        self.reload_current()
+        voucher = self.current_voucher
+        self.patch_voucher_row(voucher, "updated")
+        self.select_voucher(voucher)
 
     def _voucher_context_menu(self, pos) -> None:
         """右键菜单：单行操作 + 多选批量删除。"""
@@ -3559,7 +3775,9 @@ class SpecimenWindow(QMainWindow):
         count = self.store.clear_photos(voucher)
         self.statusBar().showMessage(f"已清除 {voucher} 的 {count} 张照片关联", 3000)
         self._refresh_image_index_after_photo_change()
-        self.reload_current()
+        self.patch_voucher_row(voucher, "updated")
+        if self.current_voucher == voucher:
+            self.select_voucher(voucher)
 
     def _open_data_in_excel(self) -> None:
         """用 Excel 打开数据目录里的 xlsx（密码门 + 风险提示 + 可选快照）。
@@ -3831,6 +4049,65 @@ class SpecimenWindow(QMainWindow):
             "下次用新版软件打开时，版本会自动升回最新。",
         )
 
+    def _clean_duplicate_photo_links(self) -> None:
+        """工具菜单入口：批量清理 照片信息.xlsx 中按 (voucher, SHA256, 原始文件名)
+        分组的重复行；保留「已归档 > 仅记录」，同级取归档时间最早。
+
+        历史脏数据来源：早期 add_photo 未查重，用户对同一物理照片以两种 photo_management_mode
+        关联两次会产生 SHA256 相同但 归档状态 不同的两行（ImageSearchDialog 显示一已关联一未关联）。
+        新版 add_photo 已加查重，本工具用于一次性清理历史数据。
+        """
+        store = getattr(self, "store", None)
+        if store is None:
+            QMessageBox.information(self, "未选择工作区", "请先选择工作区再使用此功能。")
+            return
+        try:
+            preview = store.dedupe_photo_links(dry_run=True)
+        except Exception as exc:
+            QMessageBox.critical(self, "扫描失败", f"无法扫描照片重复：{exc}")
+            return
+        if preview["groups"] == 0:
+            QMessageBox.information(
+                self, "无需清理",
+                "未发现重复的照片关联（按 入库编号 + 文件SHA256 + 原始文件名 判定）。",
+            )
+            return
+        password, ok = QInputDialog.getText(
+            self, "清理重复照片关联",
+            f"扫描发现 {preview['groups']} 组重复，预计将删除 {preview['removed']} 条重复行。\n\n"
+            "操作前会自动创建数据快照（出问题可走「版本管理 → 数据版本」回退）。\n"
+            "本操作不可单步撤销（撤回菜单不会出现对应记录）。\n\n"
+            "请输入管理密码以继续：",
+            QLineEdit.Password,
+        )
+        if not ok or not password:
+            return
+        if password != ADMIN_PASSWORD:
+            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
+            return
+        answer = QMessageBox.question(
+            self, "确认清理",
+            f"即将合并 {preview['groups']} 组重复，删除 {preview['removed']} 条多余的照片记录行。\n\n"
+            "保留规则：归档状态「已归档」优先于「仅记录」；同级取归档时间最早。\n"
+            "继续吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            summary = store.dedupe_photo_links()
+        except Exception as exc:
+            QMessageBox.critical(self, "清理失败", f"操作失败：{exc}")
+            return
+        QMessageBox.information(
+            self, "清理完成",
+            f"已合并 {summary['groups']} 组，删除 {summary['removed']} 条重复行。\n\n"
+            "如需复原可通过「版本管理 → 数据版本」回退到本次操作前的快照。",
+        )
+        self.refresh_list()
+        if self.current_voucher:
+            self.select_voucher(self.current_voucher)
+
     def _context_delete_voucher(self, voucher: str) -> None:
         password, ok = QInputDialog.getText(
             self, "删除入库编号",
@@ -3852,7 +4129,8 @@ class SpecimenWindow(QMainWindow):
             return
         self.store.delete_specimen(voucher)
         self.current_voucher = None
-        self.refresh_list()
+        # 旧：refresh_list() 全量重读 3 表。新：patch_voucher_row("removed") 仅移除该 voucher 项。
+        self.patch_voucher_row(voucher, "removed")
         vouchers = self.store.list_vouchers()
         if vouchers:
             self.select_voucher(vouchers[0])
@@ -3981,7 +4259,7 @@ class SpecimenWindow(QMainWindow):
         self.current_photo_index = max(0, len(self.current_photos) - 1)
         self.refresh_photo_table()
         self.load_current_photo()
-        self.refresh_list()
+        self.patch_voucher_row(self.current_voucher, "updated")
         self._show_skipped_photos(skipped)
         return added
 
@@ -4056,7 +4334,7 @@ class SpecimenWindow(QMainWindow):
             self.refresh_photo_table()
             self.load_current_photo()
         self._append_added_photos_to_image_index(rows)
-        self.refresh_list()
+        self.patch_voucher_row(voucher, "updated")
         self._show_skipped_photos(skipped)
         self.statusBar().showMessage(f"已关联 {len(rows)} 张照片")
 
@@ -4153,7 +4431,7 @@ class SpecimenWindow(QMainWindow):
             self._grid_mode_before_expand = ""
         self.refresh_photo_table()
         self.load_current_photo()
-        self.refresh_list()
+        self.patch_voucher_row(self.current_voucher, "updated")
         self._refresh_image_index_after_photo_change()
 
     def shift_photo(self, delta: int) -> None:
@@ -4282,6 +4560,18 @@ class SpecimenWindow(QMainWindow):
             self.photo_table.blockSignals(False)
             QMessageBox.critical(self, "保存失败", str(exc))
 
+    def _add_write_action_to_menu(self, menu: QMenu, label: str, callback) -> QAction:
+        """plan A2 helper: add a menu action that is disabled when the window is in read-only mode.
+
+        Read-only副本下所有"修改/取消关联/移动/重命名"动作必须 setEnabled(False)，
+        不能让用户点完才发现 store 抛 PermissionError。复用本 helper 统一处理。
+        """
+        action = menu.addAction(label, callback)
+        if self.read_only:
+            action.setEnabled(False)
+            action.setToolTip("只读副本：禁用写入操作。请在主窗口操作。")
+        return action
+
     def _photo_table_context_menu(self, pos) -> None:
         clicked = self.photo_table.itemAt(pos)
         if clicked is not None and not clicked.isSelected():
@@ -4306,20 +4596,21 @@ class SpecimenWindow(QMainWindow):
                 fill_action.setShortcut(self._photo_filename_fill_action.shortcut())
         menu.addSeparator()
         if len(rows) == 1:
-            menu.addAction("编辑文件名", lambda: self._edit_photo_table_cell(real_rows[0], 1))
-            menu.addAction("编辑描述", lambda: self._edit_photo_table_cell(real_rows[0], 3))
+            # plan A2: 写动作通过 _add_write_action_to_menu 注入只读判断
+            self._add_write_action_to_menu(menu, "编辑文件名", lambda: self._edit_photo_table_cell(real_rows[0], 1))
+            self._add_write_action_to_menu(menu, "编辑描述", lambda: self._edit_photo_table_cell(real_rows[0], 3))
             menu.addSeparator()
             menu.addAction("打开原图", lambda: self.open_current_photo_external(real_rows[0]))
             menu.addAction("打开原图所在位置", lambda: self.open_photo_location(real_rows[0]))
-            menu.addAction("替换此照片", self._replace_current_photo)
+            self._add_write_action_to_menu(menu, "替换此照片", self._replace_current_photo)
             # 旧标签「删除此照片」/「删除选中的 N 张照片」——实为取消关联，原始照片不动。
-            menu.addAction("取消关联此照片", self.delete_photo)
+            self._add_write_action_to_menu(menu, "取消关联此照片", self.delete_photo)
         else:
-            menu.addAction(f"取消关联选中的 {len(rows)} 张照片", self._delete_selected_photos)
+            self._add_write_action_to_menu(menu, f"取消关联选中的 {len(rows)} 张照片", self._delete_selected_photos)
         # 「移动到其他编号」：原本只有工具栏「分配入库编号」入口，入库汇总精简后
         # 把照片「移动到」能力补进右键菜单（复用已存在的 _assign_voucher_to_selected）。
         menu.addSeparator()
-        menu.addAction("移动到其他编号", self._assign_voucher_to_selected)
+        self._add_write_action_to_menu(menu, "移动到其他编号", self._assign_voucher_to_selected)
         menu.exec_(self.photo_table.viewport().mapToGlobal(pos))
 
     def _copy_photo_filename(self, real_idx: int) -> None:
@@ -4409,7 +4700,7 @@ class SpecimenWindow(QMainWindow):
             self.current_photos = self.store.get_photos(self.current_voucher)
             self.refresh_photo_table()
             self.load_current_photo()
-            self.refresh_list()
+            self.patch_voucher_row(self.current_voucher, "updated")
             self._append_added_photos_to_image_index([new_row])
             self._refresh_image_index_after_photo_change()
 
@@ -4444,14 +4735,29 @@ class SpecimenWindow(QMainWindow):
         self.current_photo_index = min(self.current_photo_index, max(0, len(self.current_photos) - 1))
         self.refresh_photo_table()
         self.load_current_photo()
-        self.refresh_list()
+        self.patch_voucher_row(self.current_voucher, "updated")
 
     # ---- Photo rendering ----
 
     def _preview_size(self) -> tuple[int, int] | None:
         if not hasattr(self, '_cached_preview_quality'):
             self._cached_preview_quality = load_settings().preview_quality
-        return PREVIEW_QUALITY_SIZES.get(self._cached_preview_quality, (800, 600))
+        selected_size = PREVIEW_QUALITY_SIZES.get(self._cached_preview_quality, (800, 600))
+        try:
+            from .env_detect import memory_profile_params
+            profile = load_settings().memory_profile
+            max_size = memory_profile_params(profile).get("preview_max_size")
+        except Exception:
+            max_size = None
+        # 低内存档将单张预览限制在压缩尺寸，避免用户历史设置为“原始质量”时仍将
+        # 大 QPixmap 常驻内存；选择高档位可明确解除此保护。
+        if max_size and (
+            selected_size is None
+            or selected_size[0] > max_size[0]
+            or selected_size[1] > max_size[1]
+        ):
+            return max_size
+        return selected_size
 
     def _is_grid_mode(self) -> bool:
         return self._view_mode != "单张"
@@ -4714,10 +5020,11 @@ class SpecimenWindow(QMainWindow):
             menu.addAction("放大显示", lambda: self.enlarge_photo_from_grid(idx))
             menu.addAction("打开原图", lambda: self.open_current_photo_external(idx))
             menu.addAction("打开原图所在位置", lambda: self.open_photo_location(idx))
-            menu.addAction("替换此照片", self._replace_current_photo)
+            # plan A2: 写动作经 _add_write_action_to_menu 注入只读判断
+            self._add_write_action_to_menu(menu, "替换此照片", self._replace_current_photo)
             # 旧标签「删除此照片」——实为取消关联（原始照片不动）。
-            menu.addAction("取消关联此照片", lambda: self.delete_photo_at(idx))
-            menu.addAction("移动到其他编号", self._assign_voucher_to_selected)
+            self._add_write_action_to_menu(menu, "取消关联此照片", lambda: self.delete_photo_at(idx))
+            self._add_write_action_to_menu(menu, "移动到其他编号", self._assign_voucher_to_selected)
             menu.addSeparator()
             fill_action = menu.addAction("从照片文件名填充标本信息", lambda: self.fill_photo_from_filename(idx))
             if self._photo_filename_fill_action is not None:
@@ -4726,8 +5033,8 @@ class SpecimenWindow(QMainWindow):
             menu.addAction("复制绝对路径", lambda: self.copy_photo_absolute_path(idx))
         else:
             menu.addAction("打开原图", lambda: self.open_current_photo_external(indices[0]))
-            menu.addAction(f"取消关联选中的 {len(indices)} 张照片", self._delete_selected_photos)
-            menu.addAction("移动到其他编号", self._assign_voucher_to_selected)
+            self._add_write_action_to_menu(menu, f"取消关联选中的 {len(indices)} 张照片", self._delete_selected_photos)
+            self._add_write_action_to_menu(menu, "移动到其他编号", self._assign_voucher_to_selected)
         menu.exec_(event.globalPos())
 
     def _show_single_preview_context_menu(self, global_pos) -> None:
@@ -4740,10 +5047,11 @@ class SpecimenWindow(QMainWindow):
         menu = QMenu(self)
         menu.addAction("打开原图", lambda: self.open_current_photo_external(idx))
         menu.addAction("打开原图所在位置", lambda: self.open_photo_location(idx))
-        menu.addAction("替换此照片", self._replace_current_photo)
+        # plan A2: 写动作经 _add_write_action_to_menu 注入只读判断
+        self._add_write_action_to_menu(menu, "替换此照片", self._replace_current_photo)
         # 旧标签「删除此照片」——实为取消关联（原始照片不动）。
-        menu.addAction("取消关联此照片", lambda: self.delete_photo_at(idx))
-        menu.addAction("移动到其他编号", self._assign_voucher_to_selected)
+        self._add_write_action_to_menu(menu, "取消关联此照片", lambda: self.delete_photo_at(idx))
+        self._add_write_action_to_menu(menu, "移动到其他编号", self._assign_voucher_to_selected)
         menu.addSeparator()
         fill_action = menu.addAction("从照片文件名填充标本信息", lambda: self.fill_photo_from_filename(idx))
         if self._photo_filename_fill_action is not None:
@@ -4782,10 +5090,12 @@ class SpecimenWindow(QMainWindow):
         if not ok:
             return
         voucher = voucher.strip()
+        created_target = False
         if not voucher:
             # Create new voucher
             try:
                 voucher = self.store.create_specimen()
+                created_target = True
             except Exception as exc:
                 QMessageBox.critical(self, "创建失败", str(exc))
                 return
@@ -4798,7 +5108,10 @@ class SpecimenWindow(QMainWindow):
         self.current_photo_index = min(self.current_photo_index, max(0, len(self.current_photos) - 1))
         self.refresh_photo_table()
         self.load_current_photo()
-        self.refresh_list()
+        source_voucher = self.current_voucher or ""
+        if source_voucher:
+            self.patch_voucher_row(source_voucher, "updated")
+        self.patch_voucher_row(voucher, "added" if created_target else "updated")
         self.statusBar().showMessage(f"已将 {moved} 张照片分配给 {voucher}", 5000)
 
     def _save_panel(self, category: str) -> None:
@@ -4973,6 +5286,15 @@ class SpecimenWindow(QMainWindow):
 
     def _on_grid_drop(self, event) -> None:
         self.grid_frame.setStyleSheet("")
+        # plan A2: 拖入照片是隐性写入入口，只读副本下必须挡住
+        if self.read_only:
+            QMessageBox.information(
+                self,
+                "只读副本",
+                "只读副本禁止导入照片。请在主窗口操作。",
+            )
+            event.ignore()
+            return
         paths = []
         for url in event.mimeData().urls():
             if url.isLocalFile():
@@ -5020,13 +5342,15 @@ class SpecimenWindow(QMainWindow):
         progress_dlg.show()
         QApplication.processEvents()
         try:
-            result = self.store.import_workspace(source)
+            result = self.store.import_workspace(source, photo_duplicate_policy="report")
             progress_dlg.close()
             # 原代码导入后保留旧图片索引;新导入照片或图谱目录需要重新建索引才能被检索到。
             self.search_index = None
             clear_image_index()
             QTimer.singleShot(200, self._build_search_index_background)
             message = f"导入 {result.imported} 个标本,跳过 {result.skipped} 个重复记录,关联照片 {result.photos_imported} 张。"
+            if result.duplicate_candidates:
+                message += f"\n已跳过 {len(result.duplicate_candidates)} 张已关联其他入库编号的重复照片。"
             if result.report_path:
                 message += f"\n缺失照片报告:{result.report_path}"
             QMessageBox.information(self, "导入完成", message)
@@ -5591,6 +5915,7 @@ class SpecimenWindow(QMainWindow):
         self.search_index = None
         clear_image_index()
         QTimer.singleShot(300, self._build_search_index_background)
+        self._image_index_timer.start()
         if self._thumb_worker is not None:
             self._thumb_worker.stop()
         self._thumb_worker = ThumbnailWorker(self.thumbnail_cache, self)
@@ -5657,19 +5982,27 @@ class SpecimenWindow(QMainWindow):
     # ---- Search index ----
 
     def _build_search_index_background(self, force_rebuild: bool = False) -> None:
-        """Build the image search index in the background after startup."""
-        if self._is_closing or self._index_build_worker is not None:
+        """Incrementally reconcile the default and saved search scopes."""
+        if self._is_closing or self.workspace_root is None or self._index_build_worker is not None:
             return
-        self._index_build_worker = IndexBuildWorker(self.workspace_root, self, force_rebuild=force_rebuild)
+        if self._import_job_active or self._save_timers:
+            QTimer.singleShot(3000, self._build_search_index_background)
+            return
+        scopes: list[list[str] | None] = [None]
+        for path in load_settings().search_paths:
+            if Path(path).is_dir() and [path] not in scopes:
+                scopes.append([path])
+        self._index_build_worker = IndexBuildWorker(self.workspace_root, scopes, self)
         self._index_build_worker.index_ready.connect(self._on_index_ready)
         self._index_build_worker.finished.connect(
             lambda: setattr(self, "_index_build_worker", None)
         )
-        self._index_build_worker.start()
+        self._index_build_worker.start(QThread.LowPriority)
 
-    def _on_index_ready(self, index: ImageSearchIndex | None) -> None:
-        self.search_index = index
-        _startup_mark("image search index ready")
+    def _on_index_ready(self, updates: list[object]) -> None:
+        self.search_index = None
+        self.image_index_updated.emit(updates)
+        _startup_mark("image search index reconciliation ready")
 
     # ---- Version manager ----
 
@@ -6175,12 +6508,15 @@ class SpecimenWindow(QMainWindow):
                 from .env_detect import memory_profile_params
                 params = memory_profile_params(current_settings.memory_profile)
                 if self.thumbnail_cache is not None:
-                    self.thumbnail_cache.memory_limit_bytes = params["thumb_cache_bytes"]
+                    self.thumbnail_cache.set_memory_limit(params["thumb_cache_bytes"])
                 if self.store is not None:
                     self.store._row_cache_maxsize = params["row_cache_maxsize"]
                     self.store._enforce_row_cache_size()
             except Exception:
                 pass
+            # 预览质量或低内存上限刚发生变化时，立即替换当前可能仍常驻的大预览图。
+            if self.current_photos:
+                self.load_current_photo()
             # 立即刷新状态栏档位显示
             if hasattr(self, "_refresh_memory_status"):
                 self._refresh_memory_status()
@@ -6349,39 +6685,50 @@ IMAGE_TYPE_CHOICES = [
 
 
 class IndexBuildWorker(QThread):
-    """Background worker that builds the image search index at startup."""
+    """Low-priority worker that reconciles one or more persistent index scopes."""
 
-    index_ready = pyqtSignal(object)  # ImageSearchIndex | None
+    index_ready = pyqtSignal(object)  # list[ImageIndexUpdate]
 
-    def __init__(self, workspace_root: Path, parent=None, force_rebuild: bool = False):
+    def __init__(self, workspace_root: Path, scopes: list[list[str] | None], parent=None):
         super().__init__(parent)
         self.workspace_root = workspace_root
-        self.force_rebuild = force_rebuild
+        self.scopes = scopes
+
+    def run(self) -> None:
+        updates = []
+        try:
+            for scope in self.scopes:
+                if self.isInterruptionRequested():
+                    break
+                updates.append(
+                    reconcile_image_index(
+                        self.workspace_root,
+                        extra_roots=scope,
+                        should_stop=self.isInterruptionRequested,
+                    )
+                )
+        except Exception:
+            pass
+        self.index_ready.emit(updates)
+
+
+class PhotoSearchContextWorker(QThread):
+    """Build photo-link display maps without delaying dialog presentation."""
+
+    result_ready = pyqtSignal(object, object, object)
+
+    def __init__(self, store: ExcelStore, parent=None):
+        super().__init__(parent)
+        self.store = store
 
     def run(self) -> None:
         try:
-            photo_dir = Path(self.workspace_root).resolve() / "照片"
-            if photo_dir.is_dir():
-                roots = [photo_dir]
-                scan_depth = 0  # 专用照片目录，深度不限
-            else:
-                # 原代码：照片目录不存在时 fallback 扫整个工作区且 max_depth=0（无限深度）。
-                # 若工作区本身是个巨大目录，会遍历海量文件、拖垮整机。fallback 改为有界深度。
-                roots = [Path(self.workspace_root).resolve()]
-                scan_depth = 4
-            if self.isInterruptionRequested():
-                self.index_ready.emit(None)
-                return
-            index = _get_or_build_search_index(
-                roots,
-                max_depth=scan_depth,
-                should_stop=self.isInterruptionRequested,
-                force_rebuild=self.force_rebuild,
-                cache_root=self.workspace_root,
-            )
-            self.index_ready.emit(index)
-        except Exception:
-            self.index_ready.emit(None)
+            vouchers = self.store.get_all_photo_voucher_map()
+            aliases = self.store.get_photo_search_alias_map()
+        except Exception as exc:
+            self.result_ready.emit({}, {}, exc)
+        else:
+            self.result_ready.emit(vouchers, aliases, None)
 
 
 class ImageSearchWorker(QThread):
@@ -6402,6 +6749,7 @@ class ImageSearchWorker(QThread):
         force_rebuild: bool = False,
         limit: int = 50,
         path_to_vouchers: dict[str, list[str]] | None = None,
+        canonical_photo_paths: dict[str, str] | None = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -6418,6 +6766,7 @@ class ImageSearchWorker(QThread):
         self.force_rebuild = force_rebuild
         self.limit = limit
         self.path_to_vouchers = path_to_vouchers
+        self.canonical_photo_paths = canonical_photo_paths
 
     def run(self) -> None:
         try:
@@ -6435,6 +6784,7 @@ class ImageSearchWorker(QThread):
                 search_index=self.search_index,
                 force_rebuild=self.force_rebuild,
                 path_to_vouchers=self.path_to_vouchers,
+                canonical_photo_paths=self.canonical_photo_paths,
             )
         except Exception as exc:
             self.result_ready.emit(self.token, [], exc)
@@ -6457,6 +6807,10 @@ class ImageSearchDialog(QDialog):
         self._render_token = 0
         self._search_token = 0
         self._search_workers: list[ImageSearchWorker] = []
+        self._context_worker: PhotoSearchContextWorker | None = None
+        self._scope_index_worker: IndexBuildWorker | None = None
+        self._path_to_vouchers: dict[str, list[str]] = {}
+        self._canonical_photo_paths: dict[str, str] = {}
         self._card_labels: dict[int, QLabel] = {}
         self._cards: list[QFrame] = []
         self._thumb_worker = ThumbnailWorker(app.thumbnail_cache, self)
@@ -6464,7 +6818,8 @@ class ImageSearchDialog(QDialog):
         self._thumb_worker.start()
 
         self._build()
-        self.refresh_results()
+        self.app.image_index_updated.connect(self._on_automatic_index_updated)
+        QTimer.singleShot(0, self._start_dialog_work)
 
     def _build(self) -> None:
         layout = QVBoxLayout(self)
@@ -6496,7 +6851,7 @@ class ImageSearchDialog(QDialog):
         self.path_combo.setEditable(True)
         self.path_combo.addItems(self._default_search_paths())
         self.path_combo.setToolTip("输入自定义路径（可用 ; 分隔多个路径），或选择预设")
-        self.path_combo.currentTextChanged.connect(self.schedule_refresh)
+        self.path_combo.currentTextChanged.connect(self._on_search_path_changed)
         path_row.addWidget(self.path_combo, stretch=1)
         path_row.addWidget(QLabel("类型"))
         self.type_combo = QComboBox()
@@ -6552,16 +6907,74 @@ class ImageSearchDialog(QDialog):
         if d:
             if self.path_combo.findText(d) < 0:
                 self.path_combo.addItem(d)
+            settings = load_settings()
+            if d not in settings.search_paths:
+                settings.search_paths.append(d)
+                save_settings(settings)
             self.path_combo.setCurrentText(d)
 
     def _reset_search_paths(self) -> None:
         self.path_combo.setCurrentText(DEFAULT_PHOTO_SCOPE)
 
     def _clear_index_cache(self) -> None:
-        clear_image_index()
+        clear_image_index(self.app.workspace_root, self._parse_search_roots())
         self.app.search_index = None
-        self.status_label.setText("索引缓存已清除，下次检索将重新扫描。")
-        QTimer.singleShot(500, self.refresh_results)
+        self.status_label.setText("当前搜索范围的索引已清除，正在后台重新建立。")
+        self.refresh_results(force_rebuild=True)
+
+    def _start_dialog_work(self) -> None:
+        self.refresh_results()
+        self._start_context_refresh()
+        self._request_scope_reconcile()
+
+    def _start_context_refresh(self) -> None:
+        if self._context_worker is not None and self._context_worker.isRunning():
+            return
+        self._context_worker = PhotoSearchContextWorker(self.app.store, self)
+        self._context_worker.result_ready.connect(self._on_context_ready)
+        self._context_worker.finished.connect(lambda: setattr(self, "_context_worker", None))
+        self._context_worker.start(QThread.LowPriority)
+
+    def _on_context_ready(
+        self, path_to_vouchers: dict[str, list[str]], canonical_paths: dict[str, str], exc: Exception | None
+    ) -> None:
+        if exc is not None:
+            return
+        self._path_to_vouchers = path_to_vouchers
+        self._canonical_photo_paths = canonical_paths
+        self.refresh_results()
+
+    def _on_search_path_changed(self, _text: str = "") -> None:
+        self.schedule_refresh()
+        if not hasattr(self, "_scope_refresh_timer"):
+            self._scope_refresh_timer = QTimer(self)
+            self._scope_refresh_timer.setSingleShot(True)
+            self._scope_refresh_timer.timeout.connect(self._request_scope_reconcile)
+        self._scope_refresh_timer.start(300)
+
+    def _request_scope_reconcile(self) -> None:
+        roots = self._parse_search_roots()
+        if not image_index_exists(self.app.workspace_root, roots):
+            return
+        if self._scope_index_worker is not None and self._scope_index_worker.isRunning():
+            self._scope_index_worker.requestInterruption()
+            self._scope_index_worker.wait(1000)
+        self._scope_index_worker = IndexBuildWorker(self.app.workspace_root, [roots], self)
+        self._scope_index_worker.index_ready.connect(self._on_scope_index_ready)
+        self._scope_index_worker.finished.connect(lambda: setattr(self, "_scope_index_worker", None))
+        self._scope_index_worker.start(QThread.LowPriority)
+
+    def _on_scope_index_ready(self, updates: list[object]) -> None:
+        modified = any(getattr(update, "modified", False) for update in updates)
+        if modified:
+            added = sum(getattr(update, "added", 0) for update in updates)
+            removed = sum(getattr(update, "removed", 0) for update in updates)
+            self.status_label.setText(f"后台索引更新完成：新增 {added} 张，移除 {removed} 张；正在刷新结果...")
+            self.refresh_results()
+
+    def _on_automatic_index_updated(self, updates: list[object]) -> None:
+        if any(getattr(update, "modified", False) for update in updates):
+            self.refresh_results()
 
     def _parse_search_roots(self) -> list[str] | None:
         text = self.path_combo.currentText().strip()
@@ -6610,15 +7023,12 @@ class ImageSearchDialog(QDialog):
         search_roots = self._parse_search_roots()
         if force_rebuild:
             self.status_label.setText(f"正在重新建立图片索引，并检索 {query}...")
-        elif self.app.search_index is not None:
-            self.status_label.setText(f"正在检索：{query}...")
         elif image_index_exists(self.app.workspace_root, search_roots):
-            self.status_label.setText(f"正在检索索引：{query}...")
+            self.status_label.setText(f"正在检索缓存：{query}...（后台会检查新增图片）")
         else:
-            self.status_label.setText(f"正在建立图片索引，并检索 {query}...")
+            self.status_label.setText(f"正在后台建立图片索引，并检索 {query}...")
 
         linked_paths = [self.app.store.resolve_photo_path(row) for row in self.app.current_photos]
-        path_to_vouchers = self.app.store.get_all_photo_voucher_map()
         specimen = self.app.store.get_specimen(self.app.current_voucher) or {}
         classification = self.app.store.get_classification(self.app.current_voucher) or {}
         self._search_token += 1
@@ -6636,11 +7046,11 @@ class ImageSearchDialog(QDialog):
             query=query,
             search_roots=search_roots,
             image_type=self._selected_image_type(),
-            # 原代码所有范围都传启动索引；自定义目录和整个工作区应使用对应范围的新索引。
-            search_index=self.app.search_index if search_roots is None and not force_rebuild else None,
+            search_index=None,
             force_rebuild=force_rebuild,
             limit=self.result_limit,
-            path_to_vouchers=path_to_vouchers,
+            path_to_vouchers=self._path_to_vouchers,
+            canonical_photo_paths=self._canonical_photo_paths,
             parent=self,
         )
         worker.result_ready.connect(self._on_search_ready)
@@ -6675,21 +7085,32 @@ class ImageSearchDialog(QDialog):
 
     def render_results(self) -> None:
         self._clear_cards()
-        columns = 4
 
         if not self.results:
             query = self.query_edit.text().strip()
             self.status_label.setText(f'未找到与 "{query}" 匹配的图片')
             return
 
-        for index, result in enumerate(self.results):
+        self._render_next_index = 0
+        self._render_batch(self._render_token)
+
+    def _render_batch(self, token: int) -> None:
+        if token != self._render_token:
+            return
+        columns = 4
+        start = getattr(self, "_render_next_index", 0)
+        end = min(start + 20, len(self.results))
+        for index in range(start, end):
+            result = self.results[index]
             r = index // columns
             c = index % columns
             card = self._create_card(index, result)
             self.result_grid.addWidget(card, r, c)
             self._cards.append(card)
-
+        self._render_next_index = end
         self._update_status()
+        if end < len(self.results):
+            QTimer.singleShot(0, lambda current=token: self._render_batch(current))
 
     def _create_card(self, index: int, result: ImageSearchResult) -> QFrame:
         """创建单张搜索结果卡片。
@@ -6860,6 +7281,7 @@ class ImageSearchDialog(QDialog):
         added = self.app.add_photo_paths(paths, ask_for_outside=False)
         self.selected_indices.clear()
         self.last_selected_index = None
+        self._start_context_refresh()
         self.refresh_results()
         self.status_label.setText(f"已添加 {added} 张图片。")
 
@@ -6911,6 +7333,14 @@ class ImageSearchDialog(QDialog):
                 worker.wait(3000)
             except Exception:
                 pass
+        for worker in (self._context_worker, self._scope_index_worker):
+            if worker is not None and worker.isRunning():
+                worker.requestInterruption()
+                worker.wait(3000)
+        try:
+            self.app.image_index_updated.disconnect(self._on_automatic_index_updated)
+        except (TypeError, RuntimeError):
+            pass
         self._search_workers.clear()  # 兜底清空,即使 finished 未触发
         self._thumb_worker.stop()
         super().closeEvent(event)
@@ -8115,13 +8545,14 @@ class SettingsDialog(QDialog):
         self.memory_profile_combo.setCurrentIndex(mp_idx)
         self.memory_profile_combo.setToolTip(
             "调整缩略图缓存 / Excel 缓存 / 并发解码档位\n"
-            "低档省内存,高档加速大数据汇总"
+            "低档限制为压缩预览并省内存,高档加速大数据汇总"
         )
         layout.addRow("内存档位", self.memory_profile_combo)
         # hint label (灰色小字警告 + 重启提示)
         mp_hint = QLabel(
             "调高档位可加速大数据汇总但需要更多内存;\n"
-            "极高档不建议在 < 8GB 机器使用,会触发系统 swap 反而卡顿。\n"
+            "自动档在 ≤ 4GB 机器使用低档策略并限制为压缩预览;\n"
+            "高/极高档不建议在低内存机器使用,会触发系统 swap 反而卡顿。\n"
             "缩略图缓存与 Excel 缓存即时生效;并发解码线程数需重启应用生效。"
         )
         mp_hint.setStyleSheet("color: #888; font-size: 11px;")
@@ -8393,7 +8824,7 @@ def run_app(workspace_root: Path | str | None) -> None:
         from .startup_diag import mark as _mark
         _mark(f"env: {env_snapshot()}")
         if is_low_memory():
-            _mark("env: LOW MEMORY MODE (< 3GB RAM)")
+            _mark("env: LOW MEMORY MODE (<= 4GB RAM)")
         if is_wsl():
             _mark("env: WSL detected, software rendering set in run_app.py")
         # 规范化软件设计 2026-05 K 章:高档位预 import openpyxl + PIL,后续首次读 Excel /
@@ -8474,7 +8905,8 @@ def run_app(workspace_root: Path | str | None) -> None:
     # E1: 启动后 ~2s 异步提示用户"上次未正常退出"。延迟以避开启动期繁忙。
     if not _last_exit_was_clean:
         def _show_crash_hint() -> None:
-            recent = list_recent_crash_logs(limit=3)
+            # 后台 WoRMS/测试线程日志不代表主窗口崩溃，不能冒充上次应用异常退出。
+            recent = list_recent_crash_logs(limit=3, context="main_thread")
             if recent:
                 paths_text = "\n".join(f"  · {p.name}" for p in recent)
                 detail = (
@@ -8488,7 +8920,7 @@ def run_app(workspace_root: Path | str | None) -> None:
                     "没有崩溃日志说明属于系统级中止，本次启动一切正常。"
                 )
             try:
-                QMessageBox.information(None, "上次异常退出", detail)
+                QMessageBox.information(window, "上次异常退出", detail)
             except Exception:
                 pass
 
@@ -9020,6 +9452,116 @@ class BatchImportSourcesDialog(QDialog):
         if report.snapshot_path:
             lines.append(f"\n已自动快照：{report.snapshot_path.name}")
         QMessageBox.information(self, "批量合并完成", "\n".join(lines))
+        self.accept()
+
+
+class TakeoverPickerDialog(QDialog):
+    """S2: 接管未入库编号选择器。
+
+    列出系统中所有「已批量领取但未完成入库」的编号，支持搜索 + 多选；
+    用户确认后由调用方把选中项加入 `_active_task["接管编号"]` set，
+    并在任务结束时计入工作量统计（alloc_log 新建数量 / 接管数量 / 完成入库数 三列）。
+    """
+
+    def __init__(self, parent, candidates: list[tuple[str, str, str]]):
+        super().__init__(parent)
+        self.setWindowTitle("接管未入库编号")
+        self.resize(720, 520)
+        self._all_rows = list(candidates)   # [(voucher, 领取人, 领取时间), ...]
+        self.selected: list[tuple[str, str, str]] = []
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "下列编号已被「批量领取」但尚未完成入库（specimen 必填 / 照片 / 分类必填 任一缺失）。\n"
+            "勾选后点「接管选中」，将这些编号纳入本任务的工作量统计；"
+            "「本人已领取」的编号不在此列。"
+        ))
+        # 搜索
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("筛选"))
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("按入库编号 / 领取人筛选（支持包含匹配）")
+        self._search_edit.textChanged.connect(self._refresh_table)
+        search_row.addWidget(self._search_edit, stretch=1)
+        layout.addLayout(search_row)
+        # 表
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(["", "入库编号", "原领取人", "领取时间"])
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.setColumnWidth(0, 36)
+        self._table.setColumnWidth(1, 130)
+        self._table.setColumnWidth(2, 140)
+        self._table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._table.setEditTriggers(QTableWidget.NoEditTriggers)
+        layout.addWidget(self._table, stretch=1)
+        # 控制行
+        ctrl_row = QHBoxLayout()
+        self._select_all_btn = QPushButton("全选当前筛选")
+        self._select_all_btn.clicked.connect(self._select_all_filtered)
+        ctrl_row.addWidget(self._select_all_btn)
+        self._clear_btn = QPushButton("清除选择")
+        self._clear_btn.clicked.connect(self._clear_selection)
+        ctrl_row.addWidget(self._clear_btn)
+        ctrl_row.addStretch(1)
+        self._status_label = QLabel("")
+        ctrl_row.addWidget(self._status_label)
+        layout.addLayout(ctrl_row)
+        # 按钮
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        ok = buttons.button(QDialogButtonBox.Ok)
+        if ok:
+            ok.setText("接管选中")
+        cancel = buttons.button(QDialogButtonBox.Cancel)
+        if cancel:
+            cancel.setText("取消")
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._refresh_table()
+
+    def _filtered_rows(self) -> list[tuple[str, str, str]]:
+        kw = self._search_edit.text().strip().lower()
+        if not kw:
+            return list(self._all_rows)
+        return [r for r in self._all_rows if kw in r[0].lower() or kw in (r[1] or "").lower()]
+
+    def _refresh_table(self) -> None:
+        rows = self._filtered_rows()
+        self._table.setRowCount(len(rows))
+        for i, (v, person, ts) in enumerate(rows):
+            cb_item = QTableWidgetItem()
+            cb_item.setFlags(cb_item.flags() | Qt.ItemIsUserCheckable)
+            cb_item.setCheckState(Qt.Unchecked)
+            self._table.setItem(i, 0, cb_item)
+            self._table.setItem(i, 1, QTableWidgetItem(v))
+            self._table.setItem(i, 2, QTableWidgetItem(person or "(未知)"))
+            self._table.setItem(i, 3, QTableWidgetItem(ts or ""))
+        self._status_label.setText(f"候选 {len(rows)} 条")
+
+    def _select_all_filtered(self) -> None:
+        for i in range(self._table.rowCount()):
+            item = self._table.item(i, 0)
+            if item is not None:
+                item.setCheckState(Qt.Checked)
+
+    def _clear_selection(self) -> None:
+        for i in range(self._table.rowCount()):
+            item = self._table.item(i, 0)
+            if item is not None:
+                item.setCheckState(Qt.Unchecked)
+
+    def _on_accept(self) -> None:
+        rows = self._filtered_rows()
+        chosen = []
+        for i, r in enumerate(rows):
+            cb = self._table.item(i, 0)
+            if cb is not None and cb.checkState() == Qt.Checked:
+                chosen.append(r)
+        if not chosen:
+            QMessageBox.information(self, "未选择", "请至少勾选一个编号再接管。")
+            return
+        self.selected = chosen
         self.accept()
 
 

@@ -45,9 +45,9 @@ AUTO_UPDATE_CHANNEL_OPTIONS: dict[str, str] = {
 # 规范化软件设计 2026-05 新增:内存档位选项。
 # 5 档对应不同的缩略图缓存 / 缩略图并发 / Excel _row_cache LRU 上限,详见 env_detect.memory_profile_params。
 MEMORY_PROFILE_OPTIONS: dict[str, str] = {
-    "extra_low": "极低 (≤ 1GB 机器,8MB 缓存,1 并发)",
-    "low": "低 (1-3GB,16MB 缓存,1 并发)",
-    "auto": "自动 (按 RAM 检测,默认)",
+    "extra_low": "极低 (≤ 2GB,8MB 缓存,1 并发,压缩预览)",
+    "low": "低 (2-4GB,16MB 缓存,1 并发,压缩预览)",
+    "auto": "自动 (≤ 4GB 自动使用低档,默认)",
     "high": "高 (8-16GB,128MB 缓存,4 并发)",
     "extra_high": "极高 (16GB+ 工作站,256MB 缓存,4 并发,适合超大汇总)",
 }

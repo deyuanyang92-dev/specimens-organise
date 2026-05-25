@@ -94,6 +94,12 @@ class ThumbnailCache:
             self._memory_cache.clear()
             self._memory_cache_bytes = 0
 
+    def set_memory_limit(self, memory_limit_bytes: int) -> None:
+        """更新内存缓存限额，并立即释放超过新限额的旧缩略图。"""
+        with self._lock:
+            self.memory_limit_bytes = max(4 * 1024 * 1024, int(memory_limit_bytes))
+            self._trim_memory_cache()
+
     def _get_from_memory(self, key: str) -> Image.Image | None:
         with self._lock:
             item = self._memory_cache.get(key)
@@ -104,17 +110,24 @@ class ThumbnailCache:
             return image.copy()
 
     def _put_in_memory(self, key: str, image: Image.Image) -> None:
-        cached = image.copy()
-        byte_count = _image_byte_count(cached)
+        byte_count = _image_byte_count(image)
         with self._lock:
             old = self._memory_cache.pop(key, None)
             if old is not None:
                 self._memory_cache_bytes -= old[1]
+            # 旧逻辑至少保留一张图片，即使单张已超档位限额；低内存机器切换大图后 RSS
+            # 无法降下来。超额单张由当前 QPixmap 显示即可，不再额外常驻 PIL 缓存。
+            if byte_count > self.memory_limit_bytes:
+                return
+            cached = image.copy()
             self._memory_cache[key] = (cached, byte_count)
             self._memory_cache_bytes += byte_count
-            while self._memory_cache_bytes > self.memory_limit_bytes and len(self._memory_cache) > 1:
-                _old_key, (_old_image, old_bytes) = self._memory_cache.popitem(last=False)
-                self._memory_cache_bytes -= old_bytes
+            self._trim_memory_cache()
+
+    def _trim_memory_cache(self) -> None:
+        while self._memory_cache_bytes > self.memory_limit_bytes and self._memory_cache:
+            _old_key, (_old_image, old_bytes) = self._memory_cache.popitem(last=False)
+            self._memory_cache_bytes -= old_bytes
 
 
 def _image_byte_count(image: Image.Image) -> int:
@@ -149,30 +162,59 @@ def _downsample_if_huge(image: Image.Image, max_size: tuple[int, int] | None) ->
 
 
 def load_source_image(path: Path, max_size: tuple[int, int] | None = None) -> Image.Image:
-    if path.suffix.lower() in {".tif", ".tiff"}:
-        image = _load_tiff(path, max_size=max_size)
-        if image is not None:
-            return image
-    # 规范化软件设计 2026-05 P1 审查修复:image 变量多次重赋值,源缓冲与中间对象都靠 with 关闭。
-    # try/finally 确保任意中间步骤异常时,源 image 句柄也能释放(出 with 块自动关原图,
-    # 但 _downsample_if_huge / exif_transpose / convert 创建的新 Image 对象由 GC 处理)。
+    try:
+        return _load_pillow_image(path, max_size=max_size)
+    except Exception as pillow_exc:
+        # Pillow 可读取的 TIFF 优先使用其按目标尺寸缩放路径；旧逻辑先调用 tifffile
+        # materialize 整张数组，预览缩略图时会造成不必要的高峰值。特殊 TIFF 若 Pillow
+        # 不支持，再保留 tifffile 作为兼容回退。
+        if path.suffix.lower() in {".tif", ".tiff"}:
+            image = _load_tiff(path, max_size=max_size)
+            if image is not None:
+                return image
+        raise pillow_exc
+
+
+def _load_pillow_image(path: Path, max_size: tuple[int, int] | None = None) -> Image.Image:
+    # image 变量多次重赋值，源缓冲与中间对象由 with 关闭；返回前 load() 使返回图像
+    # 不再依赖文件句柄。
     with Image.open(path) as image:
-        # draft() 让 JPEG 在解码阶段就按目标尺寸降比例解码（对其它格式是 no-op）；
-        # 之后 _downsample_if_huge 兜底处理超大图，避免全分辨率中间缓冲导致内存爆。
-        if max_size:
+        target_before_orientation = _target_size_before_orientation(image, max_size)
+        # draft() 让 JPEG 在解码阶段按目标尺寸降比例解码（对其它格式是 no-op）。
+        if target_before_orientation:
             try:
-                image.draft("RGB", max_size)
+                image.draft("RGB", target_before_orientation)
             except Exception:
-                pass  # draft 失败不阻断,仍走 _downsample_if_huge
-        image = _downsample_if_huge(image, max_size)
+                pass
+        image = _downsample_if_huge(image, target_before_orientation)
+        # 旧逻辑在这里先 exif_transpose/convert，20MP TIFF 会先生成整图缓冲，再缩到
+        # 800x600。现在先在源方向缩到预览目标，再转置，显著降低单图峰值。
+        if target_before_orientation and (
+            image.width > target_before_orientation[0] or image.height > target_before_orientation[1]
+        ):
+            image.thumbnail(target_before_orientation, Image.LANCZOS)
         image = ImageOps.exif_transpose(image)
         if image.mode not in ("RGB", "L"):
             image = image.convert("RGB")
         if max_size and (image.width > max_size[0] or image.height > max_size[1]):
             image.thumbnail(max_size, Image.LANCZOS)
-        # 返回前调用 .load() 让数据完全读入内存,确保 with 关闭后图像仍可用。
         image.load()
         return image
+
+
+def _target_size_before_orientation(
+    image: Image.Image,
+    max_size: tuple[int, int] | None,
+) -> tuple[int, int] | None:
+    if max_size is None:
+        return None
+    try:
+        orientation = int(image.getexif().get(274, 1))
+    except Exception:
+        orientation = 1
+    if orientation in (5, 6, 7, 8):
+        return max_size[1], max_size[0]
+    return max_size
 
 
 def _load_tiff(path: Path, max_size: tuple[int, int] | None = None) -> Image.Image | None:

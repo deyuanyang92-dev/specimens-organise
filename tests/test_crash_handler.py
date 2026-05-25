@@ -143,6 +143,18 @@ class CrashLogTests(unittest.TestCase):
         self.assertEqual(recent[0].name, "crash_003.log")
         self.assertEqual(recent[1].name, "crash_002.log")
 
+    def test_list_recent_crash_logs_can_filter_main_process_crashes(self) -> None:
+        main = self.tmp / "crash_main.log"
+        daemon = self.tmp / "crash_daemon.log"
+        main.write_text("Context:  main_thread\n", encoding="utf-8")
+        daemon.write_text("Context:  worms-daemon\n", encoding="utf-8")
+        os.utime(main, (1000, 1000))
+        os.utime(daemon, (1001, 1001))
+
+        recent = crash_log.list_recent_crash_logs(limit=3, context="main_thread")
+
+        self.assertEqual([path.name for path in recent], ["crash_main.log"])
+
 
 if __name__ == "__main__":
     unittest.main()

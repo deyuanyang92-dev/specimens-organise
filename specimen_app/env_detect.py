@@ -2,7 +2,7 @@
 
 提供:
 - `total_ram_mb()` 总 RAM(MB);失败返 None。
-- `is_low_memory()` 总 RAM < 3GB 判低内存机。
+- `is_low_memory()` 总 RAM <= 4GB 判低内存机。
 - `is_wsl()` 在 WSL 上(检 /proc/version 或 uname.release)。
 - `is_frozen()` 在 PyInstaller 打包态(sys.frozen)。
 - `env_snapshot()` 拼一行环境快照字符串(供 startup_diag 落 log)。
@@ -19,11 +19,11 @@ from functools import lru_cache
 from typing import Optional
 
 
-# 总 RAM 阈值:< 3GB 算"低内存机器"。
-# - 2GB 机(用户案例)显然命中
-# - 3GB 是 Win10 最低官方推荐内存,跑桌面应用也吃紧
-# - >= 4GB 用默认配置即可
-_LOW_MEMORY_THRESHOLD_MB = 3000
+# 总 RAM 阈值:<= 4GB 算"低内存机器"。
+# - 2GB 机必须严格限制图片解码并发和常驻缓存
+# - 4GB Windows 在系统与 Qt 占用后余量仍有限,双张 TIFF 解码会造成明显内存压力
+# - > 4GB 才使用默认的双解码并发
+_LOW_MEMORY_THRESHOLD_MB = 4096
 
 
 @lru_cache(maxsize=1)
@@ -48,11 +48,11 @@ def total_ram_mb() -> Optional[int]:
 
 @lru_cache(maxsize=1)
 def is_low_memory() -> bool:
-    """总 RAM < 3GB 判低内存。失败 (未知 RAM) 保守返 False (即按正常配置跑)。"""
+    """总 RAM <= 4GB 判低内存。失败 (未知 RAM) 保守返 False (即按正常配置跑)。"""
     ram = total_ram_mb()
     if ram is None:
         return False
-    return ram < _LOW_MEMORY_THRESHOLD_MB
+    return ram <= _LOW_MEMORY_THRESHOLD_MB
 
 
 @lru_cache(maxsize=1)
@@ -107,19 +107,30 @@ def memory_profile_params(profile: str) -> dict:
     - ``thumb_cache_bytes`` (int): ThumbnailCache memory_limit_bytes
     - ``thumb_workers`` (int): ThumbnailWorker max_workers
     - ``row_cache_maxsize`` (int): ExcelStore._row_cache_maxsize
+    - ``preview_max_size`` (tuple | None): 主预览允许的最大尺寸;低内存档压到 800x600
 
-    profile == "auto" 时按 is_low_memory() 内部分流(< 3GB → low 级,否则中)。
+    profile == "auto" 时按 is_low_memory() 内部分流(<= 4GB -> low 级,否则中)。
     未知 profile fallback "auto"。
     """
     if profile == "auto":
         if is_low_memory():
-            return {"thumb_cache_bytes": 16 << 20, "thumb_workers": 1, "row_cache_maxsize": 4}
-        return {"thumb_cache_bytes": 32 << 20, "thumb_workers": 2, "row_cache_maxsize": 6}
+            return {
+                "thumb_cache_bytes": 16 << 20,
+                "thumb_workers": 1,
+                "row_cache_maxsize": 4,
+                "preview_max_size": (800, 600),
+            }
+        return {
+            "thumb_cache_bytes": 32 << 20,
+            "thumb_workers": 2,
+            "row_cache_maxsize": 6,
+            "preview_max_size": None,
+        }
     table = {
-        "extra_low":  {"thumb_cache_bytes":   8 << 20, "thumb_workers": 1, "row_cache_maxsize":  3},
-        "low":        {"thumb_cache_bytes":  16 << 20, "thumb_workers": 1, "row_cache_maxsize":  4},
-        "high":       {"thumb_cache_bytes": 128 << 20, "thumb_workers": 4, "row_cache_maxsize": 12},
-        "extra_high": {"thumb_cache_bytes": 256 << 20, "thumb_workers": 4, "row_cache_maxsize": 20},
+        "extra_low":  {"thumb_cache_bytes":   8 << 20, "thumb_workers": 1, "row_cache_maxsize":  3, "preview_max_size": (800, 600)},
+        "low":        {"thumb_cache_bytes":  16 << 20, "thumb_workers": 1, "row_cache_maxsize":  4, "preview_max_size": (800, 600)},
+        "high":       {"thumb_cache_bytes": 128 << 20, "thumb_workers": 4, "row_cache_maxsize": 12, "preview_max_size": None},
+        "extra_high": {"thumb_cache_bytes": 256 << 20, "thumb_workers": 4, "row_cache_maxsize": 20, "preview_max_size": None},
     }
     return table.get(profile, memory_profile_params("auto"))
 
