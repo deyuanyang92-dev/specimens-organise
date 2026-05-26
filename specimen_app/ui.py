@@ -665,23 +665,24 @@ class UpdateCheckWorker(QThread):
 
 class UpdateDownloadWorker(QThread):
     progress = pyqtSignal(int)               # 下载进度百分比
-    # Path|None, incremental(bool, 始终 False), Exception|None
+    # Path|None, incremental(bool), Exception|None
     finished_download = pyqtSignal(object, object, object)
 
     def __init__(self, release, dest_root, local_roots=None, parent=None):
         super().__init__(parent)
         self._release = release
         self._dest_root = dest_root
-        # local_roots 形参保留以兼容现有调用点;v0.8.2 删增量后不再使用。
+        # plan v0.10.8 重启用 local_roots：传递本地已有 release 目录供增量查 runtime_hash 匹配
         self._local_roots = local_roots or []
 
     def run(self) -> None:
         try:
-            # v0.8.2:删增量更新,统一下载完整 setup zip。
-            path = download_release(
-                self._release, self._dest_root, self.progress.emit
+            # plan v0.10.8：优先走 app-only 增量下载，匹配不到 runtime 时自动 fallback 全量
+            from .updater import download_release_with_optional_incremental
+            path, was_incremental = download_release_with_optional_incremental(
+                self._release, self._dest_root, self._local_roots, self.progress.emit
             )
-            self.finished_download.emit(path, False, None)
+            self.finished_download.emit(path, was_incremental, None)
         except Exception as exc:
             self.finished_download.emit(None, False, exc)
 

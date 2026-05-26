@@ -2404,6 +2404,93 @@ class Phase5PhotoArchiveExtractionTests(unittest.TestCase):
         )
 
 
+class Phase8IncrementalUpdateInfraTests(unittest.TestCase):
+    """plan v0.10.8：build_release 增量更新基础设施 + updater 端 runtime_hash 复用。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_fake_bundle(self, bundle_dir: Path, app_files: dict, runtime_files: dict) -> None:
+        """Build a fake PyInstaller bundle with app + runtime parts for testing."""
+        bundle_dir.mkdir(parents=True)
+        # root exe
+        (bundle_dir / "标本入库管理_vTEST.exe").write_text("fake exe", encoding="utf-8")
+        # _internal/specimen_app/** (app 部分)
+        for rel, content in app_files.items():
+            target = bundle_dir / "_internal" / "specimen_app" / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        # _internal/<other>/** (runtime 部分)
+        for rel, content in runtime_files.items():
+            target = bundle_dir / "_internal" / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+
+    def test_partition_bundle_app_runtime_lists_disjoint(self) -> None:
+        """plan v0.10.8：app 文件列表与 runtime 文件列表无交集。"""
+        from build_release import _list_app_relative_paths, _list_runtime_relative_paths
+        bundle_dir = self.tmp / "标本入库管理_vTEST"
+        self._make_fake_bundle(
+            bundle_dir,
+            app_files={"__init__.py": "ver1", "ui.py": "x"},
+            runtime_files={"PyQt5/QtCore.pyd": "binary", "python3.dll": "binary"},
+        )
+        app_paths = {p.as_posix() for p in _list_app_relative_paths(bundle_dir)}
+        runtime_paths = {p.as_posix() for p in _list_runtime_relative_paths(bundle_dir)}
+        self.assertTrue(app_paths)
+        self.assertTrue(runtime_paths)
+        self.assertEqual(app_paths & runtime_paths, set(), "app 与 runtime 路径不应有交集")
+        # root exe 应在 app
+        self.assertIn("标本入库管理_vTEST.exe", app_paths)
+        # PyQt5/python 应在 runtime
+        self.assertTrue(any("PyQt5" in p for p in runtime_paths))
+
+    def test_runtime_hash_stable_across_identical_runtime(self) -> None:
+        """plan v0.10.8：runtime 文件不变时 runtime_hash 必稳定（增量复用前提）。"""
+        from build_release import _compute_runtime_hash
+        bundle_v1 = self.tmp / "v1"
+        bundle_v2 = self.tmp / "v2"
+        identical_runtime = {"PyQt5/QtCore.pyd": "binary-aaaa", "python3.dll": "binary-bbbb"}
+        self._make_fake_bundle(bundle_v1, app_files={"__init__.py": "v1"}, runtime_files=identical_runtime)
+        self._make_fake_bundle(bundle_v2, app_files={"__init__.py": "v2-different"}, runtime_files=identical_runtime)
+        hash_v1 = _compute_runtime_hash(bundle_v1)
+        hash_v2 = _compute_runtime_hash(bundle_v2)
+        self.assertEqual(hash_v1, hash_v2, "App 变 runtime 不变 → hash 同 → 走增量")
+
+    def test_runtime_hash_differs_when_runtime_changes(self) -> None:
+        """plan v0.10.8：runtime 一个字节变化 → runtime_hash 变 → 退回全量。"""
+        from build_release import _compute_runtime_hash
+        bundle_a = self.tmp / "a"
+        bundle_b = self.tmp / "b"
+        self._make_fake_bundle(
+            bundle_a, app_files={"__init__.py": "x"},
+            runtime_files={"python3.dll": "binary-1234"},
+        )
+        self._make_fake_bundle(
+            bundle_b, app_files={"__init__.py": "x"},
+            runtime_files={"python3.dll": "binary-5678"},  # 1 字节不同
+        )
+        self.assertNotEqual(_compute_runtime_hash(bundle_a), _compute_runtime_hash(bundle_b))
+
+    def test_find_local_release_with_matching_runtime_hash(self) -> None:
+        """plan v0.10.8：updater 能在本地 releases/ 找到匹配 runtime 的旧版。"""
+        from specimen_app.updater import _find_local_release_with_matching_runtime_hash
+        import json as _json
+        releases_root = self.tmp / "releases"
+        old_version_dir = releases_root / "v0.10.7"
+        old_bundle = old_version_dir / "标本入库管理_v0.10.7"
+        old_bundle.mkdir(parents=True)
+        meta = {"version": "0.10.7", "runtime_hash": "abc123def456", "app_files": []}
+        (old_bundle / ".update_meta.json").write_text(_json.dumps(meta), encoding="utf-8")
+        found = _find_local_release_with_matching_runtime_hash([releases_root], "abc123def456")
+        self.assertEqual(found, old_bundle)
+        not_found = _find_local_release_with_matching_runtime_hash([releases_root], "xxx_not_match")
+        self.assertIsNone(not_found)
+
+
 class Phase7SessionRestoreTests(unittest.TestCase):
     """plan v0.10.7 U3：界面恢复增强 settings 字段持久化 + 默认值兼容。"""
 

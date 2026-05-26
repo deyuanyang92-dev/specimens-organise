@@ -32,9 +32,123 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-# v0.8.2:删除增量更新（应用包 / 运行时包拆分 + update_manifest）。
-# 用户反馈"增量太复杂",每次发版只产出一个完整 setup zip,GitHub Release
-# 页面更清爽（每平台仅 setup zip + sha256 两个文件）。升级走完整包下载。
+# v0.10.8 重新启用增量更新基础设施（v0.8.2 曾删，但用户反馈"为何不能像 VSCode 一样
+# 只下小数据"——重新加回，产物：setup_v*.zip（全量主分发）+ app_v*.zip（仅代码 ~5MB）+
+# update_manifest_*.json（含 runtime_hash 供 updater 端比对复用本地 runtime）。
+# 老用户首次升级仍全量；后续若 Python+PyQt5 版本不变 → 仅下 app_v*.zip 几 MB。
+
+
+# v0.10.8 partition_bundle: 把 PyInstaller --onedir 产物拆 app/runtime 两部分。
+# app: root exe + _internal/specimen_app/** + .update_meta.json (含 runtime_hash)
+# runtime: 其他 _internal/** (Python / PyQt5 / 资源等，~60MB，版本间复用率高)
+# runtime_hash = 对 runtime 文件清单 + 各文件 sha256 算总 hash，runtime 不变则 hash 同。
+APP_INTERNAL_SPECIMEN_APP_SUBPATH = "_internal/specimen_app"
+
+
+def _list_runtime_relative_paths(bundle_dir: Path) -> list[Path]:
+    """返回 bundle_dir 内 "runtime" 部分（_internal/** 但排除 specimen_app/）的相对路径列表，sorted。"""
+    runtime_paths: list[Path] = []
+    internal_root = bundle_dir / "_internal"
+    if not internal_root.is_dir():
+        return runtime_paths
+    specimen_app_dir = (bundle_dir / APP_INTERNAL_SPECIMEN_APP_SUBPATH).resolve()
+    for item in sorted(internal_root.rglob("*")):
+        if not item.is_file():
+            continue
+        try:
+            item_resolved = item.resolve()
+            item_resolved.relative_to(specimen_app_dir)
+            continue  # 在 specimen_app/ 子树里，属于 app 部分
+        except ValueError:
+            pass
+        runtime_paths.append(item.relative_to(bundle_dir))
+    return runtime_paths
+
+
+def _list_app_relative_paths(bundle_dir: Path) -> list[Path]:
+    """返回 bundle_dir 内 "app" 部分（root exe + _internal/specimen_app/**）的相对路径列表，sorted。"""
+    app_paths: list[Path] = []
+    # root 层除 _internal 目录之外的所有文件（exe / .update_meta.json / 其他散文件）
+    for item in sorted(bundle_dir.iterdir()):
+        if item.is_file():
+            app_paths.append(item.relative_to(bundle_dir))
+    # _internal/specimen_app/** 全部文件
+    specimen_app_dir = bundle_dir / APP_INTERNAL_SPECIMEN_APP_SUBPATH
+    if specimen_app_dir.is_dir():
+        for item in sorted(specimen_app_dir.rglob("*")):
+            if item.is_file():
+                app_paths.append(item.relative_to(bundle_dir))
+    return app_paths
+
+
+def _compute_runtime_hash(bundle_dir: Path) -> str:
+    """对 runtime 文件清单 + 各文件 sha256 算总 hash。runtime 文件不变则 hash 不变。"""
+    aggregator = hashlib.sha256()
+    for relative_path in _list_runtime_relative_paths(bundle_dir):
+        aggregator.update(relative_path.as_posix().encode("utf-8"))
+        aggregator.update(b"\0")
+        aggregator.update(sha256(bundle_dir / relative_path).encode("ascii"))
+        aggregator.update(b"\0")
+    return aggregator.hexdigest()[:12]
+
+
+def _write_update_meta(bundle_dir: Path, version: str, runtime_hash: str, app_relative_paths: list[Path]) -> None:
+    """把 .update_meta.json 写到 bundle_dir 根，updater 用来识别 app-only zip。"""
+    meta = {
+        "version": version,
+        "runtime_hash": runtime_hash,
+        "app_files": [p.as_posix() for p in app_relative_paths],
+    }
+    (bundle_dir / ".update_meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _build_app_only_zip(bundle_dir: Path, release_dir: Path, version: str, platform_tag: str) -> tuple[Path, str]:
+    """打包 app-only zip：只含 root exe + _internal/specimen_app/** + .update_meta.json。
+
+    zip 内根目录与 setup_*.zip 一致（``标本入库管理_v{version}/``），方便 updater 解压后识别。
+    返回 (zip_path, sha256_hex)。
+    """
+    versioned_name = bundle_dir.name
+    zip_name = f"app_v{version}_{platform_tag}.zip"
+    zip_path = release_dir / zip_name
+    if zip_path.exists():
+        zip_path.unlink()
+    # app 部分包含：root 层全部文件（已含 .update_meta.json） + _internal/specimen_app/**
+    app_relative_paths = _list_app_relative_paths(bundle_dir)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for relative_path in app_relative_paths:
+            arc_name = Path(versioned_name) / relative_path
+            archive.write(bundle_dir / relative_path, arc_name.as_posix())
+    zip_digest = sha256(zip_path)
+    (release_dir / f"{zip_name}.sha256").write_text(
+        f"{zip_digest}  {zip_name}\n", encoding="utf-8"
+    )
+    return zip_path, zip_digest
+
+
+def _write_update_manifest(release_dir: Path, version: str, platform_tag: str, *, setup_zip_name: str,
+                           setup_zip_sha256: str, app_zip_name: str, app_zip_sha256: str,
+                           runtime_hash: str) -> Path:
+    """update_manifest_{plat}.json：updater 端先拉这个判增量是否可用。
+
+    包含两套下载选项：
+    - setup_zip: 全量包，老用户/无匹配 runtime 时走
+    - app_zip + runtime_hash: 本地 release 目录中若有相同 runtime_hash 的旧版本，
+      复制其 _internal/ 后只下 app_zip 覆盖 specimen_app/ → 真增量
+    """
+    manifest = {
+        "version": version,
+        "platform": platform_tag,
+        "runtime_hash": runtime_hash,
+        "setup_zip": {"name": setup_zip_name, "sha256": setup_zip_sha256},
+        "app_zip": {"name": app_zip_name, "sha256": app_zip_sha256},
+    }
+    manifest_name = f"update_manifest_{platform_tag}.json"
+    manifest_path = release_dir / manifest_name
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return manifest_path
 
 
 def build_release(version: str, project_root: Path, icon_path: Path | None = None) -> Path:
@@ -159,9 +273,17 @@ def build_release(version: str, project_root: Path, icon_path: Path | None = Non
     # ._find_executable 的发现规则一致：解压到 releases/v{version}/ 后即可被识别。
     platform_tag = "windows" if IS_WINDOWS else ("macos" if sys.platform == "darwin" else "linux")
 
-    # 完整 zip：唯一的分发包。命名纯 ASCII setup_ 前缀（旧：APP_NAME 前缀含中文，
-    # GitHub Actions 上传后中文部分丢失，用户看不懂）。
-    # v0.8.2 起每平台只产出这一个 zip + 一个 .sha256,不再有增量 app/runtime 包。
+    # v0.10.8 重启用增量更新：先算 runtime_hash + 写 .update_meta.json，再打 setup zip
+    # （含 meta） + app-only zip + manifest。setup_*.zip 仍是主分发，老用户/无匹配 runtime
+    # 走它；updater 端可选拉 manifest 走 app_v*.zip 增量。
+    runtime_hash = _compute_runtime_hash(versioned_dir)
+    app_relative_paths = _list_app_relative_paths(versioned_dir)
+    # 先写 meta（让 setup zip 也含），再算 app_relative_paths 时 meta 也算 app 一员
+    _write_update_meta(versioned_dir, version, runtime_hash, app_relative_paths)
+    # 重算 app_relative_paths 含新写的 .update_meta.json
+    app_relative_paths = _list_app_relative_paths(versioned_dir)
+
+    # 完整 zip：主分发包，命名纯 ASCII setup_ 前缀。
     zip_name = f"setup_v{version}_{platform_tag}.zip"
     zip_path = release_dir / zip_name
     if zip_path.exists():
@@ -171,11 +293,21 @@ def build_release(version: str, project_root: Path, icon_path: Path | None = Non
             if item.is_file():
                 archive.write(item, item.relative_to(release_dir))
     zip_digest = sha256(zip_path)
-
-    # zip 的 .sha256（完整性校验）。
     (release_dir / f"{zip_name}.sha256").write_text(
         f"{zip_digest}  {zip_name}\n", encoding="utf-8"
     )
+
+    # v0.10.8 app-only zip + manifest（增量更新基础设施）
+    app_zip_path, app_zip_digest = _build_app_only_zip(versioned_dir, release_dir, version, platform_tag)
+    manifest_path = _write_update_manifest(
+        release_dir, version, platform_tag,
+        setup_zip_name=zip_name, setup_zip_sha256=zip_digest,
+        app_zip_name=app_zip_path.name, app_zip_sha256=app_zip_digest,
+        runtime_hash=runtime_hash,
+    )
+    print(f"[release] full setup ({zip_path.stat().st_size // 1024 // 1024} MB)：{zip_name}")
+    print(f"[release] app-only ({app_zip_path.stat().st_size // 1024 // 1024} MB)：{app_zip_path.name}")
+    print(f"[release] runtime_hash={runtime_hash}  manifest={manifest_path.name}")
 
     # sha256.txt 保留原有 exe 摘要行（向后兼容），并追加完整 zip 摘要行。
     (release_dir / "sha256.txt").write_text(

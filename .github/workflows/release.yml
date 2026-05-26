@@ -1,8 +1,8 @@
 name: Release
 
 # 推送 v* 标签时，在 Windows 和 Linux 上各自构建发布包，
-# 并把 zip + 对应的 .sha256 作为 GitHub Release 资产上传。
-# 应用内"检查 GitHub 更新"会读取最新 Release 的这些资产。
+# 并把 zip + 对应的 .sha256 + (v0.10.8+) app-only zip + update_manifest.json 作为
+# GitHub Release 资产上传。应用内"检查 GitHub 更新"会读取 manifest 判断是否走增量更新。
 
 on:
   push:
@@ -46,12 +46,19 @@ jobs:
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
+        env:
+          # 安全：head_commit.message 是 untrusted 字符串，必须经 env 引用而非
+          # 直接 inline 进 YAML 模板，防 workflow injection（不可信 commit message
+          # 含 ` ${{...}} ` 即可执行任意脚本）。
+          # 参考 https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          RELEASE_VERSION: ${{ steps.ver.outputs.version }}
         with:
           generate_release_notes: true
           body: |
             ## 本次更新
 
-            ${{ github.event.head_commit.message }}
+            $HEAD_COMMIT_MESSAGE
 
             ---
 
@@ -67,7 +74,13 @@ jobs:
             > 软件采用目录模式打包，`.exe` 必须和 `_internal/` 子目录在同一层，不能单独复制 `.exe` 运行。
             >
             > `.sha256` 文件是完整性校验码，普通用户无需下载。
-
+            >
+            > **v0.10.8+ 增量更新**：应用内「检查更新」会先拉 `update_manifest_*.json`；若本地已有
+            > 相同 `runtime_hash` 的旧版本目录，则只下载 `app_v*.zip`（仅几 MB），跳过 ~60MB 的
+            > Python+PyQt5 runtime，体验接近 VSCode 的"小数据"升级。
           files: |
             releases/v${{ steps.ver.outputs.version }}/setup_*.zip
             releases/v${{ steps.ver.outputs.version }}/setup_*.zip.sha256
+            releases/v${{ steps.ver.outputs.version }}/app_*.zip
+            releases/v${{ steps.ver.outputs.version }}/app_*.zip.sha256
+            releases/v${{ steps.ver.outputs.version }}/update_manifest_*.json

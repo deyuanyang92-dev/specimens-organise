@@ -50,6 +50,11 @@ class LatestRelease:
     zip_name: str         # 完整下载包文件名
     sha256_url: str | None  # 对应的 sha256 校验文件 URL（可能为 None）
     notes: str            # release 说明正文
+    # v0.10.8 增量更新基础设施
+    manifest_url: str = ""       # update_manifest_{plat}.json URL（缺时表示 release 无增量包）
+    app_zip_url: str = ""        # app_v*_{plat}.zip URL（仅 app 代码部分）
+    app_zip_name: str = ""       # app zip 文件名
+    app_zip_sha256_url: str = ""  # app zip 对应 .sha256 URL
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +224,23 @@ def check_latest_release(
             sha256_url = str(asset.get("browser_download_url", "") or "")
             break
 
+    # v0.10.8 增量更新资产：app_v*_{plat}.zip + update_manifest_{plat}.json
+    app_zip_url = app_zip_name = app_zip_sha256_url = manifest_url = ""
+    for asset in assets:
+        name = str(asset.get("name", "") or "")
+        url = str(asset.get("browser_download_url", "") or "")
+        nl = name.lower()
+        if nl.startswith("app_") and nl.endswith(".zip") and plat in nl:
+            app_zip_url, app_zip_name = url, name
+        elif nl == f"update_manifest_{plat}.json":
+            manifest_url = url
+    if app_zip_name:
+        for asset in assets:
+            name = str(asset.get("name", "") or "")
+            if name == f"{app_zip_name}.sha256":
+                app_zip_sha256_url = str(asset.get("browser_download_url", "") or "")
+                break
+
     return LatestRelease(
         version=version,
         tag=tag,
@@ -226,6 +248,10 @@ def check_latest_release(
         zip_name=zip_name,
         sha256_url=sha256_url,
         notes=str(payload.get("body", "") or ""),
+        manifest_url=manifest_url,
+        app_zip_url=app_zip_url,
+        app_zip_name=app_zip_name,
+        app_zip_sha256_url=app_zip_sha256_url,
     )
 
 
@@ -285,6 +311,118 @@ def _safe_extract(zip_path: Path, dest: Path) -> None:
             except ValueError:
                 raise UpdateError(f"压缩包包含非法路径,已中止:{member}")
         archive.extractall(dest)
+
+
+def _find_local_release_with_matching_runtime_hash(
+    local_roots: list[Path | str], required_runtime_hash: str,
+) -> Path | None:
+    """plan v0.10.8：扫 local_roots/v*/ 找含相同 runtime_hash 的旧版本目录。
+
+    每个 release 目录里 PyInstaller 产物的根目录（``标本入库管理_v{version}/``）含
+    ``.update_meta.json``，里面记 runtime_hash。若任一旧版本 runtime_hash 与
+    required_runtime_hash 相同 → 表示其 _internal/（除 specimen_app）可被复用，
+    增量更新只需下 app_v*.zip 覆盖代码即可。
+    """
+    if not required_runtime_hash:
+        return None
+    for root in local_roots:
+        root_path = Path(root)
+        if not root_path.is_dir():
+            continue
+        for version_dir in sorted(root_path.iterdir()):
+            if not version_dir.is_dir():
+                continue
+            # PyInstaller bundle 直接在 version_dir 下，名字是 标本入库管理_v{version}/
+            for bundle_dir in version_dir.iterdir():
+                if not bundle_dir.is_dir():
+                    continue
+                meta_path = bundle_dir / ".update_meta.json"
+                if not meta_path.is_file():
+                    continue
+                try:
+                    with meta_path.open("r", encoding="utf-8") as fh:
+                        meta = json.load(fh)
+                    if str(meta.get("runtime_hash", "")) == required_runtime_hash:
+                        return bundle_dir
+                except (OSError, json.JSONDecodeError):
+                    continue
+    return None
+
+
+def download_release_with_optional_incremental(
+    release: LatestRelease,
+    dest_root: Path | str,
+    local_roots: list[Path | str] | None = None,
+    progress_cb: Callable[[int], None] | None = None,
+) -> tuple[Path, bool]:
+    """plan v0.10.8：优先走 app-only 增量；不可走则 fallback 全量 setup zip。
+
+    返回 (target_dir, was_incremental)。was_incremental=True 表示真走了增量路径
+    （只下了 ~5MB 的 app zip，复用了本地旧版 runtime ~60MB），False 表示走全量
+    setup_v*.zip（~66-135MB）。
+
+    增量路径条件：
+      - release 提供了 manifest_url + app_zip_url
+      - 本地 local_roots 中存在 ``.update_meta.json`` runtime_hash 与 manifest
+        中 runtime_hash 相同的旧版本目录
+    任一条件不满足 → fallback download_release 全量。
+    """
+    local_roots = list(local_roots or [])
+    dest_root = Path(dest_root)
+    target_dir = dest_root / f"v{release.version}"
+
+    # 条件 1：必须有 manifest + app_zip
+    if not release.manifest_url or not release.app_zip_url:
+        return download_release(release, dest_root, progress_cb), False
+
+    if target_dir.exists():
+        raise UpdateError(f"版本目录已存在，无需重复下载：\n{target_dir}")
+
+    # 拉 manifest 取 runtime_hash
+    try:
+        _validate_url(release.manifest_url)
+        manifest_bytes = _http_get(release.manifest_url)
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+        required_runtime_hash = str(manifest.get("runtime_hash", "") or "")
+        expected_app_sha256 = str(manifest.get("app_zip", {}).get("sha256", "") or "")
+    except (UpdateError, json.JSONDecodeError, UnicodeDecodeError):
+        return download_release(release, dest_root, progress_cb), False
+
+    if not required_runtime_hash:
+        return download_release(release, dest_root, progress_cb), False
+
+    # 条件 2：本地找匹配 runtime 的旧版
+    source_bundle_dir = _find_local_release_with_matching_runtime_hash(local_roots, required_runtime_hash)
+    if source_bundle_dir is None:
+        return download_release(release, dest_root, progress_cb), False
+
+    # 走增量：先 copy 旧 release 整体 → 解压 app zip 覆盖 specimen_app + root exe
+    _validate_url(release.app_zip_url)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="specimen-update-app-"))
+    try:
+        tmp_zip = tmp_dir / release.app_zip_name
+        _download_to(release.app_zip_url, tmp_zip, progress_cb)
+        if expected_app_sha256:
+            _verify_sha256(tmp_zip, expected_app_sha256)
+        # source_bundle_dir 是 …/v{old}/标本入库管理_v{old}/；其 parent 是 v{old}/
+        source_version_dir = source_bundle_dir.parent
+        dest_root.mkdir(parents=True, exist_ok=True)
+        # 整体复制到目标 v{new}/，然后改 bundle 目录名 + 覆盖 app 部分
+        shutil.copytree(source_version_dir, target_dir)
+        # 旧 bundle dir 名（如 标本入库管理_v0.10.7）→ 重命名为新版 (v0.10.8)
+        old_bundle_in_target = target_dir / source_bundle_dir.name
+        new_bundle_in_target = target_dir / f"{APP_NAME}_v{release.version}"
+        if old_bundle_in_target != new_bundle_in_target:
+            old_bundle_in_target.rename(new_bundle_in_target)
+        # 解压 app zip 覆盖到 target_dir（zip 内根目录与新 bundle 同名）
+        _safe_extract(tmp_zip, target_dir)
+        return target_dir, True
+    except Exception:
+        # 增量失败 → 清理已 copy 的 target_dir，fallback 全量
+        shutil.rmtree(target_dir, ignore_errors=True)
+        return download_release(release, dest_root, progress_cb), False
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def download_release(
