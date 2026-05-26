@@ -12,6 +12,15 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
+# v0.10.8 fix: GitHub Actions Windows runner defaults stdout to cp1252 → UnicodeEncodeError
+# when PyInstaller subprocess prints paths containing CJK (bundle dir is "标本入库管理_vX.Y.Z").
+# Reconfigure stdout/stderr to UTF-8 before any print or subprocess capture.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, OSError):
+    pass
+
 from specimen_app import __version__
 
 
@@ -305,8 +314,9 @@ def build_release(version: str, project_root: Path, icon_path: Path | None = Non
         app_zip_name=app_zip_path.name, app_zip_sha256=app_zip_digest,
         runtime_hash=runtime_hash,
     )
-    print(f"[release] full setup ({zip_path.stat().st_size // 1024 // 1024} MB)：{zip_name}")
-    print(f"[release] app-only ({app_zip_path.stat().st_size // 1024 // 1024} MB)：{app_zip_path.name}")
+    # ASCII-only stdout: Windows GitHub Actions runner default cp1252 can't encode CJK
+    print(f"[release] full setup ({zip_path.stat().st_size // 1024 // 1024} MB): {zip_name}")
+    print(f"[release] app-only ({app_zip_path.stat().st_size // 1024 // 1024} MB): {app_zip_path.name}")
     print(f"[release] runtime_hash={runtime_hash}  manifest={manifest_path.name}")
 
     # sha256.txt 保留原有 exe 摘要行（向后兼容），并追加完整 zip 摘要行。

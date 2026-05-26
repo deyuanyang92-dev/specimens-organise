@@ -42,6 +42,11 @@ jobs:
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Build release
+        # v0.10.8 fix: 强制 Python stdout/stderr UTF-8（Windows runner 默认 cp1252，
+        # PyInstaller subprocess 打印 "标本入库管理_vX.Y.Z/..." 含 CJK 时 UnicodeEncodeError）
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
         run: python build_release.py --version ${{ steps.ver.outputs.version }}
 
       - name: Upload release assets
