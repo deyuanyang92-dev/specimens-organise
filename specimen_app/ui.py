@@ -1346,6 +1346,59 @@ class SpecimenWindow(QMainWindow):
         if fast:
             _startup_mark("fast profile: scheduling preheat")
             QTimer.singleShot(500, self._preheat_caches)
+        # plan v0.10.7 U3：恢复上次会话 UI 状态（仅当工作区与上次一致）
+        QTimer.singleShot(800, self._restore_last_session_ui_state)
+
+    def _restore_last_session_ui_state(self) -> None:
+        """plan v0.10.7 U3：启动后恢复上次会话的 voucher 选中 / 搜索框 / 筛选 / 照片视图。
+
+        仅在当前工作区与 settings.last_workspace 一致时恢复——跨工作区无意义且会
+        触发不存在的 voucher 错误。
+        """
+        if self._is_closing or self.store is None or self.workspace_root is None:
+            return
+        try:
+            settings = load_settings()
+        except Exception:
+            return
+        # 工作区匹配检查
+        try:
+            current_workspace_resolved = str(Path(self.workspace_root).resolve())
+            last_workspace_resolved = str(Path(settings.last_workspace).resolve()) if settings.last_workspace else ""
+        except Exception:
+            return
+        if not last_workspace_resolved or current_workspace_resolved != last_workspace_resolved:
+            return
+        # 1. 搜索框
+        try:
+            search_text = settings.last_search_text or ""
+            if search_text and hasattr(self, "_voucher_search"):
+                self._voucher_search.setText(search_text)
+        except Exception:
+            pass
+        # 2. 筛选键
+        try:
+            filter_key = settings.last_voucher_filter_key or "all"
+            if filter_key and filter_key != getattr(self, "_active_filter", "all"):
+                if hasattr(self, "_set_voucher_filter"):
+                    self._set_voucher_filter(filter_key)
+        except Exception:
+            pass
+        # 3. voucher 选中
+        try:
+            target_voucher = settings.last_selected_voucher or ""
+            if target_voucher and target_voucher in getattr(self, "_all_flags", {}):
+                self.reveal_voucher(target_voucher) if hasattr(self, "reveal_voucher") else self.select_voucher(target_voucher)
+        except Exception:
+            pass
+        # 4. 照片视图模式（grid / single）
+        try:
+            view_mode = settings.last_photo_view_mode or "single"
+            if view_mode == "grid" and hasattr(self, "toggle_grid_mode"):
+                self.toggle_grid_mode()
+        except Exception:
+            pass
+        _startup_mark("last session UI state restored")
 
     def _on_index_sync_completed(self, elapsed_seconds: float, error: object) -> None:
         """plan v0.10.3 H1：后台索引校验完成的 UI 回调。"""
@@ -1601,6 +1654,16 @@ class SpecimenWindow(QMainWindow):
                 [int(x) for x in self.right_splitter.sizes()],
             ]
             settings.show_grid_filenames = getattr(self, "_show_grid_filenames", settings.show_grid_filenames)
+            # plan v0.10.7 U3：界面恢复——保存当前 voucher / 搜索框 / 筛选 / 照片视图模式
+            settings.last_selected_voucher = self.current_voucher or ""
+            try:
+                settings.last_search_text = (
+                    self._voucher_search.text() if hasattr(self, "_voucher_search") else ""
+                )
+            except Exception:
+                settings.last_search_text = ""
+            settings.last_voucher_filter_key = getattr(self, "_active_filter", "all") or "all"
+            settings.last_photo_view_mode = "grid" if getattr(self, "_is_grid_mode_state", False) else "single"
             save_settings(settings)
         except OSError as exc:
             # 磁盘满 / 无权限等环境问题：保存窗口状态失败可容忍，不阻断关闭，但记录到 stderr。
@@ -6368,6 +6431,31 @@ class SpecimenWindow(QMainWindow):
             self._show_update_banner(release)
             self._start_background_download_for_pending(release)
 
+    def _show_pending_update_ready_banner(self, pending) -> None:
+        """plan v0.10.7 U1：下载已就绪 → 顶部 banner 文案 + 按钮切换到"立即重启安装"。
+
+        与 ``_show_update_banner``（发现新版未下载）区别：
+          - 文案明确"已就绪"，emoji ✅
+          - [立即升级] 按钮行为：不再走 "check+download+confirm" 长流程；直接调
+            ``_launch_pending_swap(pending)`` 即刻 flush+swap+restart（已下载好）
+          - [稍后] 隐 banner 但保留 pending.json，下次启动 banner 重显
+          - [跳过此版] 删 pending.json + 加 skip 集合
+        """
+        banner = getattr(self, "_update_banner", None)
+        if banner is None:
+            self.statusBar().showMessage(
+                f"v{pending.version} 已下载就绪，下次启动即可安装", 15000
+            )
+            return
+        self._update_banner_release = None  # 清掉旧 release 引用避免误触
+        self._pending_update_ready_for_banner = pending
+        label = banner.findChild(QLabel, "_update_banner_text")
+        if label is not None:
+            label.setText(
+                f"✅ v{pending.version} 已下载就绪 · 点击「立即安装」即刻重启升级"
+            )
+        banner.show()
+
     def _show_update_banner(self, release) -> None:
         """D19 启动 banner:notify 模式有新版时主窗口顶部黄条提示。
 
@@ -6413,9 +6501,8 @@ class SpecimenWindow(QMainWindow):
                 workspace=str(workspace or ""),
             )
             write_pending(pending)
-            self.statusBar().showMessage(
-                f"v{release.version} 已下载,下次启动时弹窗确认安装", 15000
-            )
+            # plan v0.10.7 U1：下载完成立刻顶部 banner 提示一键重启，免等下次启动
+            self._show_pending_update_ready_banner(pending)
 
         worker = UpdateDownloadWorker(release, dest_root, local_roots, parent=self)
         worker.finished_download.connect(_done)
@@ -6427,7 +6514,18 @@ class SpecimenWindow(QMainWindow):
 
         相当于 VSCode "Restart to Update" / Chrome 静默后台升级用户视角的"一键"。
         失败时回落开升级中心对话框让用户手动操作。
+
+        plan v0.10.7 U1：如果当前 banner 是"下载已就绪"状态（_pending_update_ready_for_banner
+        有值），直接调 _launch_pending_swap 跳过 check/download，立即 swap。
         """
+        pending_ready = getattr(self, "_pending_update_ready_for_banner", None)
+        if pending_ready is not None:
+            banner = getattr(self, "_update_banner", None)
+            if banner is not None:
+                banner.hide()
+            self._pending_update_ready_for_banner = None
+            self._launch_pending_swap_with_confirm(pending_ready)
+            return
         self._oneclick_upgrade_now(source="banner")
 
     def _oneclick_upgrade_now(self, *, source: str = "menu") -> None:
@@ -6607,11 +6705,29 @@ class SpecimenWindow(QMainWindow):
         banner = getattr(self, "_update_banner", None)
         if banner is not None:
             banner.hide()
+        # plan v0.10.7 U1: pending 已就绪状态下点"稍后" → banner 隐藏，pending.json 留，
+        # 下次启动 _apply_pending_update_on_startup 会再次显示 banner
+        self._pending_update_ready_for_banner = None
 
     def _upgrade_banner_skip(self) -> None:
         release = getattr(self, "_update_banner_release", None)
+        pending_ready = getattr(self, "_pending_update_ready_for_banner", None)
         banner = getattr(self, "_update_banner", None)
-        if release is not None:
+        # plan v0.10.7 U1: 跳过 pending 已下载版本 → 删 pending.json + 加 skip 集合
+        if pending_ready is not None:
+            try:
+                from .updater_pending import clear_pending
+                clear_pending()
+            except Exception:
+                pass
+            settings = load_settings()
+            if pending_ready.version not in settings.auto_update_skipped_versions:
+                settings.auto_update_skipped_versions = list(
+                    settings.auto_update_skipped_versions
+                ) + [pending_ready.version]
+                save_settings(settings)
+            self._pending_update_ready_for_banner = None
+        elif release is not None:
             settings = load_settings()
             if release.version not in settings.auto_update_skipped_versions:
                 settings.auto_update_skipped_versions = list(
@@ -6624,7 +6740,14 @@ class SpecimenWindow(QMainWindow):
     # ---- D3+D11 启动入口:apply pending + sentinel 健康检查 ----
 
     def _apply_pending_update_on_startup(self) -> None:
-        """启动时检测 pending_update.json,有就弹"立即安装并重启?"三选。"""
+        """启动时检测 pending_update.json，有就显示顶部 banner（plan v0.10.7 U2 改）。
+
+        旧（v0.10.6 之前）：modal QMessageBox 三选，强阻塞主窗口。
+        新：默认走 non-modal banner（与下载完成同款），用户点[立即安装]才 swap，
+        不点也能继续录入，下次启动 banner 重显。
+
+        老用户偏好 modal 可在 settings 勾 ``pending_update_use_modal_prompt`` 兜底。
+        """
         from .updater_pending import clear_pending, read_pending
         pending = read_pending()
         if pending is None:
@@ -6635,28 +6758,29 @@ class SpecimenWindow(QMainWindow):
         kind = self._install_kind_safe()
         if kind not in ("frozen-current", "frozen-direct"):
             # source / appimage / system-package — pending state is meaningless here.
-            # Don't clear — user might be testing; just note it.
             self.statusBar().showMessage(
                 f"已下载 v{pending.version} 但当前运行模式 ({kind}) 不支持自动应用,请手动启动", 12000
             )
             return
-        msg = (
+        # plan v0.10.7 U2：默认走 banner 不弹 modal
+        use_modal = bool(getattr(load_settings(), "pending_update_use_modal_prompt", False))
+        if not use_modal:
+            self._show_pending_update_ready_banner(pending)
+            return
+        # 兜底 modal 路径（老用户偏好）
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("已下载更新")
+        box.setText(
             f"已下载新版 v{pending.version}（从 v{pending.from_version}）。\n\n"
             f"位置：{pending.bundle_dir}\n\n"
             "是否立即关闭软件并安装？\n"
             "（升级会先创建数据快照；新版仅在重启后生效。）"
         )
-        btn_install = QMessageBox.Yes
-        btn_later = QMessageBox.No
-        btn_discard = QMessageBox.Discard
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Question)
-        box.setWindowTitle("已下载更新")
-        box.setText(msg)
         box.addButton("立即安装并重启", QMessageBox.YesRole)
         box.addButton("稍后", QMessageBox.NoRole)
         box.addButton("丢弃此次更新", QMessageBox.DestructiveRole)
-        ret = box.exec_()
+        box.exec_()
         clicked = box.clickedButton()
         if clicked is None:
             return

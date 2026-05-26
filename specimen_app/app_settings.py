@@ -110,6 +110,15 @@ class AppSettings:
     # 入库编号列表字体微调档（相对基准 _VOUCHER_TABLE_BASE_PT 的增量,钳 -2..+12）。
     # 由编号列表上方 A- / A+ 按钮调节,独立于全局界面字体。
     voucher_table_font_delta: int = 0
+    # plan v0.10.7 U3：界面恢复增强——重启后恢复上次的工作区 + voucher + 搜索框 + 筛选
+    # closeEvent 保存；_finish_initial_load_step3 恢复（仅当 workspace_root == last_workspace 时）。
+    last_selected_voucher: str = ""
+    last_search_text: str = ""
+    last_voucher_filter_key: str = "all"
+    last_photo_view_mode: str = "single"  # "single" | "grid"
+    # plan v0.10.7 U2：pending update 启动提示走 banner 还是 modal 弹框
+    # 默认 False = banner（非阻塞）。True = modal（老用户偏好）。
+    pending_update_use_modal_prompt: bool = False
 
 
 def app_config_dir() -> Path:
@@ -242,6 +251,16 @@ def load_settings() -> AppSettings:
     if not isinstance(voucher_table_font_delta, int) or isinstance(voucher_table_font_delta, bool):
         voucher_table_font_delta = 0
     voucher_table_font_delta = max(-2, min(12, voucher_table_font_delta))
+    # plan v0.10.7 U3：界面恢复字段 + U2：pending banner vs modal
+    last_selected_voucher = str(data.get("last_selected_voucher", ""))
+    last_search_text = str(data.get("last_search_text", ""))
+    last_voucher_filter_key = str(data.get("last_voucher_filter_key", "all")) or "all"
+    last_photo_view_mode = str(data.get("last_photo_view_mode", "single"))
+    if last_photo_view_mode not in ("single", "grid"):
+        last_photo_view_mode = "single"
+    pending_update_use_modal_prompt = data.get("pending_update_use_modal_prompt", False)
+    if not isinstance(pending_update_use_modal_prompt, bool):
+        pending_update_use_modal_prompt = False
     return AppSettings(
         last_workspace=str(data.get("last_workspace", "")),
         recent_workspaces=[str(item) for item in data.get("recent_workspaces", []) if item],
@@ -279,6 +298,11 @@ def load_settings() -> AppSettings:
         upgrade_last_distribution_dir=upgrade_last_distribution_dir,
         upgrade_skip_current_init=upgrade_skip_current_init,
         voucher_table_font_delta=voucher_table_font_delta,
+        last_selected_voucher=last_selected_voucher,
+        last_search_text=last_search_text,
+        last_voucher_filter_key=last_voucher_filter_key,
+        last_photo_view_mode=last_photo_view_mode,
+        pending_update_use_modal_prompt=pending_update_use_modal_prompt,
     )
 
 
@@ -322,6 +346,12 @@ def save_settings(settings: AppSettings) -> None:
         "upgrade_last_distribution_dir": settings.upgrade_last_distribution_dir,
         "upgrade_skip_current_init": settings.upgrade_skip_current_init,
         "voucher_table_font_delta": settings.voucher_table_font_delta,
+        # plan v0.10.7 U3 + U2
+        "last_selected_voucher": settings.last_selected_voucher,
+        "last_search_text": settings.last_search_text,
+        "last_voucher_filter_key": settings.last_voucher_filter_key,
+        "last_photo_view_mode": settings.last_photo_view_mode,
+        "pending_update_use_modal_prompt": settings.pending_update_use_modal_prompt,
     }
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)

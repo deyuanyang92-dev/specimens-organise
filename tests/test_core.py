@@ -2404,6 +2404,63 @@ class Phase5PhotoArchiveExtractionTests(unittest.TestCase):
         )
 
 
+class Phase7SessionRestoreTests(unittest.TestCase):
+    """plan v0.10.7 U3：界面恢复增强 settings 字段持久化 + 默认值兼容。"""
+
+    def setUp(self) -> None:
+        import tempfile as _tempfile
+        self._fake_config_dir = Path(_tempfile.mkdtemp())
+        self._original_settings_path = None
+        # mock app_config_dir to redirect settings.json to temp
+        from specimen_app import app_settings as _app_settings
+        self._original_app_config_dir = _app_settings.app_config_dir
+        _app_settings.app_config_dir = lambda: self._fake_config_dir
+
+    def tearDown(self) -> None:
+        from specimen_app import app_settings as _app_settings
+        _app_settings.app_config_dir = self._original_app_config_dir
+        shutil.rmtree(self._fake_config_dir, ignore_errors=True)
+
+    def test_settings_persists_last_session_voucher_and_search(self) -> None:
+        from specimen_app.app_settings import load_settings, save_settings
+        settings = load_settings()
+        settings.last_selected_voucher = "YZZ000123"
+        settings.last_search_text = "qd-lsd"
+        settings.last_voucher_filter_key = "claimed"
+        settings.last_photo_view_mode = "grid"
+        save_settings(settings)
+        reloaded = load_settings()
+        self.assertEqual(reloaded.last_selected_voucher, "YZZ000123")
+        self.assertEqual(reloaded.last_search_text, "qd-lsd")
+        self.assertEqual(reloaded.last_voucher_filter_key, "claimed")
+        self.assertEqual(reloaded.last_photo_view_mode, "grid")
+
+    def test_settings_backward_compatible_when_new_fields_missing(self) -> None:
+        """老 settings.json (无新字段) 应能 load 并返回默认值。"""
+        from specimen_app.app_settings import load_settings, settings_path
+        import json as _json
+        # 写一份只含老字段的 settings.json
+        legacy_settings = {
+            "last_workspace": "/some/path",
+            "preview_quality": "standard",
+            "ui_font_size": 12,
+        }
+        settings_file_path = settings_path()
+        settings_file_path.parent.mkdir(parents=True, exist_ok=True)
+        with settings_file_path.open("w", encoding="utf-8") as h:
+            _json.dump(legacy_settings, h)
+        loaded = load_settings()
+        # 新字段应有默认值
+        self.assertEqual(loaded.last_selected_voucher, "")
+        self.assertEqual(loaded.last_search_text, "")
+        self.assertEqual(loaded.last_voucher_filter_key, "all")
+        self.assertEqual(loaded.last_photo_view_mode, "single")
+        self.assertFalse(loaded.pending_update_use_modal_prompt)
+        # 老字段保留
+        self.assertEqual(loaded.last_workspace, "/some/path")
+        self.assertEqual(loaded.ui_font_size, 12)
+
+
 class Phase6StartupPerfTests(unittest.TestCase):
     """plan v0.10.3 启动性能热修：H1 索引异步 + H2 WSL 检测 + H4 preheat 跳过。"""
 
