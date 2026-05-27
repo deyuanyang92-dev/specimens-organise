@@ -876,6 +876,24 @@ class ExcelStore:
             self._delete_unreferenced_photo_file(photo, remaining_photos)
         self._delete_index(voucher)
         self._record_action("delete_specimen", voucher, "specimen", "", old, {})
+        # 删除审计：写分发日志（操作记录 undo 栈已有完整数据；此处仅提供可视化管理记录）
+        try:
+            import uuid as _uuid
+            from datetime import datetime as _dt
+            self.log_alloc_event({
+                "记录ID":   str(_uuid.uuid4())[:8],
+                "时间":     _dt.now().isoformat(timespec="seconds"),
+                "类型":     "删除编号",
+                "人员":     "",
+                "用途":     "",
+                "备注":     specimen.get("管内编号*", ""),
+                "编号系列": voucher[:3] if len(voucher) >= 3 else "",
+                "编号起始": voucher,
+                "编号结束": voucher,
+                "数量":     "1",
+            })
+        except Exception:
+            pass  # 审计失败不阻断主流程
 
     def clear_photos(self, voucher: str) -> int:
         photos = self.get_photos(voucher)
@@ -2996,6 +3014,78 @@ class ExcelStore:
     def read_alloc_log(self) -> list[Row]:
         """读取全部分发记录。"""
         return self._read_plain_rows(self.data_dir / ALLOC_LOG_FILE, ALLOC_LOG_HEADERS)
+
+    def cancel_batch_reservation(self, record_id: str) -> dict:
+        """撤销一次批量预领。
+
+        - 预留段内无已录入标本时，将 next_serial 退回预留起始值并移除
+          reserved_through_serial，使断档编号重新进入自增序列。
+        - 操作前自动建数据快照。
+        - 向分发日志追加「批量取消」审计行，原「批量领取」行保留不删。
+        - 仅支持 YZZ 系列，且只能撤销当前 reserved_through_serial 匹配的最近一次预领。
+        返回 {"cancelled": n, "start": str, "end": str}。
+        """
+        from .parsing import parse_voucher_serial, format_voucher
+        from datetime import datetime as _dt
+
+        rows = self.read_alloc_log()
+        target = next(
+            (r for r in rows
+             if self._value(r, "记录ID") == record_id
+             and self._value(r, "类型") == "批量领取"),
+            None,
+        )
+        if target is None:
+            raise ValueError(f"未找到分发记录 {record_id!r}")
+
+        start_v = self._value(target, "编号起始")
+        end_v   = self._value(target, "编号结束")
+        series  = self._value(target, "编号系列") or "YZZ"
+        person  = self._value(target, "人员")
+        start_s = parse_voucher_serial(start_v)
+        end_s   = parse_voucher_serial(end_v)
+
+        # 安全检查：预留段内无已创建标本
+        index_set = self._ensure_index_voucher_set()
+        used = [
+            format_voucher(s)
+            for s in range(start_s, end_s + 1)
+            if format_voucher(s) in index_set
+        ]
+        if used:
+            sample = "、".join(used[:3]) + ("……" if len(used) > 3 else "")
+            raise ValueError(
+                f"编号 {sample} 已有录入的标本记录，无法撤销这批预领。\n"
+                "请先删除这些标本记录（须确认无科研价值）后再撤销。"
+            )
+
+        if series == "YZZ":
+            current_reserved = int(self.config.get("reserved_through_serial", 0))
+            if current_reserved != end_s:
+                raise ValueError(
+                    "此批预领不是最近一次，无法自动恢复编号段。\n"
+                    "请先撤销更新的预领记录，再处理这条。"
+                )
+            # 数据保护：建快照后再改配置
+            self.create_data_snapshot(f"撤销批量预领 {start_v}–{end_v} 前自动备份")
+            self.config["next_serial"] = start_s
+            self.config.pop("reserved_through_serial", None)
+            self._save_config()
+
+        # 追加审计行，保留原「批量领取」行
+        self.log_alloc_event({
+            "记录ID":   record_id + "_cancel",
+            "时间":     _dt.now().isoformat(timespec="seconds"),
+            "类型":     "批量取消",
+            "人员":     person,
+            "用途":     self._value(target, "用途"),
+            "备注":     f"撤销预领 {record_id}",
+            "编号系列": series,
+            "编号起始": start_v,
+            "编号结束": end_v,
+            "数量":     str(end_s - start_s + 1),
+        })
+        return {"cancelled": end_s - start_s + 1, "start": start_v, "end": end_v}
 
     # ── S2: 入库完成度判定 / 未入库编号枚举 ────────────────────────────────
 

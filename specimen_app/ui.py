@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import (
     QFormLayout,
     QFrame,
     QGridLayout,
+    QHeaderView,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
@@ -2303,7 +2304,18 @@ class SpecimenWindow(QMainWindow):
         self._series_switch_menu.aboutToShow.connect(self._populate_series_switch_menu)
         number_menu.addSeparator()
         _add(number_menu, "批量生成编号…", self._open_batch_generate, "batch_generate")
+        self._batch_new_specimens_action = _add(
+            number_menu, "批量新增入库编号…", self._open_batch_new_specimens, "batch_new_specimens"
+        )
+        self._batch_new_specimens_action.setEnabled(False)
+        number_menu.addSeparator()
         _add(number_menu, "手动添加编号…", self._open_manual_voucher, "manual_voucher")
+        number_menu.addSeparator()
+        self._cancel_batch_reservation_action = _add(
+            number_menu, "撤销批量预领…", self._open_cancel_batch_reservation, "cancel_batch_reservation"
+        )
+        number_menu.addSeparator()
+        _add(number_menu, "编号操作记录…", self._open_voucher_audit_log, "voucher_audit_log")
 
         # 顶层「WoRMS」菜单
         worms_menu = _make_menu("WoRMS")
@@ -3051,6 +3063,8 @@ class SpecimenWindow(QMainWindow):
             self._task_end_btn.setVisible(True)
             self._new_voucher_btn.setEnabled(True)
             self._new_voucher_btn.setToolTip("")
+            if hasattr(self, "_batch_new_specimens_action"):
+                self._batch_new_specimens_action.setEnabled(True)
         else:
             self._task_label.setText("未开始任务")
             self._task_label.setStyleSheet("color: #888;")
@@ -3059,12 +3073,59 @@ class SpecimenWindow(QMainWindow):
             self._task_end_btn.setVisible(False)
             self._new_voucher_btn.setEnabled(False)
             self._new_voucher_btn.setToolTip("请先开始录入任务")
+            if hasattr(self, "_batch_new_specimens_action"):
+                self._batch_new_specimens_action.setEnabled(False)
 
     def _open_batch_generate(self) -> None:
         if self.store is None:
             return
         dlg = BatchGenerateDialog(self.store, self)
         dlg.exec_()
+
+    def _open_batch_new_specimens(self) -> None:
+        if self.store is None or not self._active_task:
+            return
+        dlg = BatchNewSpecimensDialog(self._active_task, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        n = dlg.count
+        first_voucher = None
+        for i in range(n):
+            try:
+                carry: dict[str, str] = {}
+                if self.current_voucher:
+                    prev = self.store.get_specimen(self.current_voucher) or {}
+                    carry = {
+                        f: str(prev.get(f, ""))
+                        for f in CARRY_OVER_SPECIMEN_FIELDS
+                        if str(prev.get(f, "")).strip()
+                    }
+                if self._active_task:
+                    carry["信息录入人员"] = self._active_task.get("人员", "")
+                voucher = self.store.create_specimen()
+                if carry:
+                    self.store.set_fields("specimen", voucher, carry)
+                if self._active_task:
+                    self._active_task["本任务编号"].add(voucher)
+                if i == 0:
+                    first_voucher = voucher
+                self.patch_voucher_row(voucher, "added")
+            except Exception as exc:
+                QMessageBox.critical(self, "新增失败", f"第 {i+1} 条时出错：{exc}")
+                break
+        if first_voucher:
+            self.select_voucher(first_voucher)
+
+    def _open_cancel_batch_reservation(self) -> None:
+        if self.store is None:
+            return
+        dlg = CancelBatchReservationDialog(self.store, self)
+        dlg.exec_()
+
+    def _open_voucher_audit_log(self) -> None:
+        if self.store is None:
+            return
+        VoucherAuditLogDialog(self.store, self).exec_()
 
     def _open_manual_voucher(self) -> None:
         """Phase 5: 手动添加入库编号 + 规则推断 + 批量生成。"""
@@ -9983,6 +10044,19 @@ class BatchGenerateDialog(QDialog):
 
         layout = QFormLayout(self)
 
+        warn = QLabel(
+            "⚠  此功能用于多人协作：为外出采集团队预留编号段、打印标签。"
+            "预留的编号不会立即创建标本记录，使用后本地编号序列会出现断档。\n\n"
+            "如果您只是想在本机一次新建多条入库记录，请关闭此窗口，"
+            "改用菜单「编号 → 批量新增入库编号」。"
+        )
+        warn.setWordWrap(True)
+        warn.setStyleSheet(
+            "background:#fff3cd; color:#856404;"
+            "border:1px solid #ffc107; border-radius:4px; padding:8px;"
+        )
+        layout.addRow(warn)
+
         note = QLabel("预留连续编号段，不创建标本记录。可导出编号列表用于打印标签。")
         note.setWordWrap(True)
         layout.addRow(note)
@@ -10180,6 +10254,284 @@ class BatchGenerateDialog(QDialog):
             import csv
             with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
                 csv.writer(f).writerows([header] + rows)
+
+
+class BatchNewSpecimensDialog(QDialog):
+    """一次新增多条空白入库编号（本地直接创建，连续编号，无断档）。"""
+
+    def __init__(self, active_task: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("批量新增入库编号")
+        self.setMinimumWidth(400)
+        self.count = 10
+
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            "系统将连续生成指定数量的空白入库编号，直接出现在入库列表中，"
+            "您可以逐条填写标本信息。编号连续，不会产生断档。"
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#2a6fbd; background:#e8f0fb; border-radius:4px; padding:8px;")
+        layout.addWidget(info)
+
+        form = QFormLayout()
+        self._spin = QSpinBox()
+        self._spin.setRange(1, 99)
+        self._spin.setValue(10)
+        form.addRow("新增数量（1–99）", self._spin)
+        layout.addLayout(form)
+
+        person = active_task.get("人员", "")
+        purpose = active_task.get("用途", "")
+        task_lbl = QLabel(f"当前录入任务：{person}　/　{purpose}")
+        task_lbl.setStyleSheet("color:#555; font-size:11px;")
+        layout.addWidget(task_lbl)
+
+        layout.addStretch()
+
+        btns = QDialogButtonBox()
+        self._ok_btn = btns.addButton("确认新增 10 条", QDialogButtonBox.AcceptRole)
+        btns.addButton("取消", QDialogButtonBox.RejectRole)
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        self._spin.valueChanged.connect(
+            lambda v: self._ok_btn.setText(f"确认新增 {v} 条")
+        )
+
+    def _on_accept(self):
+        self.count = self._spin.value()
+        self.accept()
+
+
+class CancelBatchReservationDialog(QDialog):
+    """管理员撤销批量预领记录，恢复断档编号可用。现有标本数据不受影响。"""
+
+    def __init__(self, store, parent=None):
+        super().__init__(parent)
+        self._store = store
+        self.setWindowTitle("撤销批量预领（管理员）")
+        self.setMinimumWidth(560)
+
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            "选择要撤销的批量预领记录，系统将把这批编号恢复到可用序列中。\n"
+            "现有标本数据不受任何影响。操作前会自动保存备份。"
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#155724; background:#d4edda; border-radius:4px; padding:8px;")
+        layout.addWidget(info)
+
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(["预领时间", "领取人", "编号范围", "数量"])
+        self._table.horizontalHeader().setStretchLastSection(False)
+        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self._table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._table.setAlternatingRowColors(True)
+        layout.addWidget(self._table)
+
+        self._detail_lbl = QLabel("")
+        self._detail_lbl.setWordWrap(True)
+        self._detail_lbl.setStyleSheet("color:#856404;")
+        layout.addWidget(self._detail_lbl)
+
+        btns = QDialogButtonBox()
+        self._cancel_btn = btns.addButton("撤销选中的预领记录…", QDialogButtonBox.AcceptRole)
+        self._cancel_btn.setEnabled(False)
+        btns.addButton("关闭", QDialogButtonBox.RejectRole)
+        btns.accepted.connect(self._on_cancel_selected)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        self._table.itemSelectionChanged.connect(self._on_selection_changed)
+        self._records: list[dict] = []
+        self._load_records()
+
+    def _load_records(self):
+        self._table.setRowCount(0)
+        self._records = []
+        try:
+            rows = self._store.read_alloc_log()
+        except Exception:
+            rows = []
+
+        # 已被取消的记录ID集合
+        cancelled_ids = {
+            self._store._value(r, "记录ID").replace("_cancel", "")
+            for r in rows
+            if self._store._value(r, "类型") == "批量取消"
+        }
+
+        # 过滤出可撤销的「批量领取」
+        eligible = [
+            r for r in rows
+            if self._store._value(r, "类型") == "批量领取"
+            and self._store._value(r, "记录ID") not in cancelled_ids
+        ]
+
+        if not eligible:
+            self._detail_lbl.setText("目前没有可撤销的批量预领记录。")
+            self._cancel_btn.setEnabled(False)
+            return
+
+        for r in reversed(eligible):  # 最近的排前面
+            row_idx = self._table.rowCount()
+            self._table.insertRow(row_idx)
+            t = self._store._value(r, "时间")[:16] if self._store._value(r, "时间") else ""
+            self._table.setItem(row_idx, 0, QTableWidgetItem(t))
+            self._table.setItem(row_idx, 1, QTableWidgetItem(self._store._value(r, "人员")))
+            rng = (
+                f"{self._store._value(r, '编号起始')} – {self._store._value(r, '编号结束')}"
+            )
+            self._table.setItem(row_idx, 2, QTableWidgetItem(rng))
+            self._table.setItem(row_idx, 3, QTableWidgetItem(self._store._value(r, "数量")))
+            self._records.append(r)
+
+    def _on_selection_changed(self):
+        rows = self._table.selectedItems()
+        if not rows:
+            self._detail_lbl.setText("")
+            self._cancel_btn.setEnabled(False)
+            return
+        idx = self._table.currentRow()
+        if idx < 0 or idx >= len(self._records):
+            return
+        r = self._records[idx]
+        start = self._store._value(r, "编号起始")
+        end = self._store._value(r, "编号结束")
+        n = self._store._value(r, "数量")
+        self._detail_lbl.setText(
+            f"已选中：{start} – {end}（共 {n} 个编号）\n"
+            "撤销后，这批编号将从下次新建标本时起重新启用。"
+        )
+        self._cancel_btn.setEnabled(True)
+
+    def _on_cancel_selected(self):
+        idx = self._table.currentRow()
+        if idx < 0 or idx >= len(self._records):
+            return
+        r = self._records[idx]
+        record_id = self._store._value(r, "记录ID")
+        start = self._store._value(r, "编号起始")
+        end = self._store._value(r, "编号结束")
+        n = self._store._value(r, "数量")
+
+        # 二次确认 + 管理员密码
+        from PyQt5.QtWidgets import QInputDialog
+        msg = (
+            f"您即将撤销以下批量预领记录：\n\n"
+            f"  领取人：{self._store._value(r, '人员')}\n"
+            f"  预领时间：{self._store._value(r, '时间')[:16]}\n"
+            f"  编号范围：{start} – {end}\n"
+            f"  数量：{n} 个\n\n"
+            "系统将在操作前自动保存备份，现有标本数据不会受到任何影响。\n\n"
+            "请输入管理员密码："
+        )
+        password, ok = QInputDialog.getText(self, "确认撤销预领", msg, QLineEdit.Password)
+        if not ok or not password:
+            return
+        if password != ADMIN_PASSWORD:
+            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
+            return
+
+        try:
+            result = self._store.cancel_batch_reservation(record_id)
+            QMessageBox.information(
+                self,
+                "撤销成功",
+                f"编号 {result['start']} – {result['end']}（共 {result['cancelled']} 个）已恢复可用。\n"
+                "下次新建标本时，系统将从该范围起始编号开始分配。",
+            )
+            self._load_records()
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法撤销", str(exc))
+        except Exception as exc:
+            QMessageBox.critical(self, "撤销失败", f"操作时发生错误：{exc}")
+
+
+class VoucherAuditLogDialog(QDialog):
+    """编号操作记录汇总：领取/取消/删除/任务开始结束，支持类型/人员筛选，可导出。"""
+
+    def __init__(self, store, parent=None):
+        super().__init__(parent)
+        from .spreadsheet_preview import SpreadsheetPreviewWidget as _SPW
+        self._SPW = _SPW
+        self._store = store
+        self.setWindowTitle("编号操作记录")
+        self.resize(900, 520)
+
+        layout = QVBoxLayout(self)
+
+        # 筛选栏
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("类型："))
+        self._type_combo = QComboBox()
+        self._type_combo.addItems(["全部", "批量领取", "批量取消", "删除编号", "任务开始", "任务结束"])
+        filter_row.addWidget(self._type_combo)
+        filter_row.addSpacing(16)
+        filter_row.addWidget(QLabel("人员："))
+        self._person_combo = QComboBox()
+        filter_row.addWidget(self._person_combo)
+        btn_refresh = QPushButton("刷新")
+        btn_refresh.clicked.connect(self._refresh)
+        filter_row.addWidget(btn_refresh)
+        filter_row.addStretch()
+        layout.addLayout(filter_row)
+
+        # 表格
+        self._table = _SPW(show_export=True, show_copy=True, show_search=True)
+        layout.addWidget(self._table)
+
+        # 关闭按钮
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        # 筛选信号
+        self._type_combo.currentIndexChanged.connect(self._refresh)
+        self._person_combo.currentIndexChanged.connect(self._refresh)
+
+        self._refresh()
+
+    def _refresh(self) -> None:
+        rows_raw = self._store.read_alloc_log()
+
+        # 动态填充人员下拉（保留当前选中）
+        cur_person = self._person_combo.currentText()
+        persons = sorted({(r.get("人员") or "").strip() for r in rows_raw if (r.get("人员") or "").strip()})
+        self._person_combo.blockSignals(True)
+        self._person_combo.clear()
+        self._person_combo.addItems(["全部"] + persons)
+        idx = self._person_combo.findText(cur_person)
+        self._person_combo.setCurrentIndex(max(0, idx))
+        self._person_combo.blockSignals(False)
+
+        sel_type = self._type_combo.currentText()
+        sel_person = self._person_combo.currentText()
+        filtered = [
+            r for r in rows_raw
+            if (sel_type == "全部" or r.get("类型") == sel_type)
+            and (sel_person == "全部" or (r.get("人员") or "").strip() == sel_person)
+        ]
+        filtered.sort(key=lambda x: x.get("时间", ""), reverse=True)
+
+        columns = ["类型", "时间", "人员", "编号系列", "编号起始", "编号结束", "数量", "备注"]
+        data = []
+        for r in filtered:
+            try:
+                qty = int(r.get("数量", 0) or 0)
+            except Exception:
+                qty = 0
+            data.append([
+                r.get("类型", ""), r.get("时间", ""), r.get("人员", ""),
+                r.get("编号系列", ""), r.get("编号起始", ""), r.get("编号结束", ""),
+                qty, r.get("备注", ""),
+            ])
+        self._table.set_data(columns, data)
 
 
 class WorkloadReportDialog(QDialog):

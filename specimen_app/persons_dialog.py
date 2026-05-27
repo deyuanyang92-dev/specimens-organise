@@ -127,9 +127,9 @@ class PersonsManagerDialog(QDialog):
         self._detail_widget = SpreadsheetPreviewWidget()
         self._tabs.addTab(self._detail_widget, "📋 任务明细")
 
-        # Tab 4: 编号分发
+        # Tab 4: 操作记录（批量领取 / 批量取消 / 删除编号等）
         self._alloc_widget = SpreadsheetPreviewWidget()
-        self._tabs.addTab(self._alloc_widget, "🔢 编号分发")
+        self._tabs.addTab(self._alloc_widget, "🔢 操作记录")
 
         # 底部关闭
         foot = QHBoxLayout()
@@ -311,8 +311,9 @@ class PersonsManagerDialog(QDialog):
                 "记录ID": start.get("记录ID", ""),
             })
 
-        # 批量领取
-        allocations = [r for r in rows if r.get("类型") == "批量领取"]
+        # 旧：allocations = [r for r in rows if r.get("类型") == "批量领取"]
+        # 现：排除任务开始/结束（专属"录入任务"Tab），其余类型（批量领取/批量取消/删除编号等）全展示
+        allocations = [r for r in rows if r.get("类型") not in ("任务开始", "任务结束")]
 
         # first/last seen (按 alloc_log 中此人最早/最末出现)
         first_seen: dict[str, str] = {}
@@ -365,6 +366,8 @@ class PersonsManagerDialog(QDialog):
             s["录入标本数"] += t["录入量"]
             s["时长秒"] += t["时长秒"]
         for a in allocations:
+            if a.get("类型") != "批量领取":  # 旧：无此判断；取消/删除行不计入领取统计
+                continue
             p = (a.get("人员") or "").strip() or "(未指定)"
             try:
                 qty = int(a.get("数量", 0) or 0)
@@ -420,7 +423,7 @@ class PersonsManagerDialog(QDialog):
         self._detail_widget.set_data(columns, rows)
 
     def _fill_alloc_tab(self, allocations) -> None:
-        columns = ["时间", "人员", "编号系列", "编号起始", "编号结束", "数量", "关联任务ID", "备注"]
+        columns = ["类型", "时间", "人员", "编号系列", "编号起始", "编号结束", "数量", "备注"]
         rows = []
         for a in sorted(allocations, key=lambda x: x.get("时间", ""), reverse=True):
             try:
@@ -428,13 +431,13 @@ class PersonsManagerDialog(QDialog):
             except Exception:
                 qty = 0
             rows.append([
+                a.get("类型", ""),
                 a.get("时间", ""),
                 a.get("人员", ""),
                 a.get("编号系列", ""),
                 a.get("编号起始", ""),
                 a.get("编号结束", ""),
                 qty,
-                a.get("关联任务ID", ""),
                 a.get("备注", ""),
             ])
         self._alloc_widget.set_data(columns, rows)
