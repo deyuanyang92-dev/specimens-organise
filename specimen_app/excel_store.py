@@ -3212,6 +3212,15 @@ class ExcelStore:
         if cutoff_serial is None:
             raise ValueError(f"无效的入库编号格式：{cutoff!r}")
 
+        # 自动快照（截断重置是不可撤回的破坏性操作，必须有快照兜底）
+        try:
+            self.create_data_snapshot(
+                "截断重置前快照",
+                f"从 {cutoff} 截断重置前自动快照（781 及之后全部清除）"
+            )
+        except Exception:
+            pass  # 快照失败不阻断主流程
+
         # Step 1：删除有 specimen 行的编号（specimen / classification / photo / index）
         all_vouchers = self.list_vouchers()
         to_delete = [

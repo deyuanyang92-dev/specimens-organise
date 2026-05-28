@@ -554,7 +554,7 @@ TOOLBAR_DEFAULT_LAYOUT: dict[str, list[str]] = {
     "aux": [
         "export_data", "switch_workspace",
         "clear_photos",
-        "version_manager",
+        "version_manager", "data_snapshot",
         "settings",
     ],
 }
@@ -2024,6 +2024,10 @@ class SpecimenWindow(QMainWindow):
         manage_series_btn.setToolTip("新增 / 编辑 / 删除 入库编号系列")
         manage_series_btn.clicked.connect(self._open_series_manager)
         series_row.addWidget(manage_series_btn)
+        history_btn = QPushButton("⏪ 操作历史")
+        history_btn.setToolTip("查看操作历史快照，可回退到任意历史状态（需管理员密码）")
+        history_btn.clicked.connect(self.open_version_manager)
+        series_row.addWidget(history_btn)
         series_row.addStretch(1)
         voucher_layout.addLayout(series_row)
         # Search + quick filter
@@ -4566,6 +4570,13 @@ class SpecimenWindow(QMainWindow):
         msg.exec_()
         clicked = msg.clickedButton()
         if clicked == btn_delete:
+            try:
+                self.store.create_data_snapshot(
+                    "批量删除前快照",
+                    f"批量删除 {len(vouchers)} 个编号前自动快照"
+                )
+            except Exception:
+                pass
             deleted = self.store.delete_specimens_batch(vouchers)
             self.current_voucher = None
             self.refresh_list()
@@ -4574,6 +4585,13 @@ class SpecimenWindow(QMainWindow):
                 self.select_voucher(vouchers_remaining[0])
             self.statusBar().showMessage(f"已批量删除 {deleted} 个入库编号（编号可复用）", 5000)
         elif clicked == btn_void:
+            try:
+                self.store.create_data_snapshot(
+                    "批量注销前快照",
+                    f"批量注销 {len(vouchers)} 个编号前自动快照"
+                )
+            except Exception:
+                pass
             count = self.store.void_vouchers(vouchers)
             self.current_voucher = None
             self.refresh_list()
@@ -4617,6 +4635,14 @@ class SpecimenWindow(QMainWindow):
         )
         if answer != QMessageBox.Yes:
             return
+
+        try:
+            self.store.create_data_snapshot(
+                "强制删除前快照",
+                f"强制批量删除 {len(vouchers)} 个编号前自动快照"
+            )
+        except Exception:
+            pass
 
         # 灰条取消占位
         if placeholders:
@@ -8841,18 +8867,43 @@ class VersionManagerDialog(QDialog):
         # Data versions tab
         data_tab = QWidget()
         data_layout = QVBoxLayout(data_tab)
-        data_layout.addWidget(QPushButton("创建当前数据快照", clicked=self._create_snapshot))
+
+        hint = QLabel(
+            "每次执行截断重置、批量删除、注销等操作前会自动创建快照。\n"
+            "选中任意一条后点「回退到此版本」可恢复（需管理员密码）。"
+        )
+        hint.setStyleSheet("color:#555; font-size:11px; padding:2px 0 4px 0;")
+        hint.setWordWrap(True)
+        data_layout.addWidget(hint)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(QPushButton("📷  创建当前快照", clicked=self._create_snapshot))
+        top_row.addStretch()
+        data_layout.addLayout(top_row)
+
+        # 5 列：时间 / 操作类型 / 摘要 / 大小 / 版本ID（隐藏，供 tooltip）
         self.data_table = QTableWidget(0, 4)
-        self.data_table.setHorizontalHeaderLabels(["版本ID", "时间", "操作类型", "摘要"])
-        self.data_table.horizontalHeader().setStretchLastSection(True)
+        self.data_table.setHorizontalHeaderLabels(["时间", "操作类型", "摘要", "大小"])
+        self.data_table.horizontalHeader().setSectionResizeMode(2, self.data_table.horizontalHeader().Stretch)
+        self.data_table.setColumnWidth(0, 160)
+        self.data_table.setColumnWidth(1, 140)
+        self.data_table.setColumnWidth(3, 70)
         self.data_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.data_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.data_table.verticalHeader().setVisible(False)
+        self.data_table.setAlternatingRowColors(True)
+        # 右键菜单
+        self.data_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.data_table.customContextMenuRequested.connect(self._show_snapshot_context_menu)
         data_layout.addWidget(self.data_table, stretch=1)
+
         btn_row = QHBoxLayout()
-        btn_row.addWidget(QPushButton("回退到选中版本", clicked=self._restore_snapshot))
-        btn_row.addWidget(QPushButton("打开版本目录", clicked=self._open_snapshot_dir))
+        restore_btn = QPushButton("⏪  回退到选中版本（需管理员密码）")
+        restore_btn.clicked.connect(self._restore_snapshot)
+        btn_row.addWidget(restore_btn)
+        btn_row.addWidget(QPushButton("📂  打开版本目录", clicked=self._open_snapshot_dir))
         data_layout.addLayout(btn_row)
-        tabs.addTab(data_tab, "工作区数据版本")
+        tabs.addTab(data_tab, "操作历史 / 数据版本")
         self._populate_data_versions()
 
         # Release tab
@@ -8882,16 +8933,51 @@ class VersionManagerDialog(QDialog):
         layout.addWidget(QPushButton("关闭", clicked=self.close), alignment=Qt.AlignRight)
 
     def _populate_data_versions(self) -> None:
-        rows = self.app.store.list_data_versions()
+        import json as _json
+        rows = list(reversed(self.app.store.list_data_versions()))  # 最新在前
         self.data_table.setRowCount(len(rows))
+        # 操作类型颜色：自动快照=浅蓝，手动=浅绿，回退类=浅橙
+        _auto_ops = {"截断重置前快照", "批量删除前快照", "批量注销前快照", "强制删除前快照",
+                     "导入前快照", "回退前快照", "切换版本前快照", "Excel外部编辑前快照",
+                     "Excel 外部编辑前快照", "降级兼容版本前快照", "升级到多人协作格式前快照",
+                     "撤销批量预领前自动备份", "自动更新前快照", "清理重复照片关联前快照"}
+        _manual_ops = {"手动快照"}
         for idx, row in enumerate(rows):
-            self.data_table.setItem(idx, 0, QTableWidgetItem(str(row.get("版本ID", ""))))
-            self.data_table.setItem(idx, 1, QTableWidgetItem(str(row.get("时间", ""))))
-            self.data_table.setItem(idx, 2, QTableWidgetItem(str(row.get("操作类型", ""))))
-            self.data_table.setItem(idx, 3, QTableWidgetItem(str(row.get("摘要", ""))))
-            snapshot_path = row.get("快照路径", "")
-            if snapshot_path:
-                self.data_table.item(idx, 0).setData(Qt.UserRole, str(snapshot_path))
+            op_type  = str(row.get("操作类型", ""))
+            ts       = str(row.get("时间", ""))
+            summary  = str(row.get("摘要", ""))
+            snap_path = str(row.get("快照路径", ""))
+            # 计算快照大小
+            size_str = ""
+            if snap_path:
+                try:
+                    manifest = _json.loads((Path(snap_path) / "snapshot_manifest.json").read_text(encoding="utf-8"))
+                    total_bytes = sum(v.get("size", 0) for v in manifest.get("files", {}).values())
+                    size_str = f"{total_bytes / 1024 / 1024:.1f} MB" if total_bytes else ""
+                except Exception:
+                    pass
+            items = [
+                QTableWidgetItem(ts[:19]),       # 时间（截去毫秒）
+                QTableWidgetItem(op_type),
+                QTableWidgetItem(summary),
+                QTableWidgetItem(size_str),
+            ]
+            # 颜色区分
+            if op_type in _auto_ops:
+                bg = QColor("#e8f4fd")  # 浅蓝 = 自动快照
+            elif op_type in _manual_ops:
+                bg = QColor("#eafaea")  # 浅绿 = 手动快照
+            else:
+                bg = QColor("#fff8e6")  # 浅橙 = 其他/回退
+            for col, item in enumerate(items):
+                item.setBackground(bg)
+                if not snap_path:
+                    item.setForeground(QColor("#aaa"))  # 无快照路径 → 灰色
+                self.data_table.setItem(idx, col, item)
+            # 快照路径存在 UserRole（供回退和右键菜单使用）
+            if snap_path:
+                self.data_table.item(idx, 0).setData(Qt.UserRole, snap_path)
+                self.data_table.item(idx, 0).setToolTip(f"版本ID：{row.get('版本ID', '')}\n路径：{snap_path}")
 
     def _populate_releases(self) -> None:
         releases = list_releases(self.app.workspace_root)
@@ -8922,9 +9008,12 @@ class VersionManagerDialog(QDialog):
         snapshot = self._selected_snapshot_path()
         if not snapshot:
             return
+        # 回退是危险操作，需管理员密码
+        if not _check_admin_password_with_session(self):
+            return
         if QMessageBox.question(
             self, "确认回退",
-            f"回退前会自动保存当前状态。\n确定恢复到 {snapshot.name} 吗？",
+            f"回退前会自动保存当前状态（可再次回退）。\n确定恢复到快照 {snapshot.name} 吗？",
             QMessageBox.Yes | QMessageBox.No,
         ) != QMessageBox.Yes:
             return
@@ -8935,6 +9024,25 @@ class VersionManagerDialog(QDialog):
             return
         self.accept()
         self.app.reload_current()
+
+    def _show_snapshot_context_menu(self, pos) -> None:
+        """右键菜单：回退到此版本 / 打开目录。"""
+        row_idx = self.data_table.rowAt(pos.y())
+        if row_idx < 0:
+            return
+        item = self.data_table.item(row_idx, 0)
+        snap_path = item.data(Qt.UserRole) if item else ""
+        if not snap_path:
+            return
+        self.data_table.selectRow(row_idx)
+        menu = QMenu(self)
+        act_restore = menu.addAction("⏪  回退到此版本（需管理员密码）")
+        act_open    = menu.addAction("📂  打开版本目录")
+        chosen = menu.exec_(self.data_table.viewport().mapToGlobal(pos))
+        if chosen == act_restore:
+            self._restore_snapshot()
+        elif chosen == act_open:
+            self._open_snapshot_dir()
 
     def _open_snapshot_dir(self) -> None:
         snapshot = self._selected_snapshot_path()
