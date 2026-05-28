@@ -9689,14 +9689,17 @@ def run_app(workspace_root: Path | str | None) -> None:
         splash.show_stage("打开工作区…", 25)
     manager = WindowManager(app)
     window = manager.open_workspace(workspace_root)
-    # 行为变化:首次启动无工作区时 open_workspace 现在返回未绑定窗口(非 None),
-    # 不再走此退出分支 —— 窗口已显示并会提示选择工作区。
-    # window is None 现在仅表示真正的启动失败(如 --workspace 指向无效目录,
-    # SpecimenWindow 抛 SystemExit)。
+    # 旧：open_workspace 返回 None 时直接报"工作区无效"退出，用户无法选其他目录。
+    # 新：若指定工作区失败，自动 fallback 到未绑定模式（WelcomeDialog），
+    #     让用户选择或新建工作区而不是程序直接退出。
+    #     只有 fallback 也失败才真正退出。
+    if window is None and workspace_root is not None:
+        # 指定的工作区无法打开 → fallback 到未绑定模式
+        window = manager.open_workspace(None)
     if window is None:
         if splash is not None:
             splash.close()
-        QMessageBox.warning(None, "标本入库管理", "工作区无效,程序将退出。")
+        QMessageBox.warning(None, "标本入库管理", "启动失败，程序将退出。")
         return
     if splash is not None:
         splash.show_stage("加载界面…", 80)
