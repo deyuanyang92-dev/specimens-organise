@@ -3087,6 +3087,47 @@ class ExcelStore:
         })
         return {"cancelled": end_s - start_s + 1, "start": start_v, "end": end_v}
 
+    def cancel_placeholder_vouchers(self, vouchers: list[str]) -> int:
+        """管理员批量取消灰条占位。
+
+        向分发日志写入「取消占位」事件，``list_reserved_vouchers_pending_ingestion``
+        据此不再显示这些灰条。
+        - 不修改 reserved_through_serial / next_serial，编号仍可复用。
+        - 不要求 voucher 有 specimen 行（灰条本身无行）。
+        - 跳过已有「取消占位」记录的 voucher（幂等）。
+        返回实际写入的条数。
+        """
+        import uuid as _uuid
+        from datetime import datetime as _dt
+
+        existing_rows = self.read_alloc_log()
+        already_cancelled = {
+            self._value(r, "编号起始")
+            for r in existing_rows
+            if self._value(r, "类型") == "取消占位"
+        }
+        written = 0
+        for voucher in vouchers:
+            if voucher in already_cancelled:
+                continue
+            try:
+                self.log_alloc_event({
+                    "记录ID":   str(_uuid.uuid4())[:8],
+                    "时间":     _dt.now().isoformat(timespec="seconds"),
+                    "类型":     "取消占位",
+                    "人员":     "",
+                    "用途":     "",
+                    "备注":     "管理员取消灰条占位",
+                    "编号系列": voucher[:3] if len(voucher) >= 3 else "",
+                    "编号起始": voucher,
+                    "编号结束": voucher,
+                    "数量":     "1",
+                })
+                written += 1
+            except Exception:
+                pass
+        return written
+
     # ── S2: 入库完成度判定 / 未入库编号枚举 ────────────────────────────────
 
     def is_voucher_ingestion_complete(self, voucher: str) -> bool:
@@ -3114,6 +3155,18 @@ class ExcelStore:
             for row in self.read_rows("specimen")
             if self._value(row, "入库编号*")
         }
+        # 旧：只排除 existing_specimen_vouchers。
+        # 新：额外排除「删除编号」和「取消占位」事件中的凭证：
+        #   - 删除编号：标本已创建后被删除，不应重现灰条
+        #   - 取消占位：管理员主动取消灰条占位（编号仍可复用）
+        # 若用户撤回（undo）删除，specimen 行恢复，existing_specimen_vouchers 会包含该凭证，
+        # 灰条逻辑自然退化，此处无需特殊处理。
+        deleted_vouchers: set[str] = set()
+        for alloc_row in self.read_alloc_log():
+            if self._value(alloc_row, "类型") in ("删除编号", "取消占位"):
+                v = self._value(alloc_row, "编号起始")
+                if v:
+                    deleted_vouchers.add(v)
         result: list[dict[str, str]] = []
         seen_vouchers: set[str] = set()
         for alloc_row in reversed(self.read_alloc_log()):
@@ -3130,6 +3183,8 @@ class ExcelStore:
                 seen_vouchers.add(voucher)
                 if voucher in existing_specimen_vouchers:
                     continue  # 已建 specimen 行 → 不属于"待入库占位"
+                if voucher in deleted_vouchers:
+                    continue  # 已明确删除 → 不重现灰条
                 result.append({
                     "voucher": voucher,
                     "reserver_name": reserver_name,

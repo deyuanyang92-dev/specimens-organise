@@ -56,7 +56,7 @@ from PyQt5.QtWidgets import (
     QWidget,
     QCompleter,
 )
-from PyQt5.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
+from PyQt5.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QAbstractItemView
 
 from . import __version__
 from .app_settings import (
@@ -2065,6 +2065,7 @@ class SpecimenWindow(QMainWindow):
         # 原代码：SingleSelection 仅单选；改为 ExtendedSelection 支持 Windows 操作习惯：
         # Ctrl+Click 多选 / Shift+Click 范围选 / 拖拽多选
         self.voucher_table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.voucher_table.setDragMode(QAbstractItemView.RubberBandSelection)
         self.voucher_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.voucher_table.verticalHeader().setVisible(False)
         # 旧逻辑：列宽硬编码 85/36/36/36/52/42，表格字体固定 QFont("Consolas", 10)。
@@ -2314,6 +2315,7 @@ class SpecimenWindow(QMainWindow):
         self._cancel_batch_reservation_action = _add(
             number_menu, "撤销批量预领…", self._open_cancel_batch_reservation, "cancel_batch_reservation"
         )
+        _add(number_menu, "管理员按范围删除编号…", self._open_admin_delete_range, "admin_delete_range")
         number_menu.addSeparator()
         _add(number_menu, "编号操作记录…", self._open_voucher_audit_log, "voucher_audit_log")
 
@@ -2408,6 +2410,11 @@ class SpecimenWindow(QMainWindow):
         # 自定义工具栏 / 自定义快捷键入口（D / E）
         view_menu.addAction("自定义工具栏…", self._open_toolbar_customize)
         view_menu.addAction("自定义快捷键…", self._open_shortcuts_customize)
+        view_menu.addSeparator()
+        refresh_action = QAction("刷新列表 (F5)", self)
+        refresh_action.setShortcut(QKeySequence("F5"))
+        refresh_action.triggered.connect(self._refresh_and_keep_selection)
+        view_menu.addAction(refresh_action)
         view_menu.addSeparator()
         reset_layout_action = QAction("重置窗口布局", self)
         reset_layout_action.triggered.connect(self._reset_window_layout)
@@ -2827,6 +2834,16 @@ class SpecimenWindow(QMainWindow):
     def _schedule_list_refresh(self) -> None:
         self._list_refresh_timer.start(300)
 
+    def _refresh_and_keep_selection(self) -> None:
+        """F5 / 右键刷新：重新从磁盘读取，保持当前选中编号。
+        旧：_row_cache.clear() — 无线程保护，后台 worker 并发访问 OrderedDict 不安全。
+        新：直接 reload_current()；_cached_rows() 内置 mtime 检测，文件改变时自动失效。
+        """
+        if self.store is None:
+            return
+        self.reload_current()
+        self.statusBar().showMessage("列表已刷新", 2000)
+
     def refresh_list(self) -> None:
         if self.store is None:
             return
@@ -3121,6 +3138,17 @@ class SpecimenWindow(QMainWindow):
             return
         dlg = CancelBatchReservationDialog(self.store, self)
         dlg.exec_()
+
+    def _open_admin_delete_range(self) -> None:
+        if self.store is None:
+            return
+        dlg = AdminDeleteRangeDialog(self.store, self)
+        if dlg.exec_() == QDialog.Accepted:
+            self.current_voucher = None
+            self.refresh_list()
+            remaining = self.store.list_vouchers()
+            if remaining:
+                self.select_voucher(remaining[0])
 
     def _open_voucher_audit_log(self) -> None:
         if self.store is None:
@@ -4035,42 +4063,74 @@ class SpecimenWindow(QMainWindow):
             if item and item.text().strip():
                 selected_vouchers.append(item.text().strip())
 
+        reserved_pending = getattr(self, "_reserved_pending_metadata", {})
+        # 区分灰条（仅占位，无 specimen 行）和正式入库行
+        placeholder_vouchers = [v for v in selected_vouchers if v in reserved_pending]
+        ingested_vouchers    = [v for v in selected_vouchers if v not in reserved_pending]
+
         menu = QMenu(self)
-        # 批量导出：将选中的入库编号带入对话框（单行也支持，方便快捷导出当前标本）
-        if len(selected_vouchers) >= 1:
-            menu.addAction(
-                f"批量导出选中 ({len(selected_vouchers)}个)",
-                lambda: self._context_batch_export(selected_vouchers),
-            )
-            menu.addAction(
-                f"批量设置标本信息 ({len(selected_vouchers)}个)",
-                lambda: self._batch_set_specimen_fields(selected_vouchers),
-            )
-            menu.addSeparator()
-        menu.addAction("清除照片关联", lambda: self._context_clear_photos(voucher_text))
+        menu.addAction("刷新列表 (F5)", self._refresh_and_keep_selection)
         menu.addSeparator()
-
-        # 单行删除（右键点击的行）
-        has_photos = bool(self.store.get_photos(voucher_text))
-        if not has_photos:
-            menu.addAction("删除入库编号", lambda: self._context_delete_voucher(voucher_text))
-        else:
-            menu.addAction("删除入库编号（需先清除照片关联）").setEnabled(False)
-
-        # 多选批量删除：仅当选中 >= 2 行时显示
-        if len(selected_vouchers) >= 2:
+        # 批量导出：将选中的入库编号带入对话框（单行也支持，方便快捷导出当前标本）
+        if len(ingested_vouchers) >= 1:
+            menu.addAction(
+                f"批量导出选中 ({len(ingested_vouchers)}个)",
+                lambda: self._context_batch_export(ingested_vouchers),
+            )
+            menu.addAction(
+                f"批量设置标本信息 ({len(ingested_vouchers)}个)",
+                lambda: self._batch_set_specimen_fields(ingested_vouchers),
+            )
             menu.addSeparator()
-            # 统计可删除的（无照片关联的）数量
-            eligible = [v for v in selected_vouchers if not self.store.get_photos(v)]
-            skipped = len(selected_vouchers) - len(eligible)
-            label = f"删除选中的入库编号 ({len(eligible)}个)"
-            if skipped:
-                label += f"，跳过{skipped}个有照片的"
-            action = menu.addAction(label)
-            if not eligible:
-                action.setEnabled(False)
+
+        # 灰条占位：管理员可批量取消（编号仍可复用）
+        if placeholder_vouchers:
+            ph = list(placeholder_vouchers)
+            menu.addAction(
+                f"取消占位（{len(ph)}个灰条）…",
+                lambda: self._context_cancel_placeholder_vouchers(ph),
+            )
+            menu.addSeparator()
+
+        if voucher_text not in reserved_pending:
+            menu.addAction("清除照片关联", lambda: self._context_clear_photos(voucher_text))
+            menu.addSeparator()
+
+            # 单行删除（右键点击的行）
+            has_photos = bool(self.store.get_photos(voucher_text))
+            if not has_photos:
+                menu.addAction("删除入库编号（可复用）", lambda: self._context_delete_voucher(voucher_text))
             else:
-                action.triggered.connect(lambda: self._context_batch_delete_vouchers(eligible))
+                menu.addAction("删除入库编号（需先清除照片关联）").setEnabled(False)
+
+            # 多选批量删除
+            if len(ingested_vouchers) >= 2:
+                menu.addSeparator()
+                eligible_no_photo = [v for v in ingested_vouchers if not self.store.get_photos(v)]
+                has_photo_count   = len(ingested_vouchers) - len(eligible_no_photo)
+                # 普通批量删除（无照片行）
+                if eligible_no_photo:
+                    label = f"删除选中的入库编号（可复用，{len(eligible_no_photo)}个）"
+                    if has_photo_count:
+                        label += f"，跳过{has_photo_count}个有照片的"
+                    iv = list(eligible_no_photo)
+                    menu.addAction(label, lambda: self._context_batch_delete_vouchers(iv))
+                # 管理员强制批量删除（含照片的一并处理）
+                if has_photo_count:
+                    all_iv = list(ingested_vouchers)
+                    menu.addAction(
+                        f"管理员强制删除选中全部（{len(all_iv)}个，含{has_photo_count}个有照片）…",
+                        lambda: self._context_admin_force_delete_vouchers(all_iv),
+                    )
+
+        # 混合选中（灰条 + 已入库）：管理员一键清除全部
+        if placeholder_vouchers and ingested_vouchers:
+            all_selected = list(selected_vouchers)
+            menu.addSeparator()
+            menu.addAction(
+                f"管理员清除选中全部（{len(all_selected)}个，含灰条+数据）…",
+                lambda: self._context_admin_force_delete_vouchers(all_selected),
+            )
 
         menu.exec_(self.voucher_table.viewport().mapToGlobal(pos))
 
@@ -4426,7 +4486,8 @@ class SpecimenWindow(QMainWindow):
     def _context_delete_voucher(self, voucher: str) -> None:
         password, ok = QInputDialog.getText(
             self, "删除入库编号",
-            f"删除 {voucher} 将永久移除该编号及其标本信息、分类信息。\n\n请输入管理密码确认删除：",
+            f"删除 {voucher} 将永久移除该编号的标本信息、分类信息。\n\n"
+            f"注意：删除后该编号仍可被复用（非永久废除）。\n\n请输入管理密码确认删除：",
             QLineEdit.Password,
         )
         if not ok or not password:
@@ -4436,7 +4497,9 @@ class SpecimenWindow(QMainWindow):
             return
         answer = QMessageBox.warning(
             self, "确认删除",
-            f"密码验证通过。\n\n确定要永久删除 {voucher} 吗？\n删除后可通过「撤回」恢复，但超出撤回深度后将永久丢失。",
+            f"密码验证通过。\n\n确定要删除 {voucher} 的标本数据吗？\n"
+            f"· 删除后可通过「撤回」恢复，但超出撤回深度后将永久丢失。\n"
+            f"· 该编号删除后仍可复用（如需永久废除，待后续版本支持）。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -4449,7 +4512,7 @@ class SpecimenWindow(QMainWindow):
         vouchers = self.store.list_vouchers()
         if vouchers:
             self.select_voucher(vouchers[0])
-        self.statusBar().showMessage(f"已删除 {voucher}", 3000)
+        self.statusBar().showMessage(f"已删除 {voucher}（编号可复用）", 3000)
 
     def _context_batch_delete_vouchers(self, vouchers: list[str]) -> None:
         """批量删除选中的入库编号（不含照片关联的凭证）。"""
@@ -4458,10 +4521,10 @@ class SpecimenWindow(QMainWindow):
         # 密码验证（一次）
         password, ok = QInputDialog.getText(
             self, "批量删除入库编号",
-            f"将删除 {len(vouchers)} 个入库编号及对应的标本信息、分类信息。\n\n"
+            f"将删除 {len(vouchers)} 个入库编号的标本信息、分类信息。\n\n"
             f"编号列表：{', '.join(vouchers[:10])}"
             + (f" ...等共{len(vouchers)}个" if len(vouchers) > 10 else "")
-            + "\n\n请输入管理密码确认删除：",
+            + "\n\n注意：删除后编号仍可复用（非永久废除）。\n\n请输入管理密码确认删除：",
             QLineEdit.Password,
         )
         if not ok or not password:
@@ -4472,10 +4535,11 @@ class SpecimenWindow(QMainWindow):
         # 二次确认
         answer = QMessageBox.warning(
             self, "确认批量删除",
-            f"密码验证通过。\n\n确定要永久删除以下 {len(vouchers)} 个入库编号吗？\n"
+            f"密码验证通过。\n\n确定要删除以下 {len(vouchers)} 个入库编号的标本数据吗？\n"
             + "\n".join(f"  · {v}" for v in vouchers[:20])
             + ("\n  ..." if len(vouchers) > 20 else "")
-            + "\n\n删除后可通过「撤回」逐条恢复，但超出撤回深度后将永久丢失。",
+            + "\n\n· 删除后可通过「撤回」逐条恢复，但超出撤回深度后将永久丢失。\n"
+            + "· 这些编号删除后仍可复用（如需永久废除，待后续版本支持）。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -4492,6 +4556,110 @@ class SpecimenWindow(QMainWindow):
         if vouchers_remaining:
             self.select_voucher(vouchers_remaining[0])
         self.statusBar().showMessage(f"已批量删除 {deleted} 个入库编号", 5000)
+
+    def _context_admin_force_delete_vouchers(self, vouchers: list[str]) -> None:
+        """管理员强制批量删除：灰条取消占位，已入库的先清照片再删数据。编号可复用。"""
+        if not vouchers:
+            return
+        # 旧：用 _reserved_pending_metadata（UI 缓存），可能在操作间隙过期。
+        # 新：从 store 实时查，确保确认框摘要与实际执行一致。
+        live_pending = {e["voucher"] for e in self.store.list_reserved_vouchers_pending_ingestion()}
+        placeholders = [v for v in vouchers if v in live_pending]
+        ingested     = [v for v in vouchers if v not in live_pending]
+        with_photos  = [v for v in ingested if self.store.get_photos(v)]
+        no_photos    = [v for v in ingested if not self.store.get_photos(v)]
+
+        summary_lines = []
+        if placeholders:
+            summary_lines.append(f"· 取消占位灰条：{len(placeholders)} 个")
+        if no_photos:
+            summary_lines.append(f"· 删除标本数据（无照片）：{len(no_photos)} 个")
+        if with_photos:
+            summary_lines.append(f"· 先清照片关联再删标本数据：{len(with_photos)} 个（照片归档副本一并删除）")
+
+        password, ok = QInputDialog.getText(
+            self, "管理员强制批量删除",
+            f"将处理 {len(vouchers)} 个编号：\n"
+            + "\n".join(summary_lines)
+            + "\n\n编号删除后仍可复用（非永久废除）。\n请输入管理密码确认：",
+            QLineEdit.Password,
+        )
+        if not ok or not password:
+            return
+        if password != ADMIN_PASSWORD:
+            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
+            return
+
+        preview = ", ".join(vouchers[:10]) + (f" …等{len(vouchers)}个" if len(vouchers) > 10 else "")
+        answer = QMessageBox.warning(
+            self, "确认强制批量删除",
+            f"确定要处理以下编号吗？\n{preview}\n\n"
+            + "\n".join(summary_lines)
+            + "\n\n· 标本/分类数据删除后可通过「撤回」逐条恢复（超出撤回深度则永久丢失）\n"
+            + "· 取消占位不可通过撤回恢复（可重新批量预领）\n"
+            + "· 编号均可复用",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        # 灰条取消占位
+        if placeholders:
+            self.store.cancel_placeholder_vouchers(placeholders)
+        # 已入库：有照片先清，再删标本
+        deleted = 0
+        for v in ingested:
+            if self.store.get_photos(v):
+                self.store.clear_photos(v)
+            self.store.delete_specimen(v)
+            deleted += 1
+
+        self.current_voucher = None
+        self.refresh_list()
+        remaining = self.store.list_vouchers()
+        if remaining:
+            self.select_voucher(remaining[0])
+        parts = []
+        if placeholders:
+            parts.append(f"取消占位 {len(placeholders)} 个")
+        if deleted:
+            parts.append(f"删除标本 {deleted} 个")
+        self.statusBar().showMessage("、".join(parts) + "（编号可复用）", 5000)
+
+    def _context_cancel_placeholder_vouchers(self, vouchers: list[str]) -> None:
+        """管理员批量取消灰条占位（编号不废除，仍可复用）。"""
+        if not vouchers:
+            return
+        password, ok = QInputDialog.getText(
+            self, "取消占位",
+            f"将取消 {len(vouchers)} 个灰条占位编号：\n"
+            + ", ".join(vouchers[:10])
+            + (f" ...等共{len(vouchers)}个" if len(vouchers) > 10 else "")
+            + "\n\n这些编号将不再显示为待入库灰条，但编号本身仍可复用。\n"
+            + "（如需撤回，请重新做一次批量预领，或在「编号→撤销批量预领」中操作整批）\n\n"
+            + "请输入管理密码确认：",
+            QLineEdit.Password,
+        )
+        if not ok or not password:
+            return
+        if password != ADMIN_PASSWORD:
+            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
+            return
+        answer = QMessageBox.warning(
+            self, "确认取消占位",
+            f"确定取消以下 {len(vouchers)} 个灰条占位吗？\n"
+            + "\n".join(f"  · {v}" for v in vouchers[:20])
+            + ("\n  ..." if len(vouchers) > 20 else "")
+            + "\n\n取消后灰条消失，编号仍可复用（不会被永久废除）。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        written = self.store.cancel_placeholder_vouchers(vouchers)
+        self.refresh_list()
+        self.statusBar().showMessage(f"已取消 {written} 个占位编号（编号可复用）", 5000)
 
     def undo(self) -> None:
         action = self.store.undo_last()
@@ -10318,8 +10486,10 @@ class CancelBatchReservationDialog(QDialog):
         layout = QVBoxLayout(self)
 
         info = QLabel(
-            "选择要撤销的批量预领记录，系统将把这批编号恢复到可用序列中。\n"
-            "现有标本数据不受任何影响。操作前会自动保存备份。"
+            "选择要撤销的批量预领记录，系统将把整批编号恢复到可用序列中。\n"
+            "现有标本数据不受任何影响。操作前会自动保存备份。\n\n"
+            "提示：如需只取消部分灰条编号（不整批撤销），请回到主列表，\n"
+            "右键选中灰条行后使用「取消占位」。"
         )
         info.setWordWrap(True)
         info.setStyleSheet("color:#155724; background:#d4edda; border-radius:4px; padding:8px;")
@@ -10451,6 +10621,145 @@ class CancelBatchReservationDialog(QDialog):
             QMessageBox.warning(self, "无法撤销", str(exc))
         except Exception as exc:
             QMessageBox.critical(self, "撤销失败", f"操作时发生错误：{exc}")
+
+
+class AdminDeleteRangeDialog(QDialog):
+    """管理员按编号范围批量删除（灰条取消占位 + 已入库先清照片再删数据）。编号可复用。"""
+
+    def __init__(self, store, parent=None):
+        super().__init__(parent)
+        self._store = store
+        self.setWindowTitle("管理员按范围删除编号")
+        self.setMinimumWidth(480)
+
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            "输入起止编号，系统自动处理范围内所有编号：\n"
+            "  · 灰条（未入库占位）→ 取消占位\n"
+            "  · 已入库（有标本数据）→ 先清照片关联，再删标本数据\n\n"
+            "删除后编号仍可复用（非永久废除）。操作需管理员密码。"
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#155724; background:#d4edda; border-radius:4px; padding:8px;")
+        layout.addWidget(info)
+
+        form = QFormLayout()
+        self._start_edit = QLineEdit()
+        self._start_edit.setPlaceholderText("例：YZZ000782")
+        self._end_edit   = QLineEdit()
+        self._end_edit.setPlaceholderText("例：YZZ000889")
+        form.addRow("起始编号：", self._start_edit)
+        form.addRow("结束编号：", self._end_edit)
+        layout.addLayout(form)
+
+        self._preview_lbl = QLabel("")
+        self._preview_lbl.setWordWrap(True)
+        self._preview_lbl.setStyleSheet("color:#856404;")
+        layout.addWidget(self._preview_lbl)
+
+        btns = QDialogButtonBox()
+        self._preview_btn = btns.addButton("预览范围", QDialogButtonBox.ActionRole)
+        self._exec_btn    = btns.addButton("执行删除…", QDialogButtonBox.AcceptRole)
+        self._exec_btn.setEnabled(False)
+        btns.addButton("取消", QDialogButtonBox.RejectRole)
+        self._preview_btn.clicked.connect(self._on_preview)
+        btns.accepted.connect(self._on_execute)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        self._vouchers_in_range: list[str] = []
+
+    def _resolve_range(self) -> list[str] | None:
+        from .parsing import parse_voucher_serial, format_voucher
+        from .accession_series import AccessionSeries
+        start_raw = self._start_edit.text().strip()
+        end_raw   = self._end_edit.text().strip()
+        if not start_raw or not end_raw:
+            return None
+        try:
+            s = parse_voucher_serial(start_raw)
+            e = parse_voucher_serial(end_raw)
+        except Exception:
+            return None
+        if s is None or e is None or s > e:
+            return None
+        prefix = "".join(c for c in start_raw if not c.isdigit())
+        return [f"{prefix}{i:06d}" for i in range(s, e + 1)]
+
+    def _on_preview(self) -> None:
+        vouchers = self._resolve_range()
+        if not vouchers:
+            self._preview_lbl.setText("输入格式有误或起始 > 结束，请检查。")
+            self._exec_btn.setEnabled(False)
+            return
+
+        all_vouchers_in_db = set(self._store.list_vouchers())
+        reserved_pending   = {
+            entry["voucher"]
+            for entry in self._store.list_reserved_vouchers_pending_ingestion()
+        }
+        placeholders = [v for v in vouchers if v in reserved_pending]
+        ingested     = [v for v in vouchers if v in all_vouchers_in_db and v not in reserved_pending]
+        with_photos  = [v for v in ingested if self._store.get_photos(v)]
+        no_photos    = [v for v in ingested if not self._store.get_photos(v)]
+        not_exist    = [v for v in vouchers if v not in reserved_pending and v not in all_vouchers_in_db]
+
+        lines = [f"范围：{vouchers[0]} → {vouchers[-1]}，共 {len(vouchers)} 个"]
+        if placeholders:
+            lines.append(f"  · 灰条占位：{len(placeholders)} 个（取消占位）")
+        if no_photos:
+            lines.append(f"  · 已入库无照片：{len(no_photos)} 个（删标本数据）")
+        if with_photos:
+            lines.append(f"  · 已入库有照片：{len(with_photos)} 个（清照片关联后删数据）")
+        if not_exist:
+            lines.append(f"  · 不存在/已处理：{len(not_exist)} 个（跳过）")
+        self._preview_lbl.setText("\n".join(lines))
+
+        to_process = placeholders + ingested
+        self._vouchers_in_range = to_process
+        self._exec_btn.setEnabled(bool(to_process))
+
+    def _on_execute(self) -> None:
+        if not self._vouchers_in_range:
+            return
+        password, ok = QInputDialog.getText(
+            self, "管理员验证",
+            f"将删除 {len(self._vouchers_in_range)} 个编号，请输入管理密码：",
+            QLineEdit.Password,
+        )
+        if not ok or not password:
+            return
+        if password != ADMIN_PASSWORD:
+            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
+            return
+
+        reserved_pending = {
+            entry["voucher"]
+            for entry in self._store.list_reserved_vouchers_pending_ingestion()
+        }
+        placeholders = [v for v in self._vouchers_in_range if v in reserved_pending]
+        ingested     = [v for v in self._vouchers_in_range if v not in reserved_pending]
+
+        if placeholders:
+            self._store.cancel_placeholder_vouchers(placeholders)
+        deleted = 0
+        for v in ingested:
+            if self._store.get_photos(v):
+                self._store.clear_photos(v)
+            self._store.delete_specimen(v)
+            deleted += 1
+
+        parts = []
+        if placeholders:
+            parts.append(f"取消占位 {len(placeholders)} 个")
+        if deleted:
+            parts.append(f"删除标本 {deleted} 个")
+        QMessageBox.information(
+            self, "完成",
+            "、".join(parts) + "\n编号已可复用。",
+        )
+        self.accept()
 
 
 class VoucherAuditLogDialog(QDialog):
