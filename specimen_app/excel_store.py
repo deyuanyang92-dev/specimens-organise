@@ -284,12 +284,18 @@ class ExcelStore:
                 )
             return _denied
         write_methods = [
-            "create_specimen", "set_fields", "import_workspace",
+            "create_specimen", "create_specimen_with_voucher", "set_fields", "import_workspace",
+            "import_from_file",
             "create_data_snapshot", "restore_data_snapshot",
             "undo_last", "redo_last", "set_undo_depth",
             "downgrade_schema_version", "batch_reserve_vouchers",
             "log_alloc_event", "set_active_series",
+            "add_series", "remove_series", "update_series_counter",
             "ensure_assignee_series", "upgrade_to_multi_user_protocol",
+            "delete_specimen", "delete_specimens_batch",
+            "cancel_placeholder_vouchers", "reset_next_serial", "rollback_to_voucher",
+            "void_vouchers", "dedupe_photo_links",
+            "resolve_pending_transaction", "vacuum_transaction_journal",
             # plan A2: 原列表漏了照片相关写方法，只读模式下 UI 灰化前仍可被 Python 调用绕过
             "add_photo", "add_photos", "delete_photo", "replace_photo",
             "set_photo_filename", "set_photo_description",
@@ -991,6 +997,49 @@ class ExcelStore:
             self._auto_cleanup_alloc_after_delete([d["voucher"] for d in old_data])
         except Exception:
             pass
+        return len(old_data)
+
+    def _delete_specimens_batch_without_undo(self, vouchers: list[str]) -> int:
+        """内部删除路径：不写 action-log，用于「注销编号」这类不可撤回操作。
+
+        旧：void_vouchers 复用 delete_specimens_batch，会写 delete_specimen action-log，
+        用户仍可能通过撤回恢复数据，和 UI 的「注销不可撤回」承诺不一致。
+        新：注销只走本内部路径，仍清主表/索引/照片归档并同步 next_serial，但不记录 undo。
+        """
+        voucher_set = set(vouchers)
+        old_data: list[dict] = []
+        for v in vouchers:
+            spec = self.get_specimen(v)
+            if spec is None:
+                continue
+            old_data.append({
+                "voucher": v,
+                "photos": self.get_photos(v),
+            })
+        if not old_data:
+            return 0
+        actual_set = {d["voucher"] for d in old_data}
+        remaining_specimens = [
+            r for r in self.read_rows("specimen")
+            if self._value(r, "入库编号*") not in actual_set
+        ]
+        remaining_class = [
+            r for r in self.read_rows("classification")
+            if self._value(r, "入库编号*") not in actual_set
+        ]
+        remaining_photos = [
+            r for r in self.read_rows("photo")
+            if self._value(r, "入库编号*") not in actual_set
+        ]
+        for d in old_data:
+            for photo in d["photos"]:
+                self._delete_unreferenced_photo_file(photo, remaining_photos)
+        self._write_rows("specimen", remaining_specimens)
+        self._write_rows("classification", remaining_class)
+        self._write_rows("photo", remaining_photos)
+        for d in old_data:
+            self._delete_index(d["voucher"])
+        self._sync_next_serial()
         return len(old_data)
 
     def clear_photos(self, voucher: str) -> int:
@@ -2379,7 +2428,14 @@ class ExcelStore:
         # 不修改 action 状态。Excel 文件多步写入仍无真事务(已知限制),日后专项重构。
         rows = self._read_plain_rows(self.data_dir / ACTION_LOG_FILE)
         depth = int(self.config.get("undo_depth", 200))
-        candidates = [row for row in rows[-depth:] if self._value(row, "是否撤销") != "是"]
+        voided = self.list_voided_vouchers()
+        # 旧：注销本身不写 action-log 后，历史 create/update action 仍可能被 undo 反向复活。
+        # 新：已注销编号的历史 action 一律跳过，保证「注销不可撤回」语义。
+        candidates = [
+            row for row in rows[-depth:]
+            if self._value(row, "是否撤销") != "是"
+            and self._value(row, "入库编号") not in voided
+        ]
         if not candidates:
             return None
         action = candidates[-1]
@@ -2396,12 +2452,22 @@ class ExcelStore:
     def redo_last(self) -> str | None:
         # 同 undo_last 的 try/except 保护。
         rows = self._read_plain_rows(self.data_dir / ACTION_LOG_FILE)
-        if not any(self._value(row, "是否撤销") == "是" for row in rows):
+        voided = self.list_voided_vouchers()
+        if not any(
+            self._value(row, "是否撤销") == "是"
+            and self._value(row, "入库编号") not in voided
+            for row in rows
+        ):
             return None
         start = len(rows) - 1
-        while start >= 0 and self._value(rows[start], "是否撤销") == "是":
+        while start >= 0 and (
+            self._value(rows[start], "是否撤销") == "是"
+            or self._value(rows[start], "入库编号") in voided
+        ):
             start -= 1
         action_index = start + 1
+        while action_index < len(rows) and self._value(rows[action_index], "入库编号") in voided:
+            action_index += 1
         if action_index >= len(rows):
             return None
         action = rows[action_index]
@@ -3250,6 +3316,26 @@ class ExcelStore:
 
         # Step 3：回拨 next_serial，清 reserved_through_serial
         self.reset_next_serial(cutoff_serial)
+        # Step 4：若截止编号之前被「注销」，回滚操作意味着重新起用该编号段，
+        # 写入「取消注销」事件覆盖注销状态，确保 next_voucher 不会跳过截止编号。
+        try:
+            voided = self.list_voided_vouchers()
+            cutoff_v = format_voucher(cutoff_serial)
+            if cutoff_v in voided:
+                import uuid as _uuid
+                from datetime import datetime as _dt
+                self.log_alloc_event({
+                    "记录ID": str(_uuid.uuid4())[:8],
+                    "时间": _dt.now().isoformat(timespec="seconds"),
+                    "类型": "取消注销",
+                    "编号起始": cutoff_v,
+                    "编号结束": cutoff_v,
+                    "备注": f"从 {cutoff} 截断重置自动取消注销",
+                })
+                self._voided_cache = None
+                self._voided_cache_mtime = -1.0
+        except Exception:
+            pass
         return {"deleted": deleted, "reset_to": cutoff}
 
     def _auto_cleanup_alloc_after_delete(self, deleted_vouchers: list[str]) -> None:
@@ -3271,11 +3357,12 @@ class ExcelStore:
         }
 
         rows = self.read_alloc_log()
-        # 已有「取消占位/删除编号」事件的编号集（避免重复写）
+        # 旧：只排除「取消占位/删除编号」事件中的凭证。
+        # 新：同样排除「注销编号」和「取消注销」，保持与 list_reserved_vouchers_pending_ingestion 一致。
         already_handled = {
             self._value(r, "编号起始")
             for r in rows
-            if self._value(r, "类型") in ("取消占位", "删除编号")
+            if self._value(r, "类型") in ("取消占位", "删除编号", "注销编号", "取消注销")
             and self._value(r, "编号起始")
         }
 
@@ -3427,7 +3514,7 @@ class ExcelStore:
         # 只删有 specimen 行的编号（灰条由 cancel_placeholder_vouchers 处理）
         has_specimen = [v for v in vouchers if self.get_specimen(v) is not None]
         if has_specimen:
-            self.delete_specimens_batch(has_specimen)
+            self._delete_specimens_batch_without_undo(has_specimen)
         # 灰条占位也取消（确保注销后从列表彻底消失）
         placeholders = [v for v in vouchers if v not in has_specimen]
         if placeholders:
@@ -3463,10 +3550,14 @@ class ExcelStore:
             return set(self._voided_cache)
         result: set[str] = set()
         for row in self.read_alloc_log():
-            if self._value(row, "类型") == "注销编号":
-                v = self._value(row, "编号起始")
-                if v:
-                    result.add(v)
+            etype = self._value(row, "类型")
+            v     = self._value(row, "编号起始")
+            if not v:
+                continue
+            if etype == "注销编号":
+                result.add(v)
+            elif etype == "取消注销":
+                result.discard(v)  # rollback_to_voucher 覆盖注销状态
         self._voided_cache = result
         self._voided_cache_mtime = current_mtime
         return set(result)

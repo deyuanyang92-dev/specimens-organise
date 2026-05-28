@@ -4540,6 +4540,13 @@ class SpecimenWindow(QMainWindow):
                 self.select_voucher(vouchers[0])
             self.statusBar().showMessage(f"已删除 {voucher}（编号可复用）", 3000)
         elif clicked == btn_void:
+            try:
+                self.store.create_data_snapshot(
+                    "注销编号前快照",
+                    f"注销 {voucher} 前自动快照"
+                )
+            except Exception:
+                pass
             self.store.void_vouchers([voucher])
             self.current_voucher = None
             self.patch_voucher_row(voucher, "removed")

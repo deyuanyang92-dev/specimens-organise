@@ -1724,6 +1724,52 @@ class CoreTests(unittest.TestCase):
         returned.clear()
         self.assertEqual(store.list_voided_vouchers(), {"YZZ000001"})
 
+    def test_void_vouchers_is_not_undoable_and_keeps_number_voided(self) -> None:
+        """注销应真正不可撤回：删除数据、不写 delete action，且编号永不复用。"""
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+        store.set_fields("specimen", voucher, {"管内编号*": "QD-LSD-SC001"})
+        store.void_vouchers([voucher])
+
+        self.assertIsNone(store.get_specimen(voucher))
+        self.assertEqual(store.list_voided_vouchers(), {voucher})
+        self.assertEqual(store.next_voucher(), "YZZ000002")
+
+        # set_fields 的 action 仍在，但注销本身不写 delete_specimen action；
+        # undo 不应把已注销 voucher 的 specimen 行恢复出来。
+        store.undo_last()
+        self.assertIsNone(store.get_specimen(voucher))
+        self.assertEqual(store.next_voucher(), "YZZ000002")
+
+    def test_rollback_to_voucher_clears_voided_number_at_cutoff(self) -> None:
+        """截断重置到某编号时，应写入「取消注销」并允许该编号重新分配。"""
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+        store.void_vouchers([voucher])
+        self.assertEqual(store.list_voided_vouchers(), {voucher})
+
+        store.rollback_to_voucher(voucher)
+        self.assertNotIn(voucher, store.list_voided_vouchers())
+        self.assertEqual(store.next_voucher(), voucher)
+
+    def test_readonly_blocks_voucher_management_writes(self) -> None:
+        """只读 store 应拦截编号管理类写入口，不能绕过 UI 直接改工作区。"""
+        store = ExcelStore(self.tmp)
+        voucher = store.create_specimen()
+        store.close()
+        readonly = ExcelStore(self.tmp, read_only=True)
+        for method_name, args in (
+            ("delete_specimen", (voucher,)),
+            ("delete_specimens_batch", ([voucher],)),
+            ("void_vouchers", ([voucher],)),
+            ("cancel_placeholder_vouchers", ([voucher],)),
+            ("rollback_to_voucher", (voucher,)),
+            ("reset_next_serial", (1,)),
+        ):
+            with self.subTest(method=method_name):
+                with self.assertRaises(PermissionError):
+                    getattr(readonly, method_name)(*args)
+
     def test_get_photos_uses_voucher_index(self) -> None:
         """get_photos 走 photo voucher 索引 O(1)；多 voucher 互不干扰。"""
         store = ExcelStore(self.tmp)
