@@ -59,30 +59,38 @@ jobs:
           HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
           RELEASE_VERSION: ${{ steps.ver.outputs.version }}
         with:
-          generate_release_notes: true
+          generate_release_notes: false
           body: |
             ## 本次更新
 
-            $HEAD_COMMIT_MESSAGE
+            ${{ env.HEAD_COMMIT_MESSAGE }}
 
             ---
 
-            ## 下载安装
-
-            选你的操作系统，下载对应 zip 即可：
+            ## ⬇️ 下载安装（首次 / 全新安装）
 
             | 操作系统 | 下载文件 | 安装方式 |
             |---------|---------|--------|
-            | **Windows 10/11 64位** | `setup_v${{ steps.ver.outputs.version }}_windows.zip` | 解压 → 双击 `.exe` |
-            | **Linux (Ubuntu 20.04+)** | `setup_v${{ steps.ver.outputs.version }}_linux.zip` | 解压 → `chmod +x 文件名 && ./文件名` |
+            | **Windows 10/11 64位** | [`setup_v${{ steps.ver.outputs.version }}_windows.zip`](https://github.com/deyuanyang92-dev/specimens-organise/releases/download/v${{ steps.ver.outputs.version }}/setup_v${{ steps.ver.outputs.version }}_windows.zip) | 解压 → 双击 `.exe` 运行 |
+            | **Linux (Ubuntu 20.04+)** | [`setup_v${{ steps.ver.outputs.version }}_linux.zip`](https://github.com/deyuanyang92-dev/specimens-organise/releases/download/v${{ steps.ver.outputs.version }}/setup_v${{ steps.ver.outputs.version }}_linux.zip) | 解压 → `chmod +x 文件名 && ./文件名` |
 
-            > 软件采用目录模式打包，`.exe` 必须和 `_internal/` 子目录在同一层，不能单独复制 `.exe` 运行。
-            >
+            ---
+
+            ## ⚠️ 注意：不要手动下载 `app_v*.zip`
+
+            下方文件列表中有两类 zip，**普通用户只下载 `setup_*`**：
+
+            | 文件名 | 说明 | 能否直接运行 |
+            |--------|------|------------|
+            | `setup_v*_windows.zip` | **完整包**，含 Python 运行时 | ✅ 解压即可运行 |
+            | `app_v*_windows.zip` | 仅 app 代码，**无** Python DLL | ❌ 手动解压运行会报错 `Failed to load Python DLL` |
+
+            `app_v*.zip` 仅供软件内「检查更新」自动增量升级使用，不可手动解压运行。
+
+            ---
+
             > `.sha256` 文件是完整性校验码，普通用户无需下载。
-            >
-            > **v0.10.8+ 增量更新**：应用内「检查更新」会先拉 `update_manifest_*.json`；若本地已有
-            > 相同 `runtime_hash` 的旧版本目录，则只下载 `app_v*.zip`（仅几 MB），跳过 ~60MB 的
-            > Python+PyQt5 runtime，体验接近 VSCode 的"小数据"升级。
+            > `update_manifest_*.json` 供应用内自动更新读取，无需手动处理。
           files: |
             releases/v${{ steps.ver.outputs.version }}/setup_*.zip
             releases/v${{ steps.ver.outputs.version }}/setup_*.zip.sha256
