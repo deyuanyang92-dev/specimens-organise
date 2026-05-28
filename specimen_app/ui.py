@@ -4533,11 +4533,7 @@ class SpecimenWindow(QMainWindow):
         )
         if answer != QMessageBox.Yes:
             return
-        # 逐一删除（每条记录独立可撤回）
-        deleted = 0
-        for voucher in vouchers:
-            self.store.delete_specimen(voucher)
-            deleted += 1
+        deleted = self.store.delete_specimens_batch(vouchers)
         self.current_voucher = None
         self.refresh_list()
         vouchers_remaining = self.store.list_vouchers()
@@ -4584,13 +4580,12 @@ class SpecimenWindow(QMainWindow):
         # 灰条取消占位
         if placeholders:
             self.store.cancel_placeholder_vouchers(placeholders)
-        # 已入库：有照片先清，再删标本
-        deleted = 0
-        for v in ingested:
-            if self.store.get_photos(v):
+        # 有照片的先批量清照片，再批量删标本（两次 O(1) 文件操作）
+        with_photos = [v for v in ingested if self.store.get_photos(v)]
+        if with_photos:
+            for v in with_photos:
                 self.store.clear_photos(v)
-            self.store.delete_specimen(v)
-            deleted += 1
+        deleted = self.store.delete_specimens_batch(ingested) if ingested else 0
 
         self.current_voucher = None
         self.refresh_list()
@@ -10743,12 +10738,11 @@ class AdminDeleteRangeDialog(QDialog):
 
         if placeholders:
             self._store.cancel_placeholder_vouchers(placeholders)
-        deleted = 0
-        for v in ingested:
-            if self._store.get_photos(v):
+        with_photos = [v for v in ingested if self._store.get_photos(v)]
+        if with_photos:
+            for v in with_photos:
                 self._store.clear_photos(v)
-            self._store.delete_specimen(v)
-            deleted += 1
+        deleted = self._store.delete_specimens_batch(ingested) if ingested else 0
 
         # 自动重置编号起点：删完后把 next_serial 回拨到起始编号，清除旧预留值
         from .parsing import parse_voucher_serial

@@ -899,6 +899,87 @@ class ExcelStore:
         except Exception:
             pass  # 审计失败不阻断主流程
 
+    def delete_specimens_batch(self, vouchers: list[str]) -> int:
+        """批量删除标本：O(1) 文件操作，替代逐条 O(N)。
+
+        旧：N 条 delete_specimen → 每条重写 specimen/classification/photo/index 共 4 文件，
+            N 条 = 4N 次文件写，100 条约需数十秒。
+        新：读一次 → 过滤 → 写一次，O(1) 文件写，N=100 和 N=1 耗时相同。
+        每条仍独立写入 action-log（保留逐条撤回能力）。
+        """
+        import uuid as _uuid
+        from datetime import datetime as _dt
+
+        # 收集各 voucher 的旧数据（undo 用）
+        voucher_set = set(vouchers)
+        old_data: list[dict] = []
+        for v in vouchers:
+            spec = self.get_specimen(v)
+            if spec is None:
+                continue
+            old_data.append({
+                "voucher":        v,
+                "specimen":       spec,
+                "classification": self.get_classification(v),
+                "photos":         self.get_photos(v),
+                "index":          self._find_index(v),
+            })
+        if not old_data:
+            return 0
+        actual_set = {d["voucher"] for d in old_data}
+
+        # 一次读取 → 过滤 → 一次写入
+        remaining_specimens = [r for r in self.read_rows("specimen")
+                               if self._value(r, "入库编号*") not in actual_set]
+        remaining_class     = [r for r in self.read_rows("classification")
+                               if self._value(r, "入库编号*") not in actual_set]
+        remaining_photos    = [r for r in self.read_rows("photo")
+                               if self._value(r, "入库编号*") not in actual_set]
+
+        # 删除照片归档副本
+        for d in old_data:
+            for photo in d["photos"]:
+                self._delete_unreferenced_photo_file(photo, remaining_photos)
+
+        self._write_rows("specimen",       remaining_specimens)
+        self._write_rows("classification", remaining_class)
+        self._write_rows("photo",          remaining_photos)
+
+        # 更新索引（逐条，量少）
+        for d in old_data:
+            self._delete_index(d["voucher"])
+
+        # 每条独立写入 action-log，保留逐条撤回能力
+        for d in old_data:
+            self._record_action(
+                "delete_specimen", d["voucher"], "specimen", "",
+                {k: d[k] for k in ("specimen", "classification", "photos", "index")},
+                {},
+            )
+
+        # 一次同步编号
+        self._sync_next_serial()
+
+        # 审计日志（批量写入）
+        now = _dt.now().isoformat(timespec="seconds")
+        for d in old_data:
+            try:
+                self.log_alloc_event({
+                    "记录ID":   str(_uuid.uuid4())[:8],
+                    "时间":     now,
+                    "类型":     "删除编号",
+                    "人员":     "",
+                    "用途":     "",
+                    "备注":     d["specimen"].get("管内编号*", ""),
+                    "编号系列": d["voucher"][:3] if len(d["voucher"]) >= 3 else "",
+                    "编号起始": d["voucher"],
+                    "编号结束": d["voucher"],
+                    "数量":     "1",
+                })
+            except Exception:
+                pass
+        return len(old_data)
+
     def clear_photos(self, voucher: str) -> int:
         photos = self.get_photos(voucher)
         if not photos:
