@@ -2282,6 +2282,9 @@ class SpecimenWindow(QMainWindow):
         self.right_splitter.setSizes([260, 280, 200])
         # 右侧 标本/照片/分类 三块允许各自折叠，方便把空间让给图片区。
         self.right_splitter.setChildrenCollapsible(True)
+        # 禁止完全塌缩到不可见（用户反馈：WSL 下照片面板可能消失）
+        for panel in (self.specimen_panel, self.photo_panel, self.class_panel):
+            panel.setMinimumHeight(40)
 
         # Right side container with save-all button at top
         right_container = QWidget()
@@ -2310,7 +2313,11 @@ class SpecimenWindow(QMainWindow):
         if saved.splitter_sizes and len(saved.splitter_sizes) >= 2:
             try:
                 self.main_splitter.setSizes([int(x) for x in saved.splitter_sizes[0]])
-                self.right_splitter.setSizes([int(x) for x in saved.splitter_sizes[1]])
+                right_sizes = [int(x) for x in saved.splitter_sizes[1]]
+                # 旧：直接恢复，若之前某面板塌缩为 0 则彻底不可见。
+                # 新：每个面板至少 40px，确保标题栏可见可拖动展开。
+                right_sizes = [max(s, 40) for s in right_sizes]
+                self.right_splitter.setSizes(right_sizes)
             except Exception:
                 pass
         if saved.window_geometry:
