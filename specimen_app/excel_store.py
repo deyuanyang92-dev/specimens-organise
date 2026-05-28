@@ -3193,6 +3193,28 @@ class ExcelStore:
         self.config.pop("reserved_through_serial", None)
         self._save_config()
 
+    def rollback_to_voucher(self, cutoff: str) -> dict:
+        """从指定编号截断重置：删除 >= cutoff 的所有编号，next_serial 回拨到 cutoff。
+
+        内部调用 delete_specimens_batch（自动清灰条）+ reset_next_serial（清 reserved）。
+        返回 {"deleted": n, "reset_to": cutoff}。
+        """
+        from .parsing import parse_voucher_serial, format_voucher
+        cutoff_serial = parse_voucher_serial(cutoff)
+        if cutoff_serial is None:
+            raise ValueError(f"无效的入库编号格式：{cutoff!r}")
+
+        # 收集所有 serial >= cutoff 的 voucher
+        all_vouchers = self.list_vouchers()
+        to_delete = [
+            v for v in all_vouchers
+            if (parse_voucher_serial(v) or 0) >= cutoff_serial
+        ]
+
+        deleted = self.delete_specimens_batch(to_delete) if to_delete else 0
+        self.reset_next_serial(cutoff_serial)
+        return {"deleted": deleted, "reset_to": cutoff}
+
     def _auto_cleanup_alloc_after_delete(self, deleted_vouchers: list[str]) -> None:
         """删除标本后自动清理残留灰条，用户无感知。
 

@@ -2342,6 +2342,8 @@ class SpecimenWindow(QMainWindow):
         number_menu.addSeparator()
         _add(number_menu, "手动添加编号…", self._open_manual_voucher, "manual_voucher")
         number_menu.addSeparator()
+        _add(number_menu, "从指定编号重新开始…", self._open_reset_from_voucher, "reset_from_voucher")
+        number_menu.addSeparator()
         self._cancel_batch_reservation_action = _add(
             number_menu, "撤销批量预领…", self._open_cancel_batch_reservation, "cancel_batch_reservation"
         )
@@ -3181,6 +3183,17 @@ class SpecimenWindow(QMainWindow):
             return
         dlg = CancelBatchReservationDialog(self.store, self)
         dlg.exec_()
+
+    def _open_reset_from_voucher(self) -> None:
+        if self.store is None:
+            return
+        dlg = ResetFromVoucherDialog(self.store, self)
+        if dlg.exec_() == QDialog.Accepted:
+            self.current_voucher = None
+            self.refresh_list()
+            remaining = self.store.list_vouchers()
+            if remaining:
+                self.select_voucher(remaining[0])
 
     def _open_admin_delete_range(self) -> None:
         if self.store is None:
@@ -10415,6 +10428,88 @@ class BatchNewSpecimensDialog(QDialog):
 
     def _on_accept(self):
         self.count = self._spin.value()
+        self.accept()
+
+
+class ResetFromVoucherDialog(QDialog):
+    """从指定编号重新开始：一步清除该编号及之后的全部数据，编号从此处连续。"""
+
+    def __init__(self, store, parent=None):
+        super().__init__(parent)
+        self._store = store
+        self.setWindowTitle("从指定编号重新开始")
+        self.setMinimumWidth(460)
+
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            "输入要重新开始的入库编号。\n"
+            "该编号之前的数据完整保留；\n"
+            "该编号及之后的所有内容将被清除，下一个新编号从此处连续。"
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("background:#fff3cd; color:#856404; border-radius:4px; padding:10px;")
+        layout.addWidget(info)
+
+        form = QFormLayout()
+        self._voucher_edit = QLineEdit()
+        self._voucher_edit.setPlaceholderText("例：YZZ000781")
+        form.addRow("从哪个编号开始：", self._voucher_edit)
+        layout.addLayout(form)
+
+        self._preview_lbl = QLabel("")
+        self._preview_lbl.setWordWrap(True)
+        self._preview_lbl.setStyleSheet("color:#555; padding:4px 0;")
+        layout.addWidget(self._preview_lbl)
+
+        btns = QDialogButtonBox()
+        self._preview_btn = btns.addButton("预览影响", QDialogButtonBox.ActionRole)
+        self._ok_btn      = btns.addButton("确认清除并重置", QDialogButtonBox.AcceptRole)
+        self._ok_btn.setEnabled(False)
+        btns.addButton("取消", QDialogButtonBox.RejectRole)
+        self._preview_btn.clicked.connect(self._on_preview)
+        btns.accepted.connect(self._on_execute)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        self._cutoff: str | None = None
+
+    def _on_preview(self) -> None:
+        from .parsing import parse_voucher_serial
+        raw = self._voucher_edit.text().strip()
+        s = parse_voucher_serial(raw)
+        if s is None:
+            self._preview_lbl.setText("编号格式不正确，请检查。")
+            self._ok_btn.setEnabled(False)
+            return
+        all_vouchers = self._store.list_vouchers()
+        to_delete = [v for v in all_vouchers if (parse_voucher_serial(v) or 0) >= s]
+        gray_count = len(self._store.list_reserved_vouchers_pending_ingestion())
+        keep_count = len(all_vouchers) - len(to_delete)
+        self._preview_lbl.setText(
+            f"保留：{keep_count} 条（< {raw}）\n"
+            f"清除：{len(to_delete)} 条有数据的编号 + {gray_count} 个灰条占位\n"
+            f"重置后下一个新编号：{raw}"
+        )
+        self._cutoff = raw
+        self._ok_btn.setEnabled(True)
+
+    def _on_execute(self) -> None:
+        if not self._cutoff:
+            return
+        if not _check_admin_password_with_session(self): return
+        answer = QMessageBox.warning(
+            self, "确认清除并重置",
+            f"将清除 {self._cutoff} 及之后的所有编号，操作不可单步撤销。\n确定继续？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        result = self._store.rollback_to_voucher(self._cutoff)
+        QMessageBox.information(
+            self, "完成",
+            f"已清除 {result['deleted']} 条记录。\n下一个新编号：{result['reset_to']}",
+        )
         self.accept()
 
 
