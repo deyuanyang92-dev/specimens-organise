@@ -1708,9 +1708,13 @@ class ExcelStore:
             reserved = int(self.config.get("reserved_through_serial", 0))
             next_serial = max(int(self.config.get("next_serial", 1)), reserved + 1)
             index_set = self._ensure_index_voucher_set()
+            # 旧：只跳过 INDEX 中已存在的编号。
+            # 新：同时跳过已「注销」编号（永不复用）。list_voided_vouchers 扫 alloc_log，
+            #     注销编号极少（几个），性能影响可忽略。
+            voided = self.list_voided_vouchers()
             candidate = format_voucher(next_serial)
-            # 撞号兜底（极少触发）：若候选已在 INDEX，自增到唯一为止
-            while candidate in index_set:
+            # 撞号兜底（极少触发）：若候选已在 INDEX 或已注销，自增到唯一为止
+            while candidate in index_set or candidate in voided:
                 next_serial += 1
                 candidate = format_voucher(next_serial)
             return candidate
@@ -3196,22 +3200,41 @@ class ExcelStore:
     def rollback_to_voucher(self, cutoff: str) -> dict:
         """从指定编号截断重置：删除 >= cutoff 的所有编号，next_serial 回拨到 cutoff。
 
-        内部调用 delete_specimens_batch（自动清灰条）+ reset_next_serial（清 reserved）。
+        旧：只调 delete_specimens_batch（仅清有 specimen 行的编号）+ reset_next_serial。
+            问题：灰条占位（仅存 alloc log，无 specimen 行）不在 list_vouchers() 返回值中，
+            rollback 后灰条仍显示在列表，用户误认为重置无效（多版本反复报告的 bug）。
+        新：先清 specimen 数据，再显式取消所有 serial >= cutoff 的灰条占位，
+            确保列表彻底干净后再回拨 next_serial。
         返回 {"deleted": n, "reset_to": cutoff}。
         """
-        from .parsing import parse_voucher_serial, format_voucher
+        from .parsing import parse_voucher_serial
         cutoff_serial = parse_voucher_serial(cutoff)
         if cutoff_serial is None:
             raise ValueError(f"无效的入库编号格式：{cutoff!r}")
 
-        # 收集所有 serial >= cutoff 的 voucher
+        # Step 1：删除有 specimen 行的编号（specimen / classification / photo / index）
         all_vouchers = self.list_vouchers()
         to_delete = [
             v for v in all_vouchers
             if (parse_voucher_serial(v) or 0) >= cutoff_serial
         ]
-
         deleted = self.delete_specimens_batch(to_delete) if to_delete else 0
+
+        # Step 2：显式取消所有 serial >= cutoff 的灰条占位
+        # list_vouchers() 只读 specimen 表，灰条（仅 alloc log）不在其中，
+        # delete_specimens_batch 不会处理它们，必须单独清除。
+        try:
+            pending = self.list_reserved_vouchers_pending_ingestion()
+            placeholders_to_cancel = [
+                entry["voucher"] for entry in pending
+                if (parse_voucher_serial(entry["voucher"]) or 0) >= cutoff_serial
+            ]
+            if placeholders_to_cancel:
+                self.cancel_placeholder_vouchers(placeholders_to_cancel)
+        except Exception:
+            pass  # 灰条清理失败不阻断主流程（数据已删干净，仅视觉残留）
+
+        # Step 3：回拨 next_serial，清 reserved_through_serial
         self.reset_next_serial(cutoff_serial)
         return {"deleted": deleted, "reset_to": cutoff}
 
@@ -3339,14 +3362,15 @@ class ExcelStore:
             if self._value(row, "入库编号*")
         }
         # 旧：只排除 existing_specimen_vouchers。
-        # 新：额外排除「删除编号」和「取消占位」事件中的凭证：
+        # 新：额外排除「删除编号」、「取消占位」、「注销编号」事件中的凭证：
         #   - 删除编号：标本已创建后被删除，不应重现灰条
         #   - 取消占位：管理员主动取消灰条占位（编号仍可复用）
+        #   - 注销编号：管理员软删除，编号保留灰色显示但不重现为灰条
         # 若用户撤回（undo）删除，specimen 行恢复，existing_specimen_vouchers 会包含该凭证，
         # 灰条逻辑自然退化，此处无需特殊处理。
         deleted_vouchers: set[str] = set()
         for alloc_row in self.read_alloc_log():
-            if self._value(alloc_row, "类型") in ("删除编号", "取消占位"):
+            if self._value(alloc_row, "类型") in ("删除编号", "取消占位", "注销编号"):
                 v = self._value(alloc_row, "编号起始")
                 if v:
                     deleted_vouchers.add(v)
@@ -3373,6 +3397,51 @@ class ExcelStore:
                     "reserver_name": reserver_name,
                     "reserved_at": reserved_at,
                 })
+        return result
+
+    def void_vouchers(self, vouchers: list[str]) -> int:
+        """注销入库编号：彻底删除数据 + 向分发日志写「注销编号」事件，编号永不复用。
+
+        旧实现（错误）：仅写分发日志、保留数据，以灰色软删除形式显示。
+        新实现（正确）：
+          1. 先批量删除标本数据（同 delete_specimens_batch）
+          2. 再写「注销编号」事件 —— next_voucher() 会跳过这些编号
+          注销与普通删除的唯一区别：注销后编号永不复用，普通删除后编号可复用。
+        """
+        import uuid as _uuid
+        from datetime import datetime as _dt
+        # 只删有 specimen 行的编号（灰条由 cancel_placeholder_vouchers 处理）
+        has_specimen = [v for v in vouchers if self.get_specimen(v) is not None]
+        if has_specimen:
+            self.delete_specimens_batch(has_specimen)
+        # 灰条占位也取消（确保注销后从列表彻底消失）
+        placeholders = [v for v in vouchers if v not in has_specimen]
+        if placeholders:
+            self.cancel_placeholder_vouchers(placeholders)
+        # 写注销审计事件（next_voucher 据此跳过这些编号）
+        now = _dt.now().isoformat(timespec="seconds")
+        for v in vouchers:
+            self.log_alloc_event({
+                "记录ID":   str(_uuid.uuid4())[:8],
+                "时间":     now,
+                "类型":     "注销编号",
+                "编号起始": v,
+                "编号结束": v,
+                "备注":     "管理员注销（永不复用）",
+            })
+        return len(vouchers)
+
+    def list_voided_vouchers(self) -> set[str]:
+        """返回已注销编号集合（扫描分发日志中「注销编号」事件）。
+
+        供 next_voucher() 跳号使用：注销编号永不被自动分配。
+        """
+        result: set[str] = set()
+        for row in self.read_alloc_log():
+            if self._value(row, "类型") == "注销编号":
+                v = self._value(row, "编号起始")
+                if v:
+                    result.add(v)
         return result
 
     def list_unfinished_reserved_vouchers(self) -> list[tuple[str, str, str]]:

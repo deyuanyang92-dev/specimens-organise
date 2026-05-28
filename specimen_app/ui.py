@@ -3008,9 +3008,12 @@ class SpecimenWindow(QMainWindow):
         if self.store is None:
             return
         dlg = AccessionSeriesDialog(self.store, self)
-        dlg.exec_()
+        result = dlg.exec_()
         self._refresh_series_selector()
         self._refresh_series_filter_combo()
+        # 用户在系列管理对话框点击「从指定编号重新开始」→ 接力打开重置对话框
+        if result == AccessionSeriesDialog.RESULT_OPEN_RESET:
+            self._open_reset_from_voucher()
 
     def _populate_series_switch_menu(self) -> None:
         """动态填充「切换活动系列」子菜单（每次打开前重建，确保与当前配置一致）。"""
@@ -4509,50 +4512,75 @@ class SpecimenWindow(QMainWindow):
 
     def _context_delete_voucher(self, voucher: str) -> None:
         if not _check_admin_password_with_session(self): return
-        answer = QMessageBox.warning(
-            self, "确认删除",
-            f"密码验证通过。\n\n确定要删除 {voucher} 的标本数据吗？\n"
-            f"· 删除后可通过「撤回」恢复，但超出撤回深度后将永久丢失。\n"
-            f"· 该编号删除后仍可复用（如需永久废除，待后续版本支持）。",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+        msg = QMessageBox(self)
+        msg.setWindowTitle("处理入库编号")
+        msg.setText(f"如何处理编号 {voucher} ？")
+        msg.setInformativeText(
+            "删除：数据从列表消失，操作可通过「撤回」恢复，编号可复用。\n"
+            "注销：彻底删除数据，编号永不复用（适用于已打印标签但标本作废的情况），操作不可撤回。"
         )
-        if answer != QMessageBox.Yes:
-            return
-        self.store.delete_specimen(voucher)
-        self.current_voucher = None
-        # 旧：refresh_list() 全量重读 3 表。新：patch_voucher_row("removed") 仅移除该 voucher 项。
-        self.patch_voucher_row(voucher, "removed")
-        vouchers = self.store.list_vouchers()
-        if vouchers:
-            self.select_voucher(vouchers[0])
-        self.statusBar().showMessage(f"已删除 {voucher}（编号可复用）", 3000)
+        btn_delete = msg.addButton("删除（可撤回，编号可复用）", QMessageBox.DestructiveRole)
+        btn_void   = msg.addButton("注销（彻底删除，编号永不复用）", QMessageBox.AcceptRole)
+        msg.addButton("取消", QMessageBox.RejectRole)
+        msg.setDefaultButton(btn_delete)
+        msg.exec_()
+        clicked = msg.clickedButton()
+        if clicked == btn_delete:
+            self.store.delete_specimen(voucher)
+            self.current_voucher = None
+            # 旧：refresh_list() 全量重读 3 表。新：patch_voucher_row("removed") 仅移除该 voucher 项。
+            self.patch_voucher_row(voucher, "removed")
+            vouchers = self.store.list_vouchers()
+            if vouchers:
+                self.select_voucher(vouchers[0])
+            self.statusBar().showMessage(f"已删除 {voucher}（编号可复用）", 3000)
+        elif clicked == btn_void:
+            self.store.void_vouchers([voucher])
+            self.current_voucher = None
+            self.patch_voucher_row(voucher, "removed")
+            vouchers = self.store.list_vouchers()
+            if vouchers:
+                self.select_voucher(vouchers[0])
+            self.statusBar().showMessage(f"已注销 {voucher}（彻底删除，编号永不复用）", 3000)
 
     def _context_batch_delete_vouchers(self, vouchers: list[str]) -> None:
         """批量删除选中的入库编号（不含照片关联的凭证）。"""
         if not vouchers:
             return
         if not _check_admin_password_with_session(self): return
-        # 二次确认
-        answer = QMessageBox.warning(
-            self, "确认批量删除",
-            f"密码验证通过。\n\n确定要删除以下 {len(vouchers)} 个入库编号的标本数据吗？\n"
-            + "\n".join(f"  · {v}" for v in vouchers[:20])
-            + ("\n  ..." if len(vouchers) > 20 else "")
-            + "\n\n· 删除后可通过「撤回」逐条恢复，但超出撤回深度后将永久丢失。\n"
-            + "· 这些编号删除后仍可复用（如需永久废除，待后续版本支持）。",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+        preview_lines = "\n".join(f"  · {v}" for v in vouchers[:20])
+        if len(vouchers) > 20:
+            preview_lines += "\n  ..."
+        msg = QMessageBox(self)
+        msg.setWindowTitle("批量处理入库编号")
+        msg.setText(f"如何处理以下 {len(vouchers)} 个编号？")
+        msg.setInformativeText(
+            preview_lines + "\n\n"
+            "删除：数据从列表消失，操作可通过「撤回」逐条恢复，编号可复用。\n"
+            "注销：彻底删除数据，编号永不复用（适用于已打印标签但标本作废的情况），操作不可撤回。"
         )
-        if answer != QMessageBox.Yes:
-            return
-        deleted = self.store.delete_specimens_batch(vouchers)
-        self.current_voucher = None
-        self.refresh_list()
-        vouchers_remaining = self.store.list_vouchers()
-        if vouchers_remaining:
-            self.select_voucher(vouchers_remaining[0])
-        self.statusBar().showMessage(f"已批量删除 {deleted} 个入库编号", 5000)
+        btn_delete = msg.addButton("批量删除（可撤回，编号可复用）", QMessageBox.DestructiveRole)
+        btn_void   = msg.addButton("批量注销（彻底删除，编号永不复用）", QMessageBox.AcceptRole)
+        msg.addButton("取消", QMessageBox.RejectRole)
+        msg.setDefaultButton(btn_delete)
+        msg.exec_()
+        clicked = msg.clickedButton()
+        if clicked == btn_delete:
+            deleted = self.store.delete_specimens_batch(vouchers)
+            self.current_voucher = None
+            self.refresh_list()
+            vouchers_remaining = self.store.list_vouchers()
+            if vouchers_remaining:
+                self.select_voucher(vouchers_remaining[0])
+            self.statusBar().showMessage(f"已批量删除 {deleted} 个入库编号（编号可复用）", 5000)
+        elif clicked == btn_void:
+            count = self.store.void_vouchers(vouchers)
+            self.current_voucher = None
+            self.refresh_list()
+            vouchers_remaining = self.store.list_vouchers()
+            if vouchers_remaining:
+                self.select_voucher(vouchers_remaining[0])
+            self.statusBar().showMessage(f"已批量注销 {count} 个入库编号（彻底删除，编号永不复用）", 5000)
 
     def _context_admin_force_delete_vouchers(self, vouchers: list[str]) -> None:
         """管理员强制批量删除：灰条取消占位，已入库的先清照片再删数据。编号可复用。"""
@@ -9638,6 +9666,7 @@ class AccessionSeriesDialog(QDialog):
     """管理入库编号系列：新增 / 编辑起始号 / 删除。YZZ 为系统固定系列，只读展示。"""
 
     _YZZ_ROW = 0  # YZZ 固定占第 0 行
+    RESULT_OPEN_RESET = 42  # done() 返回此值 → 调用方打开 ResetFromVoucherDialog
 
     def __init__(self, store: "ExcelStore", parent: QWidget | None = None):
         super().__init__(parent)
@@ -9674,6 +9703,17 @@ class AccessionSeriesDialog(QDialog):
         self._del_btn.clicked.connect(self._delete_series)
         btn_row.addWidget(self._del_btn)
         btn_row.addStretch()
+
+        # YZZ 专属：从指定编号重新开始（软件功能发现入口，实际对话框在主窗口打开）
+        self._reset_btn = QPushButton("YZZ：从指定编号重新开始…")
+        self._reset_btn.setToolTip(
+            "清除指定 YZZ 编号及之后的全部数据，下一个新编号从该处连续。\n"
+            "仅支持 YZZ 系列。操作前请先做数据快照。"
+        )
+        self._reset_btn.setEnabled(False)
+        self._reset_btn.clicked.connect(self._on_reset_from_voucher)
+        btn_row.addWidget(self._reset_btn)
+
         layout.addLayout(btn_row)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
@@ -9723,12 +9763,13 @@ class AccessionSeriesDialog(QDialog):
         self._on_selection_changed()
 
     def _on_selection_changed(self) -> None:
-        """选中 YZZ 行时禁用删除和编辑起始号按钮。"""
+        """选中 YZZ 行时禁用删除和编辑起始号按钮；仅 YZZ 行启用重置按钮。"""
         cur = self._list.currentRow()
         is_yzz = cur == self._YZZ_ROW
         has_sel = cur >= 0
         self._del_btn.setEnabled(has_sel and not is_yzz)
         self._edit_btn.setEnabled(has_sel and not is_yzz)
+        self._reset_btn.setEnabled(is_yzz)
 
     def _selected_name(self) -> str | None:
         cur = self._list.currentRow()
@@ -9773,6 +9814,10 @@ class AccessionSeriesDialog(QDialog):
         if reply == QMessageBox.Yes:
             self.store.remove_series(name)
             self._refresh()
+
+    def _on_reset_from_voucher(self) -> None:
+        """关闭当前对话框，通知调用方打开 ResetFromVoucherDialog。"""
+        self.done(self.RESULT_OPEN_RESET)
 
 
 class _SeriesEditDialog(QDialog):
@@ -10484,7 +10529,12 @@ class ResetFromVoucherDialog(QDialog):
             return
         all_vouchers = self._store.list_vouchers()
         to_delete = [v for v in all_vouchers if (parse_voucher_serial(v) or 0) >= s]
-        gray_count = len(self._store.list_reserved_vouchers_pending_ingestion())
+        # 旧：统计全部灰条占位数（包含 < cutoff 的），导致预览数字偏大。
+        # 新：只统计 serial >= cutoff 的灰条，与实际清除范围一致。
+        gray_count = sum(
+            1 for r in self._store.list_reserved_vouchers_pending_ingestion()
+            if (parse_voucher_serial(r["voucher"]) or 0) >= s
+        )
         keep_count = len(all_vouchers) - len(to_delete)
         self._preview_lbl.setText(
             f"保留：{keep_count} 条（< {raw}）\n"
