@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import queue
+import time as _time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Optional, TYPE_CHECKING
@@ -280,6 +281,25 @@ def pil_to_qpixmap(pil_image: Image.Image) -> QPixmap:
 # _context_batch_delete_vouchers）。集中为一处常量便于维护，并供「用 Excel 打开
 # 数据文件」复用同一道密码门。值不变，行为完全兼容。
 ADMIN_PASSWORD = "123"
+
+_admin_session_unlocked_until: float = 0.0
+
+
+def _check_admin_password_with_session(parent_widget, title: str = "管理员验证") -> bool:
+    """管理员密码 session 验证：输一次密码，5 分钟内所有管理员操作免重输。"""
+    global _admin_session_unlocked_until
+    if _time.monotonic() < _admin_session_unlocked_until:
+        return True
+    password, ok = QInputDialog.getText(
+        parent_widget, title, "请输入管理密码：", QLineEdit.Password
+    )
+    if not ok or not password:
+        return False
+    if password != ADMIN_PASSWORD:
+        QMessageBox.warning(parent_widget, "密码错误", "密码不正确，操作已取消。")
+        return False
+    _admin_session_unlocked_until = _time.monotonic() + 300  # 5 分钟
+    return True
 
 
 def _open_path(path: Path) -> None:
@@ -1523,12 +1543,22 @@ class SpecimenWindow(QMainWindow):
     def _prompt_initial_workspace(self) -> None:
         if self._is_closing:
             return
-        # 旧逻辑：__init__ 在窗口构建前阻塞弹 QFileDialog（背后无窗口）。
-        # 现改为窗口已 show() 之后再驱动同一选择/校验/初始化/载入链路（switch_workspace）。
-        self.switch_workspace()
+        from .app_settings import load_settings
+        recent = [p for p in load_settings().recent_workspaces if Path(p).exists()]
+        if recent:
+            dlg = WelcomeDialog(recent, self)
+            result = dlg.exec_()
+            if result == QDialog.Accepted and dlg.chosen_path:
+                chosen = Path(dlg.chosen_path)
+                self._load_workspace_into_window(chosen, False)
+                return
+            elif result == QDialog.Accepted and dlg.open_new:
+                self.switch_workspace()
+                return
+        else:
+            self.switch_workspace()
         if self.store is None:
-            # 用户取消了首次工作区选择：保留空窗口，工具栏"切换工作区"按钮仍可用。
-            self.statusBar().showMessage("尚未选择工作区，可点击工具栏“切换工作区”随时打开", 0)
+            self.statusBar().showMessage("尚未选择工作区，可点击工具栏「切换工作区」随时打开", 0)
 
     # ---- workspace preparation ----
 
@@ -1780,7 +1810,7 @@ class SpecimenWindow(QMainWindow):
         if self.workspace_root is not None:
             ws_label = QLabel(f"当前工作目录：{self.workspace_root}")
         else:
-            ws_label = QLabel("当前工作目录：（未选择，请点击工具栏“切换工作区”）")
+            ws_label = QLabel("当前工作目录：（未选择，请点击工具栏「切换工作区」）")
         ws_label.setContentsMargins(8, 4, 8, 4)
         self.workspace_label = ws_label
         ws_bar.addWidget(ws_label)
@@ -2563,6 +2593,19 @@ class SpecimenWindow(QMainWindow):
         if auto_save is not None:
             self._main_toolbar.addSeparator()
             self._main_toolbar.addAction(auto_save)
+
+        self._set_store_actions_enabled(self.store is not None)
+
+    def _set_store_actions_enabled(self, enabled: bool) -> None:
+        """工作区加载/卸载时同步工具栏可用状态，避免 store=None 时点击 crash。"""
+        store_required = {
+            "import_workspace", "import_data", "export_data", "batch_export",
+            "undo", "redo", "clear_photos", "ingest_summary",
+            "version_manager",
+        }
+        for aid, action in getattr(self, "_toolbar_actions", {}).items():
+            if aid in store_required:
+                action.setEnabled(enabled)
 
     def _apply_custom_shortcuts(self) -> None:
         """把 settings.custom_shortcuts 应用到对应的 QShortcut / QAction（E 项）。
@@ -3882,7 +3925,7 @@ class SpecimenWindow(QMainWindow):
                 if changed:
                     specimen = self.store.get_specimen(voucher) or {}
                     self._loading = True
-                    # 原代码只刷新“采集日期”和“采集地点缩写*”；现在管内编号也会派生“保存方式”。
+                    # 原代码只刷新"采集日期"和"采集地点缩写*"；现在管内编号也会派生"保存方式"。
                     for auto_field in ("采集日期", "采集地点缩写*", "保存方式"):
                         w = self.specimen_widgets[auto_field]
                         w.blockSignals(True)
@@ -4071,66 +4114,66 @@ class SpecimenWindow(QMainWindow):
         menu = QMenu(self)
         menu.addAction("刷新列表 (F5)", self._refresh_and_keep_selection)
         menu.addSeparator()
-        # 批量导出：将选中的入库编号带入对话框（单行也支持，方便快捷导出当前标本）
-        if len(ingested_vouchers) >= 1:
-            menu.addAction(
-                f"批量导出选中 ({len(ingested_vouchers)}个)",
-                lambda: self._context_batch_export(ingested_vouchers),
-            )
-            menu.addAction(
-                f"批量设置标本信息 ({len(ingested_vouchers)}个)",
-                lambda: self._batch_set_specimen_fields(ingested_vouchers),
-            )
-            menu.addSeparator()
 
-        # 灰条占位：管理员可批量取消（编号仍可复用）
-        if placeholder_vouchers:
-            ph = list(placeholder_vouchers)
+        # 常用操作
+        if len(ingested_vouchers) >= 1:
+            iv_snap = list(ingested_vouchers)
             menu.addAction(
-                f"取消占位（{len(ph)}个灰条）…",
-                lambda: self._context_cancel_placeholder_vouchers(ph),
+                f"批量导出选中 ({len(iv_snap)}个)",
+                lambda iv=iv_snap: self._context_batch_export(iv),
             )
-            menu.addSeparator()
+            menu.addAction(
+                f"批量设置标本信息 ({len(iv_snap)}个)",
+                lambda iv=iv_snap: self._batch_set_specimen_fields(iv),
+            )
 
         if voucher_text not in reserved_pending:
-            menu.addAction("清除照片关联", lambda: self._context_clear_photos(voucher_text))
-            menu.addSeparator()
-
-            # 单行删除（右键点击的行）
+            menu.addAction("清除照片关联", lambda v=voucher_text: self._context_clear_photos(v))
             has_photos = bool(self.store.get_photos(voucher_text))
             if not has_photos:
-                menu.addAction("删除入库编号（可复用）", lambda: self._context_delete_voucher(voucher_text))
-            else:
-                menu.addAction("删除入库编号（需先清除照片关联）").setEnabled(False)
+                menu.addAction(
+                    "删除入库编号（可复用）",
+                    lambda v=voucher_text: self._context_delete_voucher(v),
+                )
 
-            # 多选批量删除
-            if len(ingested_vouchers) >= 2:
-                menu.addSeparator()
-                eligible_no_photo = [v for v in ingested_vouchers if not self.store.get_photos(v)]
-                has_photo_count   = len(ingested_vouchers) - len(eligible_no_photo)
-                # 普通批量删除（无照片行）
-                if eligible_no_photo:
-                    label = f"删除选中的入库编号（可复用，{len(eligible_no_photo)}个）"
-                    if has_photo_count:
-                        label += f"，跳过{has_photo_count}个有照片的"
-                    iv = list(eligible_no_photo)
-                    menu.addAction(label, lambda: self._context_batch_delete_vouchers(iv))
-                # 管理员强制批量删除（含照片的一并处理）
+        menu.addSeparator()
+
+        # 管理员操作子菜单（低频/破坏性）
+        admin_actions: list = []
+        ph_snap = list(placeholder_vouchers)
+        if ph_snap:
+            admin_actions.append((
+                f"取消占位（{len(ph_snap)}个灰条）…",
+                lambda ph=ph_snap: self._context_cancel_placeholder_vouchers(ph),
+            ))
+
+        if voucher_text not in reserved_pending and len(ingested_vouchers) >= 2:
+            eligible_no_photo = [v for v in ingested_vouchers if not self.store.get_photos(v)]
+            has_photo_count   = len(ingested_vouchers) - len(eligible_no_photo)
+            if eligible_no_photo:
+                label = f"批量删除（{len(eligible_no_photo)}个，可复用）"
                 if has_photo_count:
-                    all_iv = list(ingested_vouchers)
-                    menu.addAction(
-                        f"管理员强制删除选中全部（{len(all_iv)}个，含{has_photo_count}个有照片）…",
-                        lambda: self._context_admin_force_delete_vouchers(all_iv),
-                    )
+                    label += f"，跳过{has_photo_count}个有照片的"
+                en = list(eligible_no_photo)
+                admin_actions.append((label, lambda e=en: self._context_batch_delete_vouchers(e)))
+            if has_photo_count:
+                all_iv = list(ingested_vouchers)
+                admin_actions.append((
+                    f"强制删除全部（{len(all_iv)}个，含{has_photo_count}个有照片）…",
+                    lambda a=all_iv: self._context_admin_force_delete_vouchers(a),
+                ))
 
-        # 混合选中（灰条 + 已入库）：管理员一键清除全部
         if placeholder_vouchers and ingested_vouchers:
-            all_selected = list(selected_vouchers)
-            menu.addSeparator()
-            menu.addAction(
-                f"管理员清除选中全部（{len(all_selected)}个，含灰条+数据）…",
-                lambda: self._context_admin_force_delete_vouchers(all_selected),
-            )
+            all_sel = list(selected_vouchers)
+            admin_actions.append((
+                f"清除选中全部（{len(all_sel)}个，灰条+数据）…",
+                lambda a=all_sel: self._context_admin_force_delete_vouchers(a),
+            ))
+
+        if admin_actions:
+            admin_menu = menu.addMenu("管理员操作 ▶")
+            for label, slot in admin_actions:
+                admin_menu.addAction(label, slot)
 
         menu.exec_(self.voucher_table.viewport().mapToGlobal(pos))
 
@@ -4164,16 +4207,7 @@ class SpecimenWindow(QMainWindow):
         if store is None:
             QMessageBox.information(self, "未选择工作区", "请先选择工作区再使用此功能。")
             return
-        password, ok = QInputDialog.getText(
-            self, "用 Excel 打开数据文件",
-            "用 Excel 直接编辑数据文件有风险，需管理员操作。\n\n请输入管理密码：",
-            QLineEdit.Password,
-        )
-        if not ok or not password:
-            return
-        if password != ADMIN_PASSWORD:
-            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
-            return
+        if not _check_admin_password_with_session(self): return
         answer = QMessageBox.warning(
             self, "风险提示",
             "直接用 Excel 修改数据文件存在风险：\n"
@@ -4378,18 +4412,7 @@ class SpecimenWindow(QMainWindow):
                 f"当前工作区兼容版本已为 {current_version}，旧版软件可以直接打开。",
             )
             return
-        password, ok = QInputDialog.getText(
-            self, "降低工作区兼容版本",
-            "此操作将工作区数据版本降至 1.0.0，以便旧版软件（v0.3.x 及以下）可以打开。\n\n"
-            "数据内容不会改变，可随时用新版软件重新打开（会自动升回最新版本）。\n\n"
-            "请输入管理密码确认：",
-            QLineEdit.Password,
-        )
-        if not ok or not password:
-            return
-        if password != ADMIN_PASSWORD:
-            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
-            return
+        if not _check_admin_password_with_session(self): return
         answer = QMessageBox.question(
             self, "是否先创建数据快照？",
             f"即将把工作区数据版本从 {current_version} 降至 {TARGET_VERSION}。\n\n"
@@ -4447,19 +4470,7 @@ class SpecimenWindow(QMainWindow):
                 "未发现重复的照片关联（按 入库编号 + 文件SHA256 + 原始文件名 判定）。",
             )
             return
-        password, ok = QInputDialog.getText(
-            self, "清理重复照片关联",
-            f"扫描发现 {preview['groups']} 组重复，预计将删除 {preview['removed']} 条重复行。\n\n"
-            "操作前会自动创建数据快照（出问题可走「版本管理 → 数据版本」回退）。\n"
-            "本操作不可单步撤销（撤回菜单不会出现对应记录）。\n\n"
-            "请输入管理密码以继续：",
-            QLineEdit.Password,
-        )
-        if not ok or not password:
-            return
-        if password != ADMIN_PASSWORD:
-            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
-            return
+        if not _check_admin_password_with_session(self): return
         answer = QMessageBox.question(
             self, "确认清理",
             f"即将合并 {preview['groups']} 组重复，删除 {preview['removed']} 条多余的照片记录行。\n\n"
@@ -4484,17 +4495,7 @@ class SpecimenWindow(QMainWindow):
             self.select_voucher(self.current_voucher)
 
     def _context_delete_voucher(self, voucher: str) -> None:
-        password, ok = QInputDialog.getText(
-            self, "删除入库编号",
-            f"删除 {voucher} 将永久移除该编号的标本信息、分类信息。\n\n"
-            f"注意：删除后该编号仍可被复用（非永久废除）。\n\n请输入管理密码确认删除：",
-            QLineEdit.Password,
-        )
-        if not ok or not password:
-            return
-        if password != ADMIN_PASSWORD:  # 旧：password != "123"，改引用常量，值不变
-            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
-            return
+        if not _check_admin_password_with_session(self): return
         answer = QMessageBox.warning(
             self, "确认删除",
             f"密码验证通过。\n\n确定要删除 {voucher} 的标本数据吗？\n"
@@ -4518,20 +4519,7 @@ class SpecimenWindow(QMainWindow):
         """批量删除选中的入库编号（不含照片关联的凭证）。"""
         if not vouchers:
             return
-        # 密码验证（一次）
-        password, ok = QInputDialog.getText(
-            self, "批量删除入库编号",
-            f"将删除 {len(vouchers)} 个入库编号的标本信息、分类信息。\n\n"
-            f"编号列表：{', '.join(vouchers[:10])}"
-            + (f" ...等共{len(vouchers)}个" if len(vouchers) > 10 else "")
-            + "\n\n注意：删除后编号仍可复用（非永久废除）。\n\n请输入管理密码确认删除：",
-            QLineEdit.Password,
-        )
-        if not ok or not password:
-            return
-        if password != ADMIN_PASSWORD:  # 旧：password != "123"，改引用常量，值不变
-            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
-            return
+        if not _check_admin_password_with_session(self): return
         # 二次确认
         answer = QMessageBox.warning(
             self, "确认批量删除",
@@ -4577,18 +4565,7 @@ class SpecimenWindow(QMainWindow):
         if with_photos:
             summary_lines.append(f"· 先清照片关联再删标本数据：{len(with_photos)} 个（照片归档副本一并删除）")
 
-        password, ok = QInputDialog.getText(
-            self, "管理员强制批量删除",
-            f"将处理 {len(vouchers)} 个编号：\n"
-            + "\n".join(summary_lines)
-            + "\n\n编号删除后仍可复用（非永久废除）。\n请输入管理密码确认：",
-            QLineEdit.Password,
-        )
-        if not ok or not password:
-            return
-        if password != ADMIN_PASSWORD:
-            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
-            return
+        if not _check_admin_password_with_session(self): return
 
         preview = ", ".join(vouchers[:10]) + (f" …等{len(vouchers)}个" if len(vouchers) > 10 else "")
         answer = QMessageBox.warning(
@@ -4631,21 +4608,7 @@ class SpecimenWindow(QMainWindow):
         """管理员批量取消灰条占位（编号不废除，仍可复用）。"""
         if not vouchers:
             return
-        password, ok = QInputDialog.getText(
-            self, "取消占位",
-            f"将取消 {len(vouchers)} 个灰条占位编号：\n"
-            + ", ".join(vouchers[:10])
-            + (f" ...等共{len(vouchers)}个" if len(vouchers) > 10 else "")
-            + "\n\n这些编号将不再显示为待入库灰条，但编号本身仍可复用。\n"
-            + "（如需撤回，请重新做一次批量预领，或在「编号→撤销批量预领」中操作整批）\n\n"
-            + "请输入管理密码确认：",
-            QLineEdit.Password,
-        )
-        if not ok or not password:
-            return
-        if password != ADMIN_PASSWORD:
-            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
-            return
+        if not _check_admin_password_with_session(self): return
         answer = QMessageBox.warning(
             self, "确认取消占位",
             f"确定取消以下 {len(vouchers)} 个灰条占位吗？\n"
@@ -4662,6 +4625,8 @@ class SpecimenWindow(QMainWindow):
         self.statusBar().showMessage(f"已取消 {written} 个占位编号（编号可复用）", 5000)
 
     def undo(self) -> None:
+        if self.store is None:
+            return
         action = self.store.undo_last()
         if action:
             self.statusBar().showMessage(f"已撤回：{action}", 3000)
@@ -4670,6 +4635,8 @@ class SpecimenWindow(QMainWindow):
             self.statusBar().showMessage("没有可撤回的操作", 2000)
 
     def redo(self) -> None:
+        if self.store is None:
+            return
         action = self.store.redo_last()
         if action:
             self.statusBar().showMessage(f"已重做：{action}", 3000)
@@ -5280,7 +5247,7 @@ class SpecimenWindow(QMainWindow):
             max_size = memory_profile_params(profile).get("preview_max_size")
         except Exception:
             max_size = None
-        # 低内存档将单张预览限制在压缩尺寸，避免用户历史设置为“原始质量”时仍将
+        # 低内存档将单张预览限制在压缩尺寸，避免用户历史设置为"原始质量"时仍将
         # 大 QPixmap 常驻内存；选择高档位可明确解除此保护。
         if max_size and (
             selected_size is None
@@ -5912,18 +5879,7 @@ class SpecimenWindow(QMainWindow):
         if not incoming_dir:
             return
         incoming_path = Path(incoming_dir)
-        password, ok = QInputDialog.getText(
-            self, "从收件箱聚合",
-            "本操作会把收件箱里所有「含 数据/ 子目录」的文件夹合并到当前中心机。\n"
-            "合并前会自动创建快照，可一键回退。\n\n"
-            "请输入管理密码以继续：",
-            QLineEdit.Password,
-        )
-        if not ok or not password:
-            return
-        if password != ADMIN_PASSWORD:
-            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
-            return
+        if not _check_admin_password_with_session(self): return
         # S7: 先 dry-run 预览,让用户看到预计结果再决定是否真合并
         # 规范化软件设计 2026-05 P1 审查修复:大工作区预扫可能耗时,加 QProgressDialog 防 UI 冻。
         preview_dlg = QProgressDialog("正在预扫收件箱…", "", 0, 0, self)
@@ -6298,6 +6254,8 @@ class SpecimenWindow(QMainWindow):
         类似 NCBI Batch Entrez：可选择导出标本信息、分类信息、照片路径和照片文件。
         支持从当前凭证列表多选带入编号，也可在对话框中手动粘贴。
         """
+        if self.store is None:
+            return
         # 如果没有传入预选编号，尝试从当前凭证表获取选中的行
         if preselected is None:
             rows = self.voucher_table.selectionModel().selectedRows()
@@ -6475,6 +6433,7 @@ class SpecimenWindow(QMainWindow):
                 w.blockSignals(False)
             self._loading = False
             self.load_current_photo()
+        self._set_store_actions_enabled(True)
         return True
 
     def open_new_window(self) -> None:
@@ -10135,17 +10094,7 @@ class BatchImportSourcesDialog(QDialog):
             self._ok_btn.setEnabled(self._list_widget.count() > 0)
 
     def _on_confirm(self) -> None:
-        # 密码门控（与「从收件箱聚合」一致复用 ADMIN_PASSWORD）
-        password, ok = QInputDialog.getText(
-            self, "批量导入工作区",
-            "本操作会合并所选目录到当前中心机。\n合并前自动快照，可一键回退。\n\n请输入管理密码：",
-            QLineEdit.Password,
-        )
-        if not ok or not password:
-            return
-        if password != ADMIN_PASSWORD:
-            QMessageBox.warning(self, "密码错误", "密码不正确。")
-            return
+        if not _check_admin_password_with_session(self): return
         sources = [
             Path(self._list_widget.item(i).text())
             for i in range(self._list_widget.count())
@@ -10474,6 +10423,72 @@ class BatchNewSpecimensDialog(QDialog):
         self.accept()
 
 
+class WelcomeDialog(QDialog):
+    """启动欢迎页：最近工作区列表 + 新建/打开入口。"""
+
+    def __init__(self, recent_workspaces: list[str], parent=None):
+        super().__init__(parent)
+        self.chosen_path: str | None = None
+        self.open_new: bool = False
+        self.setWindowTitle("欢迎使用标本入库管理")
+        self.setMinimumWidth(520)
+        self.setMinimumHeight(320)
+
+        layout = QVBoxLayout(self)
+
+        title_lbl = QLabel("选择工作区")
+        title_lbl.setStyleSheet("font-size: 16px; font-weight: bold; padding: 8px 0;")
+        layout.addWidget(title_lbl)
+
+        if recent_workspaces:
+            recent_lbl = QLabel("最近使用的工作区：")
+            recent_lbl.setStyleSheet("color: #555; font-size: 11px;")
+            layout.addWidget(recent_lbl)
+
+            self._list = QListWidget()
+            for p in recent_workspaces:
+                item = QListWidgetItem(p)
+                item.setToolTip(p)
+                self._list.addItem(item)
+            self._list.setFixedHeight(min(len(recent_workspaces) * 28 + 8, 200))
+            self._list.itemDoubleClicked.connect(self._on_double_click)
+            self._list.itemClicked.connect(self._on_single_click)
+            layout.addWidget(self._list)
+
+        btn_layout = QHBoxLayout()
+        open_recent_btn = QPushButton("打开选中")
+        open_recent_btn.setEnabled(bool(recent_workspaces))
+        open_recent_btn.clicked.connect(self._on_open_recent)
+        open_new_btn = QPushButton("打开其他目录…")
+        open_new_btn.clicked.connect(self._on_open_new)
+        btn_layout.addStretch()
+        btn_layout.addWidget(open_recent_btn)
+        btn_layout.addWidget(open_new_btn)
+        layout.addLayout(btn_layout)
+
+        self._open_recent_btn = open_recent_btn
+        if recent_workspaces:
+            self._list.setCurrentRow(0)
+            self._open_recent_btn.setEnabled(True)
+
+    def _on_single_click(self, item):
+        self._open_recent_btn.setEnabled(True)
+
+    def _on_double_click(self, item):
+        self.chosen_path = item.text()
+        self.accept()
+
+    def _on_open_recent(self):
+        item = self._list.currentItem() if hasattr(self, '_list') else None
+        if item:
+            self.chosen_path = item.text()
+            self.accept()
+
+    def _on_open_new(self):
+        self.open_new = True
+        self.accept()
+
+
 class CancelBatchReservationDialog(QDialog):
     """管理员撤销批量预领记录，恢复断档编号可用。现有标本数据不受影响。"""
 
@@ -10592,21 +10607,7 @@ class CancelBatchReservationDialog(QDialog):
 
         # 二次确认 + 管理员密码
         from PyQt5.QtWidgets import QInputDialog
-        msg = (
-            f"您即将撤销以下批量预领记录：\n\n"
-            f"  领取人：{self._store._value(r, '人员')}\n"
-            f"  预领时间：{self._store._value(r, '时间')[:16]}\n"
-            f"  编号范围：{start} – {end}\n"
-            f"  数量：{n} 个\n\n"
-            "系统将在操作前自动保存备份，现有标本数据不会受到任何影响。\n\n"
-            "请输入管理员密码："
-        )
-        password, ok = QInputDialog.getText(self, "确认撤销预领", msg, QLineEdit.Password)
-        if not ok or not password:
-            return
-        if password != ADMIN_PASSWORD:
-            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
-            return
+        if not _check_admin_password_with_session(self): return
 
         try:
             result = self._store.cancel_batch_reservation(record_id)
@@ -10723,15 +10724,14 @@ class AdminDeleteRangeDialog(QDialog):
     def _on_execute(self) -> None:
         if not self._vouchers_in_range:
             return
-        password, ok = QInputDialog.getText(
-            self, "管理员验证",
-            f"将删除 {len(self._vouchers_in_range)} 个编号，请输入管理密码：",
-            QLineEdit.Password,
+        if not _check_admin_password_with_session(self): return
+        answer = QMessageBox.warning(
+            self, "确认删除",
+            f"确认要删除 {len(self._vouchers_in_range)} 个编号吗？\n标本数据可通过「撤回」逐条恢复，灰条取消不可撤回。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
         )
-        if not ok or not password:
-            return
-        if password != ADMIN_PASSWORD:
-            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
+        if answer != QMessageBox.Yes:
             return
 
         reserved_pending = {
