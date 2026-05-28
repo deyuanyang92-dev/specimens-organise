@@ -1280,6 +1280,7 @@ class SpecimenWindow(QMainWindow):
         self._all_vouchers: list[str] = []
         self._all_tube_numbers: dict[str, str] = {}
         self._all_photo_filenames: dict[str, list[str]] = {}
+        self._field_pinning_enabled = False  # 📌 固定字段开关
 
         self._build_ui()
         _startup_mark("SpecimenWindow._build_ui")
@@ -2028,6 +2029,14 @@ class SpecimenWindow(QMainWindow):
         history_btn.setToolTip("查看操作历史快照，可回退到任意历史状态（需管理员密码）")
         history_btn.clicked.connect(self.open_version_manager)
         series_row.addWidget(history_btn)
+        self._pin_fields_btn = QPushButton("📌 固定字段")
+        self._pin_fields_btn.setCheckable(True)
+        self._pin_fields_btn.setToolTip(
+            "切换入库编号时，右侧编辑器中下列字段保持不变：\n"
+            + "、".join(CARRY_OVER_SPECIMEN_FIELDS)
+        )
+        self._pin_fields_btn.toggled.connect(self._on_field_pinning_toggled)
+        series_row.addWidget(self._pin_fields_btn)
         series_row.addStretch(1)
         voucher_layout.addLayout(series_row)
         # Search + quick filter
@@ -3809,6 +3818,15 @@ class SpecimenWindow(QMainWindow):
 
     def select_voucher(self, voucher: str, defer_preview: bool = False) -> None:
         self._save_current_photo_view_state()
+        # 字段固定：切换编号前保存当前 CARRY_OVER 字段值，加载后恢复
+        _pinned: dict[str, str] = {}
+        if getattr(self, "_field_pinning_enabled", False) and self.current_voucher:
+            for field in CARRY_OVER_SPECIMEN_FIELDS:
+                w = self.specimen_widgets.get(field)
+                if w is not None:
+                    val = w.currentText() if isinstance(w, QComboBox) else w.text()
+                    if val.strip():
+                        _pinned[field] = val.strip()
         self._loading = True
         self.current_voucher = voucher
         # 动态更新照片面板标题，显示当前入库编号
@@ -3818,7 +3836,14 @@ class SpecimenWindow(QMainWindow):
         classification = self.store.get_classification(voucher) or {}
         for field, widget in self.specimen_widgets.items():
             widget.blockSignals(True)
-            if isinstance(widget, QComboBox):
+            # 字段固定：当前编辑器中已修改的 CARRY_OVER 字段值保持不变
+            val = _pinned.get(field) if _pinned else None
+            if val is not None:
+                if isinstance(widget, QComboBox):
+                    widget.setCurrentText(val)
+                else:
+                    widget.setText(val)
+            elif isinstance(widget, QComboBox):
                 widget.setCurrentText(str(specimen.get(field, "")))
             else:
                 widget.setText(str(specimen.get(field, "")))
@@ -3854,6 +3879,16 @@ class SpecimenWindow(QMainWindow):
         save_settings(settings)
         self.statusBar().showMessage(
             "已开启自动保存" if checked else "已关闭自动保存（改动需点「保存」按钮写入）", 3000
+        )
+
+    def _on_field_pinning_toggled(self, checked: bool) -> None:
+        """📌 固定字段开关：切换入库编号时保持当前编辑值不变。"""
+        self._field_pinning_enabled = bool(checked)
+        fields_str = "、".join(CARRY_OVER_SPECIMEN_FIELDS)
+        self.statusBar().showMessage(
+            f"已开启字段固定：切换编号时 {fields_str} 保持不变" if checked
+            else "已关闭字段固定",
+            3000,
         )
 
     def _on_aux_toolbar_toggled(self, checked: bool) -> None:
