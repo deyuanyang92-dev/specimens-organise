@@ -12,7 +12,7 @@ UI 用 `subprocess.Popen` 启动（POSIX `start_new_session=True` / Windows
 
 进程间通信：纯文件协议
 - **PID 文件**：daemon 启动时写入自身 PID，结束时（atexit / 信号）删除。
-  UI 读 PID 文件检测 daemon 是否在跑（再调 `os.kill(pid, 0)` 确认）。
+  UI 读 PID 文件检测 daemon 是否在跑（Windows 走 OpenProcess，POSIX 走 `os.kill(pid, 0)`）。
 - **state 文件**：crawl_full_rest 已有 autosave 机制（每 5000 条 + 完成清除）。
   UI 用 QTimer 1-2s 轮询读 `imported` 字段显示进度。
 - **停止**：UI 给 daemon 发 SIGTERM（POSIX）或 `taskkill /pid`（Windows）。
@@ -48,6 +48,37 @@ def _is_pid_alive(pid: int) -> bool:
     """跨平台检查进程是否存活。"""
     if pid <= 0:
         return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            process_query_limited_information = 0x1000
+            still_active = 259
+
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+
+            handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+            if not handle:
+                error = ctypes.get_last_error()
+                # 旧：Windows 下 os.kill(pid, 0) 不是可靠的纯判活，可能触发 Ctrl-C 语义。
+                # 现：OpenProcess 拿不到句柄时默认 stale；权限不足时保守视为存活，避免双启动。
+                return error == 5
+            try:
+                exit_code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return False
+                return exit_code.value == still_active
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
     try:
         os.kill(pid, 0)
         return True

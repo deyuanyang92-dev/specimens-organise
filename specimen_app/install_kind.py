@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import os
 import sys
-from pathlib import Path, PurePath, PureWindowsPath
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Literal
 
 InstallKind = Literal[
@@ -52,7 +52,13 @@ def _exe_path() -> PurePath:
     even when the test runs on POSIX (and vice versa).
     """
     raw = sys.executable
-    return PureWindowsPath(raw) if "\\" in raw else Path(raw)
+    if "\\" in raw:
+        return PureWindowsPath(raw)
+    if raw.startswith("/"):
+        # 旧：Windows 测试进程里 Path("/usr/bin/app") 会变成 "\\usr\\bin\\app"，
+        # 导致 Linux 系统包路径前缀识别失败。PurePosixPath 保留被模拟平台的语义。
+        return PurePosixPath(raw)
+    return Path(raw)
 
 
 def installation_kind() -> InstallKind:

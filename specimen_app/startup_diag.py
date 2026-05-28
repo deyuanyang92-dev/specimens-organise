@@ -95,10 +95,15 @@ def detect_workspace_on_windows_mounted_filesystem(workspace_root: Path) -> bool
         return False
     if "microsoft" not in proc_version and "wsl" not in proc_version:
         return False
-    try:
-        workspace_path_string = str(Path(workspace_root).resolve())
-    except (OSError, ValueError):
-        return False
+    # 旧：先 Path.resolve()；在 Windows 测试进程里 Path("/mnt/n/...") 会被规范化成
+    # Windows 盘符路径，导致模拟 WSL 的 /mnt/<drive> 判断失效。先保留原始字符串，
+    # 真实非 /mnt 路径再 resolve，不影响 WSL 运行时的兼容语义。
+    workspace_path_string = str(workspace_root).replace("\\", "/")
+    if not workspace_path_string.startswith("/mnt/"):
+        try:
+            workspace_path_string = str(Path(workspace_root).resolve()).replace("\\", "/")
+        except (OSError, ValueError):
+            return False
     # /mnt/c/, /mnt/n/, /mnt/d/ 等单字符盘符挂载
     if not workspace_path_string.startswith("/mnt/"):
         return False

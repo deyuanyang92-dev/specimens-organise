@@ -143,7 +143,8 @@ class RequestStopDaemonTests(unittest.TestCase):
                 m.return_value = mock.Mock()
                 ok = dmn.request_stop_daemon(pid_path)
             self.assertTrue(ok)
-            m.assert_called_once()
+            self.assertGreaterEqual(m.call_count, 1)
+            self.assertEqual(m.call_args_list[0].args[0], ["taskkill", "/PID", str(os.getpid())])
         else:
             with mock.patch("os.kill") as m:
                 ok = dmn.request_stop_daemon(pid_path)

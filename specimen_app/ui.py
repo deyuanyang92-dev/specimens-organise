@@ -2099,7 +2099,8 @@ class SpecimenWindow(QMainWindow):
         # 原代码：SingleSelection 仅单选；改为 ExtendedSelection 支持 Windows 操作习惯：
         # Ctrl+Click 多选 / Shift+Click 范围选 / 拖拽多选
         self.voucher_table.setSelectionMode(QTableWidget.ExtendedSelection)
-        self.voucher_table.setDragMode(QAbstractItemView.RubberBandSelection)
+        # 旧：setDragMode(QAbstractItemView.RubberBandSelection) — QTableWidget 无此方法，
+        #     Windows 下 AttributeError 崩溃（v0.10.12 引入）。ExtendedSelection 已支持多选。
         self.voucher_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.voucher_table.verticalHeader().setVisible(False)
         # 旧逻辑：列宽硬编码 85/36/36/36/52/42，表格字体固定 QFont("Consolas", 10)。
@@ -9601,7 +9602,9 @@ class WindowManager:
         except SystemExit:
             return None
         except Exception as exc:
-            QMessageBox.critical(None, "启动失败", str(exc))
+            if workspace_root is not None:
+                # 指定工作区失败时显示错误；fallback(None)路径静默，不重复弹窗
+                QMessageBox.critical(None, "启动失败", str(exc))
             return None
         self.register(window)
         window.show()

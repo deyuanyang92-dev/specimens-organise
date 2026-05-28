@@ -49,7 +49,8 @@ class SwapScriptTests(unittest.TestCase):
         self.assertIn("seq 1 7", content)
         # Linux script must be executable.
         mode = path.stat().st_mode
-        self.assertTrue(mode & stat.S_IXUSR, "owner exec bit not set")
+        if sys.platform != "win32":
+            self.assertTrue(mode & stat.S_IXUSR, "owner exec bit not set")
 
     def test_distinct_script_paths_per_invocation(self):
         a = write_swap_script_linux(dest_dir=self.dir)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 
 
 APP_NAME = "标本入库管理"
@@ -51,7 +51,18 @@ def _find_executable(directory: Path) -> Path | None:
     return None
 
 
-def current_install_root() -> Path | None:
+def _executable_pure_path() -> PurePath:
+    raw = sys.executable
+    if "\\" in raw:
+        return PureWindowsPath(raw)
+    if raw.startswith("/"):
+        # 旧：Windows 测试进程里 Path("/home/...") 会变成 "\\home\\..."，
+        # 让 current/ 链接根路径的 POSIX 字符串判断失真。
+        return PurePosixPath(raw)
+    return Path(raw)
+
+
+def current_install_root() -> PurePath | None:
     """Return the install root above the ``current/`` junction when the
     running process is launched through it. ``None`` otherwise.
 
@@ -60,7 +71,7 @@ def current_install_root() -> Path | None:
     """
     if not getattr(sys, "frozen", False):
         return None
-    exe = Path(sys.executable)
+    exe = _executable_pure_path()
     if exe.parent.name != "current":
         return None
     return exe.parent.parent

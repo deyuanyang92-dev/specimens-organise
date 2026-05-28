@@ -1692,6 +1692,38 @@ class CoreTests(unittest.TestCase):
         v2 = store.next_voucher()
         self.assertEqual(v2, "YZZ000002")
 
+    def test_voided_voucher_cache_invalidates_when_alloc_log_changes(self) -> None:
+        """注销缓存应随分发日志写入失效，避免 next_voucher 复用刚注销的编号。"""
+        store = ExcelStore(self.tmp)
+        self.assertEqual(store.list_voided_vouchers(), set())
+        store.log_alloc_event({
+            "记录ID": "void-cache-001",
+            "时间": "2026-05-28T19:00:00",
+            "类型": "注销编号",
+            "编号系列": "YZZ",
+            "编号起始": "YZZ000001",
+            "编号结束": "YZZ000001",
+            "数量": "1",
+        })
+        self.assertEqual(store.list_voided_vouchers(), {"YZZ000001"})
+        self.assertEqual(store.next_voucher(), "YZZ000002")
+
+    def test_voided_voucher_cache_return_value_is_not_mutable_internal_state(self) -> None:
+        """调用方修改返回 set 不应污染缓存；旧行为每次扫描也天然不受影响。"""
+        store = ExcelStore(self.tmp)
+        store.log_alloc_event({
+            "记录ID": "void-cache-002",
+            "时间": "2026-05-28T19:01:00",
+            "类型": "注销编号",
+            "编号系列": "YZZ",
+            "编号起始": "YZZ000001",
+            "编号结束": "YZZ000001",
+            "数量": "1",
+        })
+        returned = store.list_voided_vouchers()
+        returned.clear()
+        self.assertEqual(store.list_voided_vouchers(), {"YZZ000001"})
+
     def test_get_photos_uses_voucher_index(self) -> None:
         """get_photos 走 photo voucher 索引 O(1)；多 voucher 互不干扰。"""
         store = ExcelStore(self.tmp)

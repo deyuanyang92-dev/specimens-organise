@@ -201,6 +201,8 @@ class ExcelStore:
         # S3.2: INDEX 表 voucher set 缓存（lazy + mtime 校验）；next_voucher 撞号检测 O(1)。
         self._index_voucher_set: set[str] | None = None
         self._index_voucher_set_mtime: float = -1.0
+        self._voided_cache: set[str] | None = None  # 已注销编号缓存；分发日志变化后清空
+        self._voided_cache_mtime: float = -1.0
         # S3.3 加强：修改汇总表 voucher set 缓存，让 _ensure_summary_row 不再全量重写整张表。
         self._summary_voucher_set: set[str] | None = None
         self._summary_voucher_set_mtime: float = -1.0
@@ -2785,6 +2787,9 @@ class ExcelStore:
             if key == INDEX_FILE:
                 self._index_voucher_set = None
                 self._index_voucher_set_mtime = -1.0
+            if key == ALLOC_LOG_FILE:
+                self._voided_cache = None
+                self._voided_cache_mtime = -1.0
 
     def _enforce_row_cache_size(self) -> None:
         """规范化软件设计 2026-05 内存档位:用户改小档位后立即驱逐多余项,缩内存到位。
@@ -3216,7 +3221,7 @@ class ExcelStore:
         try:
             self.create_data_snapshot(
                 "截断重置前快照",
-                f"从 {cutoff} 截断重置前自动快照（781 及之后全部清除）"
+                f"从 {cutoff} 截断重置前自动快照（{cutoff} 及之后全部清除）"
             )
         except Exception:
             pass  # 快照失败不阻断主流程
@@ -3438,20 +3443,33 @@ class ExcelStore:
                 "编号结束": v,
                 "备注":     "管理员注销（永不复用）",
             })
+        self._voided_cache = None  # 清缓存，next_voucher 下次重新读
+        self._voided_cache_mtime = -1.0
         return len(vouchers)
 
     def list_voided_vouchers(self) -> set[str]:
         """返回已注销编号集合（扫描分发日志中「注销编号」事件）。
 
         供 next_voucher() 跳号使用：注销编号永不被自动分配。
+        结果缓存在 _voided_cache；分发日志写入或外部 mtime 变化后自动清除缓存。
         """
+        path = self.data_dir / ALLOC_LOG_FILE
+        try:
+            current_mtime = path.stat().st_mtime
+        except OSError:
+            current_mtime = 0.0
+        if self._voided_cache is not None and self._voided_cache_mtime == current_mtime:
+            # 旧：每次返回新 set，调用方误改返回值不会污染 store 内部状态。
+            return set(self._voided_cache)
         result: set[str] = set()
         for row in self.read_alloc_log():
             if self._value(row, "类型") == "注销编号":
                 v = self._value(row, "编号起始")
                 if v:
                     result.add(v)
-        return result
+        self._voided_cache = result
+        self._voided_cache_mtime = current_mtime
+        return set(result)
 
     def list_unfinished_reserved_vouchers(self) -> list[tuple[str, str, str]]:
         """列出系统中所有「已批量领取 + 未完成入库」的编号。
