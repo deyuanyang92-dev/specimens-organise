@@ -898,6 +898,12 @@ class ExcelStore:
             })
         except Exception:
             pass  # 审计失败不阻断主流程
+        # 自动清理：删除标本后同步清掉该编号的灰条占位，
+        # 并检查是否有整批预留因为所有标本都被删光而需要一并清除。
+        try:
+            self._auto_cleanup_alloc_after_delete([voucher])
+        except Exception:
+            pass
 
     def delete_specimens_batch(self, vouchers: list[str]) -> int:
         """批量删除标本：O(1) 文件操作，替代逐条 O(N)。
@@ -978,6 +984,11 @@ class ExcelStore:
                 })
             except Exception:
                 pass
+        # 自动清理灰条（同 delete_specimen 逻辑，批量版本）
+        try:
+            self._auto_cleanup_alloc_after_delete([d["voucher"] for d in old_data])
+        except Exception:
+            pass
         return len(old_data)
 
     def clear_photos(self, voucher: str) -> int:
@@ -3181,6 +3192,61 @@ class ExcelStore:
         self.config["next_serial"] = max(1, int(serial))
         self.config.pop("reserved_through_serial", None)
         self._save_config()
+
+    def _auto_cleanup_alloc_after_delete(self, deleted_vouchers: list[str]) -> None:
+        """删除标本后自动清理残留灰条，用户无感知。
+
+        两件事：
+        1. 对刚删除的编号写「取消占位」事件，确保它们不以灰条形式重现。
+        2. 扫描所有「批量领取」区间：若某区间内已无任何存活标本（全被删光），
+           自动把该区间剩余灰条也取消，整批预留从列表消失。
+
+        设计原则：新手用户不知道 alloc log，删了就该消失，不需要再手动清。
+        异常静默处理，不阻断主流程。
+        """
+        deleted_set = set(deleted_vouchers)
+        existing_specimens = {
+            self._value(r, "入库编号*")
+            for r in self.read_rows("specimen")
+            if self._value(r, "入库编号*")
+        }
+
+        rows = self.read_alloc_log()
+        # 已有「取消占位/删除编号」事件的编号集（避免重复写）
+        already_handled = {
+            self._value(r, "编号起始")
+            for r in rows
+            if self._value(r, "类型") in ("取消占位", "删除编号")
+            and self._value(r, "编号起始")
+        }
+
+        to_cancel: set[str] = set()
+
+        # Step1：刚删除的编号本身加入取消列表
+        for v in deleted_set:
+            if v not in already_handled:
+                to_cancel.add(v)
+
+        # Step2：检查每个「批量领取」区间，若该区间内存活标本为零，清掉剩余灰条
+        for row in rows:
+            if self._value(row, "类型") != "批量领取":
+                continue
+            series   = self._value(row, "编号系列") or "YZZ"
+            start_v  = self._value(row, "编号起始")
+            end_v    = self._value(row, "编号结束")
+            range_vs = set(self._expand_voucher_range(series, start_v, end_v))
+            if not range_vs:
+                continue
+            # 有任意存活标本 → 不整批清
+            if any(v in existing_specimens for v in range_vs):
+                continue
+            # 全灭 → 把灰条都加进取消列表
+            for v in range_vs:
+                if v not in already_handled:
+                    to_cancel.add(v)
+
+        if to_cancel:
+            self.cancel_placeholder_vouchers(list(to_cancel))
 
     def cancel_placeholder_vouchers(self, vouchers: list[str]) -> int:
         """管理员批量取消灰条占位。
