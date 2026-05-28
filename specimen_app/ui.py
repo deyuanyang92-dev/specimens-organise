@@ -2124,6 +2124,7 @@ class SpecimenWindow(QMainWindow):
         # 现：保留实例引用 _sc_xxx，启动末尾的 _apply_custom_shortcuts() 可按 settings 改 key。
         # Ctrl+Shift+Z 是 Ctrl+Y 的同义重做绑定，固定不参与自定义。
         self._sc_select_all_voucher = QShortcut(QKeySequence("Ctrl+A"), self.voucher_table, self._select_all_vouchers)
+        self._sc_copy_voucher = QShortcut(QKeySequence.Copy, self.voucher_table, self._copy_selected_vouchers)
         self._sc_undo = QShortcut(QKeySequence("Ctrl+Z"), self, self.undo)
         self._sc_redo = QShortcut(QKeySequence("Ctrl+Y"), self, self.redo)
         self._sc_redo_alt = QShortcut(QKeySequence("Ctrl+Shift+Z"), self, self.redo)  # 同义绑定
@@ -3009,11 +3010,23 @@ class SpecimenWindow(QMainWindow):
             self.store.set_active_series(name)
 
     def _open_series_manager(self) -> None:
-        """打开系列管理对话框。"""
+        """打开系列管理对话框（非模态、单实例）。"""
         if self.store is None:
             return
+        dlg = getattr(self, "_series_mgr_dialog", None)
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            return
         dlg = AccessionSeriesDialog(self.store, self)
-        result = dlg.exec_()
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.finished.connect(self._on_series_manager_done)
+        dlg.destroyed.connect(lambda: setattr(self, "_series_mgr_dialog", None))
+        dlg.show()
+        self._series_mgr_dialog = dlg
+
+    def _on_series_manager_done(self, result: int) -> None:
+        """系列管理对话框关闭后刷新 selector + filter。"""
         self._refresh_series_selector()
         self._refresh_series_filter_combo()
         # 用户在系列管理对话框点击「从指定编号重新开始」→ 接力打开重置对话框
@@ -3195,19 +3208,40 @@ class SpecimenWindow(QMainWindow):
     def _open_reset_from_voucher(self) -> None:
         if self.store is None:
             return
+        # 旧：exec_() 模态，阻塞主窗口。
+        # 新：show() 非模态、单实例，已开着则聚焦。
+        dlg = getattr(self, "_reset_dialog", None)
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            return
         dlg = ResetFromVoucherDialog(self.store, self)
-        if dlg.exec_() == QDialog.Accepted:
-            self.current_voucher = None
-            self.refresh_list()
-            remaining = self.store.list_vouchers()
-            if remaining:
-                self.select_voucher(remaining[0])
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.finished.connect(self._on_reset_or_admin_delete_done)
+        dlg.destroyed.connect(lambda: setattr(self, "_reset_dialog", None))
+        dlg.show()
+        self._reset_dialog = dlg
 
     def _open_admin_delete_range(self) -> None:
         if self.store is None:
             return
+        # 旧：exec_() 模态，阻塞主窗口。
+        # 新：show() 非模态、单实例，已开着则聚焦。
+        dlg = getattr(self, "_admin_delete_dialog", None)
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            return
         dlg = AdminDeleteRangeDialog(self.store, self)
-        if dlg.exec_() == QDialog.Accepted:
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.finished.connect(self._on_reset_or_admin_delete_done)
+        dlg.destroyed.connect(lambda: setattr(self, "_admin_delete_dialog", None))
+        dlg.show()
+        self._admin_delete_dialog = dlg
+
+    def _on_reset_or_admin_delete_done(self, result: int) -> None:
+        """截断重置 / 管理员删除完成后刷新主列表。"""
+        if result == QDialog.Accepted:
             self.current_voucher = None
             self.refresh_list()
             remaining = self.store.list_vouchers()
@@ -3217,7 +3251,18 @@ class SpecimenWindow(QMainWindow):
     def _open_voucher_audit_log(self) -> None:
         if self.store is None:
             return
-        VoucherAuditLogDialog(self.store, self).exec_()
+        # 旧：exec_() 模态。
+        # 新：show() 非模态、单实例（只读审计日志）。
+        dlg = getattr(self, "_audit_log_dialog", None)
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            return
+        dlg = VoucherAuditLogDialog(self.store, self)
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.destroyed.connect(lambda: setattr(self, "_audit_log_dialog", None))
+        dlg.show()
+        self._audit_log_dialog = dlg
 
     def _open_manual_voucher(self) -> None:
         """Phase 5: 手动添加入库编号 + 规则推断 + 批量生成。"""
@@ -3225,8 +3270,18 @@ class SpecimenWindow(QMainWindow):
             QMessageBox.information(self, "未选择工作区", "请先选择工作区。")
             return
         from .manual_voucher_dialog import ManualVoucherDialog
+        # 旧：exec_() 模态。
+        # 新：show() 非模态、单实例。
+        dlg = getattr(self, "_manual_voucher_dialog", None)
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            return
         dlg = ManualVoucherDialog(self.store, self)
-        dlg.exec_()
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.destroyed.connect(lambda: setattr(self, "_manual_voucher_dialog", None))
+        dlg.show()
+        self._manual_voucher_dialog = dlg
 
     # ----------------------------------------------------------------- #
     # 升级中心 v0.8.0 (D1-D20) slot 占位实现。
@@ -3330,19 +3385,21 @@ class SpecimenWindow(QMainWindow):
         )
 
     def _open_workload_report(self) -> None:
-        """工具菜单 → 入库人员记录 = PersonsManagerDialog 默认打开"工作量统计" Tab (Phase 2 复用)。
-
-        旧 WorkloadReportDialog 类仍保留向后兼容,但本入口走 PersonsManagerDialog。
-        优势:统一 UI、复用 SpreadsheetPreviewWidget(排序/筛选/复制/Excel+CSV)、
-        含明细+汇总+编号分发 三 Tab,数据维度也加了照片 / 首次/末次。
-        """
+        """工具菜单 → 入库人员记录（非模态、单实例）。"""
         if self.store is None:
             return
+        dlg = getattr(self, "_workload_dialog", None)
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            return
         from .persons_dialog import PersonsManagerDialog
-        # initial_tab=1 → 直接显"工作量统计"
         dlg = PersonsManagerDialog(self, workspace=self.workspace_root,
                                    store=self.store, initial_tab=1)
-        dlg.exec_()
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.destroyed.connect(lambda: setattr(self, "_workload_dialog", None))
+        dlg.show()
+        self._workload_dialog = dlg
 
     def _on_voucher_header_clicked(self, col: int) -> None:
         """Cycle column filter: all -> √ -> × -> all (or all -> 已认领 -> 未认领 -> all for col 4)."""
@@ -3605,6 +3662,20 @@ class SpecimenWindow(QMainWindow):
         """Ctrl+A 全选凭证列表中当前可见的所有行。"""
         self.voucher_table.selectAll()
 
+    def _copy_selected_vouchers(self) -> None:
+        """Ctrl+C / 右键：复制选中入库编号到剪贴板（换行分隔）。"""
+        selected = self.voucher_table.selectionModel().selectedRows()
+        if not selected:
+            return
+        lines: list[str] = []
+        for model_index in selected:
+            item = self.voucher_table.item(model_index.row(), 0)
+            if item and item.text().strip():
+                lines.append(item.text().strip())
+        if lines:
+            QApplication.clipboard().setText("\n".join(lines))
+            self.statusBar().showMessage(f"已复制 {len(lines)} 个入库编号", 2000)
+
     def _update_dashboard(self) -> None:
         if not hasattr(self, "_dashboard_timer"):
             self._dashboard_timer = QTimer(self)
@@ -3679,14 +3750,22 @@ class SpecimenWindow(QMainWindow):
         self.manager.open_workspace(self.workspace_root, read_only=True)
 
     def _open_persons_manager(self) -> None:
-        """工具菜单入口 / 状态栏 "管理人员…" 选项 → 打开 PersonsManagerDialog。
-
-        Phase 2 (2026-05): 传 store 让 Tab 2/3/4 显示工作量统计 / 任务明细 / 编号分发。
-        """
+        """工具菜单 / 状态栏 → 人员管理（非模态、单实例）。"""
+        dlg = getattr(self, "_persons_mgr_dialog", None)
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            return
         from .persons_dialog import PersonsManagerDialog
         dlg = PersonsManagerDialog(self, workspace=self.workspace_root, store=self.store)
-        dlg.exec_()
-        # 关闭后刷新状态栏下拉
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.finished.connect(self._on_persons_manager_done)
+        dlg.destroyed.connect(lambda: setattr(self, "_persons_mgr_dialog", None))
+        dlg.show()
+        self._persons_mgr_dialog = dlg
+
+    def _on_persons_manager_done(self, _result: int) -> None:
+        """人员管理对话框关闭后刷新状态栏下拉。"""
         try:
             prev = load_settings().current_recorder
             self._current_recorder_combo.refresh(preselect=prev)
@@ -4134,6 +4213,10 @@ class SpecimenWindow(QMainWindow):
 
         menu = QMenu(self)
         menu.addAction("刷新列表 (F5)", self._refresh_and_keep_selection)
+        menu.addAction(
+            f"复制入库编号 ({len(selected_vouchers)}个)",
+            self._copy_selected_vouchers,
+        )
         menu.addSeparator()
 
         # 常用操作
@@ -6630,8 +6713,17 @@ class SpecimenWindow(QMainWindow):
     # ---- Version manager ----
 
     def open_version_manager(self) -> None:
+        """打开版本管理 / 操作历史（非模态、单实例）。"""
+        dlg = getattr(self, "_version_mgr_dialog", None)
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            return
         dlg = VersionManagerDialog(self)
-        dlg.exec_()
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.destroyed.connect(lambda: setattr(self, "_version_mgr_dialog", None))
+        dlg.show()
+        self._version_mgr_dialog = dlg
 
     # ---- Startup update check ----
 
@@ -9009,8 +9101,9 @@ class VersionManagerDialog(QDialog):
     def _create_snapshot(self) -> None:
         path = self.app.store.create_data_snapshot("手动快照", "用户在版本管理窗口创建")
         QMessageBox.information(self, "快照已创建", str(path))
-        self.accept()
-        self.app.open_version_manager()
+        # 旧：accept() + open_version_manager() 重新打开（模态时代替刷新）。
+        # 新：直接刷新表格，用户留在当前窗口即可看到新快照。
+        self._populate_data_versions()
 
     def _restore_snapshot(self) -> None:
         snapshot = self._selected_snapshot_path()
