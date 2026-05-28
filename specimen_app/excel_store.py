@@ -876,6 +876,10 @@ class ExcelStore:
             self._delete_unreferenced_photo_file(photo, remaining_photos)
         self._delete_index(voucher)
         self._record_action("delete_specimen", voucher, "specimen", "", old, {})
+        # 旧：删除后 next_serial 不更新，导致下一个编号仍从旧值续接（用户删了高位编号后新增却从更高处开始）。
+        # 新：每次删除后同步 next_serial = max_existing + 1，确保编号始终紧跟实际最大值。
+        # undo 恢复时 specimen 行回来，_max_existing_serial 会重新算出更大值，next_serial 随之正确。
+        self._sync_next_serial()
         # 删除审计：写分发日志（操作记录 undo 栈已有完整数据；此处仅提供可视化管理记录）
         try:
             import uuid as _uuid
@@ -3087,6 +3091,16 @@ class ExcelStore:
         })
         return {"cancelled": end_s - start_s + 1, "start": start_v, "end": end_v}
 
+    def reset_next_serial(self, serial: int) -> None:
+        """将 YZZ 系列下一编号强制设为 serial，同时清除 reserved_through_serial。
+
+        用于截断重置场景：删除 ≥ N 的编号后，把 next_serial 回拨到 N，
+        确保新增入库编号从 N 开始连续，不受旧 config 残值影响。
+        """
+        self.config["next_serial"] = max(1, int(serial))
+        self.config.pop("reserved_through_serial", None)
+        self._save_config()
+
     def cancel_placeholder_vouchers(self, vouchers: list[str]) -> int:
         """管理员批量取消灰条占位。
 
@@ -3785,8 +3799,10 @@ class ExcelStore:
         return max(serials, default=0)
 
     def _sync_next_serial(self) -> None:
-        self.config["next_serial"] = self._max_existing_serial() + 1
-        self._save_config()
+        new_val = self._max_existing_serial() + 1
+        if self.config.get("next_serial") != new_val:
+            self.config["next_serial"] = new_val
+            self._save_config()
 
     # ── 多系列编号辅助方法 ─────────────────────────────────────────────────
 

@@ -10750,6 +10750,15 @@ class AdminDeleteRangeDialog(QDialog):
             self._store.delete_specimen(v)
             deleted += 1
 
+        # 自动重置编号起点：删完后把 next_serial 回拨到起始编号，清除旧预留值
+        from .parsing import parse_voucher_serial
+        start_serial = parse_voucher_serial(self._start_edit.text().strip())
+        if start_serial is not None:
+            self._store.reset_next_serial(start_serial)
+            reset_msg = f"\n下一个新编号已自动重置为 {self._start_edit.text().strip()}。"
+        else:
+            reset_msg = ""
+
         parts = []
         if placeholders:
             parts.append(f"取消占位 {len(placeholders)} 个")
@@ -10757,7 +10766,7 @@ class AdminDeleteRangeDialog(QDialog):
             parts.append(f"删除标本 {deleted} 个")
         QMessageBox.information(
             self, "完成",
-            "、".join(parts) + "\n编号已可复用。",
+            "、".join(parts) + "\n编号已可复用。" + reset_msg,
         )
         self.accept()
 
