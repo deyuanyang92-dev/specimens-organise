@@ -3880,9 +3880,19 @@ class ExcelStore:
         return max(serials, default=0)
 
     def _sync_next_serial(self) -> None:
-        new_val = self._max_existing_serial() + 1
-        if self.config.get("next_serial") != new_val:
+        max_s   = self._max_existing_serial()
+        new_val = max_s + 1
+        changed = self.config.get("next_serial") != new_val
+        if changed:
             self.config["next_serial"] = new_val
+        # 旧：reserved_through_serial 不随删除清除，导致 next_voucher() 跳过已删区间直接从 reserved+1 开始。
+        # 新：若当前最大编号已低于预留上界（说明预留区间被删除或从未使用），自动清除预留标记，
+        #     下一个新编号从 max_existing+1 连续推进，不再跳号。
+        reserved = int(self.config.get("reserved_through_serial", 0))
+        if reserved > 0 and max_s < reserved:
+            self.config.pop("reserved_through_serial", None)
+            changed = True
+        if changed:
             self._save_config()
 
     # ── 多系列编号辅助方法 ─────────────────────────────────────────────────
