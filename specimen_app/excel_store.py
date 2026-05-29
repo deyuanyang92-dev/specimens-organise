@@ -200,6 +200,8 @@ class ExcelStore:
         self._photo_voucher_index: dict[str, list[int]] = {}
         # S3.2: INDEX 表 voucher set 缓存（lazy + mtime 校验）；next_voucher 撞号检测 O(1)。
         self._index_voucher_set: set[str] | None = None
+        # 批量新增时置 True，使 _record_action 静默；批量完成后在 create_specimens_batch 统一写一条。
+        self._batch_mode: bool = False
         self._index_voucher_set_mtime: float = -1.0
         self._voided_cache: set[str] | None = None  # 已注销编号缓存；分发日志变化后清空
         self._voided_cache_mtime: float = -1.0
@@ -300,6 +302,7 @@ class ExcelStore:
             "add_photo", "add_photos", "delete_photo", "replace_photo",
             "set_photo_filename", "set_photo_description",
             "clear_photos", "move_photos",
+            "clear_specimen", "clear_classification", "clear_all_associations",
             # plan D3: 新增的批量照片字段保存
             "set_photo_fields_batch",
         ]
@@ -809,12 +812,16 @@ class ExcelStore:
                     pass
         return aliases
 
-    def create_specimen(self) -> str:
+    def create_specimen(self, initial_fields: dict | None = None) -> str:
         voucher = self.next_voucher()
         now = self._now()
         row = {header: "" for header in SPECIMEN_HEADERS}
         row["入库编号*"] = voucher
         row["入库日期"] = datetime.now().date().isoformat()
+        if initial_fields:
+            for f, v in initial_fields.items():
+                if f in SPECIMEN_HEADERS and v:
+                    row[f] = str(v)
         self._append_row("specimen", row)
         self._append_index(voucher, now, "", "", self.record_fingerprint(voucher, specimen_override=row))
         self._ensure_summary_row(voucher, created_at=now)
@@ -829,7 +836,59 @@ class ExcelStore:
         self._save_config()
         return voucher
 
-    def create_specimen_with_voucher(self, voucher: str) -> str:
+    def create_specimens_batch(self, n: int, initial_fields: dict | None = None) -> list[str]:
+        """批量新增 n 个标本，写一条 create_specimens_batch action（原子撤回）。
+
+        旧：_open_batch_new_specimens 循环调 create_specimen()，写 n 条独立 action → 需撤 n 次。
+        新：_batch_mode 静默各条 create_specimen 的 _record_action，全部完成后写一条批量 action，
+        使一次 Ctrl+Z 可撤回全部。串行逐个创建，保证 next_serial 连续推进。
+        """
+        self._batch_mode = True
+        vouchers: list[str] = []
+        rows: list[dict] = []
+        try:
+            for _ in range(n):
+                v = self.create_specimen(initial_fields)
+                vouchers.append(v)
+                rows.append(dict(self.get_specimen(v) or {}))
+        finally:
+            self._batch_mode = False
+        if vouchers:
+            self._record_action(
+                "create_specimens_batch", vouchers[0], "specimen", "",
+                {}, {"vouchers": vouchers, "rows": rows},
+            )
+        return vouchers
+
+    def create_specimens_batch_range(
+        self, voucher_list: list[str], initial_fields: dict | None = None
+    ) -> list[str]:
+        """批量新增指定编号列表的标本，跳过已存在编号，写一条 create_specimens_batch action。
+
+        旧：仅支持按数量连续新增（create_specimens_batch）。
+        新：支持按预指定编号列表创建，跳过已存在编号不报错，其余同 create_specimens_batch。
+        """
+        self._batch_mode = True
+        created: list[str] = []
+        rows: list[dict] = []
+        try:
+            for v in voucher_list:
+                try:
+                    self.create_specimen_with_voucher(v, initial_fields)
+                    created.append(v)
+                    rows.append(dict(self.get_specimen(v) or {}))
+                except DuplicateVoucherError:
+                    pass  # 旧：无此方法时直接报错中断；新：跳过已存在编号继续
+        finally:
+            self._batch_mode = False
+        if created:
+            self._record_action(
+                "create_specimens_batch", created[0], "specimen", "",
+                {}, {"vouchers": created, "rows": rows},
+            )
+        return created
+
+    def create_specimen_with_voucher(self, voucher: str, initial_fields: dict | None = None) -> str:
         """规范化软件设计 2026-05 Phase 5:手动指定 voucher 创建 specimen。
 
         跳过 next_serial 自增,直接用 voucher 字串。校验:
@@ -853,6 +912,10 @@ class ExcelStore:
         row = {header: "" for header in SPECIMEN_HEADERS}
         row["入库编号*"] = voucher
         row["入库日期"] = datetime.now().date().isoformat()
+        if initial_fields:
+            for f, v in initial_fields.items():
+                if f in SPECIMEN_HEADERS and v:
+                    row[f] = str(v)
         self._append_row("specimen", row)
         self._append_index(voucher, now, "", "", self.record_fingerprint(voucher, specimen_override=row))
         self._ensure_summary_row(voucher, created_at=now)
@@ -1052,6 +1115,42 @@ class ExcelStore:
         for photo in photos:
             self._delete_unreferenced_photo_file(photo, remaining_photos)
         return len(photos)
+
+    def clear_specimen(self, voucher: str) -> bool:
+        specimen = self.get_specimen(voucher)
+        if not specimen:
+            return False
+        self._record_action("clear_specimen", voucher, "specimen", "", {"specimen": specimen}, {})
+        self._delete_rows("specimen", voucher)
+        return True
+
+    def clear_classification(self, voucher: str) -> bool:
+        classification = self.get_classification(voucher)
+        if not classification:
+            return False
+        self._record_action("clear_classification", voucher, "classification", "", {"classification": classification}, {})
+        self._delete_rows("classification", voucher)
+        return True
+
+    def clear_all_associations(self, voucher: str) -> dict:
+        """原子清除标本+分类+照片，单条 undo 条目。入库编号索引保留。"""
+        specimen = self.get_specimen(voucher)
+        classification = self.get_classification(voucher)
+        photos = self.get_photos(voucher)
+        if not specimen and not classification and not photos:
+            return {"specimen": False, "classification": False, "photo_count": 0}
+        old = {"specimen": specimen, "classification": classification, "photos": photos}
+        self._record_action("clear_all_associations", voucher, "specimen", "", old, {})
+        if specimen:
+            self._delete_rows("specimen", voucher)
+        if classification:
+            self._delete_rows("classification", voucher)
+        if photos:
+            remaining = [r for r in self.read_rows("photo") if self._value(r, "入库编号*") != voucher]
+            self._write_rows("photo", remaining)
+            for photo in photos:
+                self._delete_unreferenced_photo_file(photo, remaining)
+        return {"specimen": bool(specimen), "classification": bool(classification), "photo_count": len(photos)}
 
     def set_fields(
         self,
@@ -2422,7 +2521,7 @@ class ExcelStore:
         self.ensure_index()
         self._sync_next_serial()
 
-    def undo_last(self) -> str | None:
+    def undo_last(self) -> dict | None:
         # 规范化软件设计 2026-05 P1 审查修复:_apply_action 失败时不能把 action 标"已撤销",
         # 否则下次 undo 跳过它造成"幽灵 action"。包 try/except,异常时清晰传播给上层,
         # 不修改 action 状态。Excel 文件多步写入仍无真事务(已知限制),日后专项重构。
@@ -2447,9 +2546,17 @@ class ExcelStore:
             raise
         action["是否撤销"] = "是"
         self._write_plain_rows(self.data_dir / ACTION_LOG_FILE, ACTION_LOG_HEADERS, rows)
-        return self._value(action, "操作类型")
+        # 旧：仅返回 action_type 字符串；新：返回 dict 含 vouchers 列表，供 UI 同步 _active_task。
+        action_type = self._value(action, "操作类型")
+        new_val = self._json(action.get("新值JSON"))
+        if action_type == "create_specimens_batch":
+            vouchers = list(new_val.get("vouchers") or []) if isinstance(new_val, dict) else []
+        else:
+            v = self._value(action, "入库编号")
+            vouchers = [v] if v else []
+        return {"action_type": action_type, "voucher": self._value(action, "入库编号"), "vouchers": vouchers}
 
-    def redo_last(self) -> str | None:
+    def redo_last(self) -> dict | None:
         # 同 undo_last 的 try/except 保护。
         rows = self._read_plain_rows(self.data_dir / ACTION_LOG_FILE)
         voided = self.list_voided_vouchers()
@@ -2477,7 +2584,15 @@ class ExcelStore:
             raise
         action["是否撤销"] = ""
         self._write_plain_rows(self.data_dir / ACTION_LOG_FILE, ACTION_LOG_HEADERS, rows)
-        return self._value(action, "操作类型")
+        # 旧：仅返回 action_type 字符串；新：返回 dict 含 vouchers 列表，供 UI 同步 _active_task。
+        action_type = self._value(action, "操作类型")
+        new_val = self._json(action.get("新值JSON"))
+        if action_type == "create_specimens_batch":
+            vouchers = list(new_val.get("vouchers") or []) if isinstance(new_val, dict) else []
+        else:
+            v = self._value(action, "入库编号")
+            vouchers = [v] if v else []
+        return {"action_type": action_type, "voucher": self._value(action, "入库编号"), "vouchers": vouchers}
 
     def set_undo_depth(self, depth: int) -> None:
         self.config["undo_depth"] = max(1, min(int(depth), 1000))
@@ -3792,6 +3907,9 @@ class ExcelStore:
         old_value: Any,
         new_value: Any,
     ) -> None:
+        # 批量新增模式下跳过单条记录；由 create_specimens_batch 统一写一条批量 action。
+        if self._batch_mode:
+            return
         # 旧：_read_plain_rows + append + _write_plain_rows 全量重写（小表也要 50-80ms）。
         # 新：openpyxl load_workbook + ws.append + 原子 replace，省全量序列化。
         # 失败回退全量重写。
@@ -3896,13 +4014,25 @@ class ExcelStore:
                 self.recover_photo_archive_after_undo(old_value)
             else:
                 self._remove_photo_row(old_value=old_value)
-        elif action_type == "create_specimen":
+        elif action_type in ("create_specimen", "create_specimen_manual"):
             if undo:
                 self._delete_rows("specimen", voucher)
                 self._delete_index(voucher)
             else:
                 self._append_row("specimen", new_value)
                 self._append_index(voucher, self._now(), "", "", self.record_fingerprint(voucher, specimen_override=new_value))
+        elif action_type == "create_specimens_batch":
+            # 旧：无此分支（批量新增无原子撤回）。新：一次撤回/重做全部编号。
+            if undo:
+                for v in (new_value.get("vouchers") or []):
+                    self._delete_rows("specimen", v)
+                    self._delete_index(v)
+            else:
+                for row in (new_value.get("rows") or []):
+                    self._append_row("specimen", row)
+                    v = self._value(row, "入库编号*")
+                    if v:
+                        self._append_index(v, self._now(), "", "", self.record_fingerprint(v, specimen_override=row))
         elif action_type == "delete_specimen":
             if undo:
                 specimen = old_value.get("specimen")
@@ -3934,6 +4064,38 @@ class ExcelStore:
             else:
                 self._delete_rows("photo", voucher)
                 self._invalidate_cache(PHOTO_FILE)
+        elif action_type == "clear_specimen":
+            if undo:
+                specimen = old_value.get("specimen")
+                if specimen:
+                    self._append_row("specimen", specimen)
+            else:
+                self._delete_rows("specimen", voucher)
+        elif action_type == "clear_classification":
+            if undo:
+                classification = old_value.get("classification")
+                if classification:
+                    self._append_row("classification", classification)
+            else:
+                self._delete_rows("classification", voucher)
+        elif action_type == "clear_all_associations":
+            if undo:
+                specimen = old_value.get("specimen")
+                classification = old_value.get("classification")
+                photos = old_value.get("photos") or []
+                if specimen:
+                    self._append_row("specimen", specimen)
+                if classification:
+                    self._append_row("classification", classification)
+                for photo in photos:
+                    self._append_row("photo", photo)
+                    self.recover_photo_archive_after_undo(photo)
+                if photos:
+                    self._invalidate_cache(PHOTO_FILE)
+            else:
+                self._delete_rows("specimen", voucher)
+                self._delete_rows("classification", voucher)
+                self._delete_rows("photo", voucher)
         elif action_type == "move_photos":
             old_photos = old_value.get("photos") or []
             new_photos = new_value.get("photos") or []

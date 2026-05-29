@@ -935,10 +935,10 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(store.move_photos(source, target, [0]), 1)
         self.assertEqual([row["文件名"] for row in store.get_photos(source)], ["move2.jpg"])
         self.assertEqual([row["文件名"] for row in store.get_photos(target)], ["move1.jpg"])
-        self.assertEqual(store.undo_last(), "move_photos")
+        self.assertEqual(store.undo_last()["action_type"], "move_photos")
         self.assertEqual([row["文件名"] for row in store.get_photos(source)], ["move2.jpg", "move1.jpg"])
         self.assertEqual(store.get_photos(target), [])
-        self.assertEqual(store.redo_last(), "move_photos")
+        self.assertEqual(store.redo_last()["action_type"], "move_photos")
         self.assertEqual([row["文件名"] for row in store.get_photos(target)], ["move1.jpg"])
 
     def test_grid_filename_setting_defaults_and_roundtrips(self) -> None:
@@ -1110,9 +1110,9 @@ class CoreTests(unittest.TestCase):
         added = store.add_photos(voucher, paths)
         self.assertEqual(len(added), 3)
         self.assertEqual(len(store.get_photos(voucher)), 3)
-        self.assertEqual(store.undo_last(), "add_photos")
+        self.assertEqual(store.undo_last()["action_type"], "add_photos")
         self.assertEqual(store.get_photos(voucher), [])
-        self.assertEqual(store.redo_last(), "add_photos")
+        self.assertEqual(store.redo_last()["action_type"], "add_photos")
         self.assertEqual([row["文件名"] for row in store.get_photos(voucher)], ["batch1.jpg", "batch2.jpg", "batch3.jpg"])
 
     def test_image_scan_excludes_generated_and_version_dirs(self) -> None:
@@ -1908,6 +1908,62 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].get("人员", ""), "李四")
         self.assertEqual(rows[0].get("数量", ""), "5")
+
+    def test_clear_specimen(self) -> None:
+        store = ExcelStore(self.tmp)
+        v = store.create_specimen()
+        self.assertIsNotNone(store.get_specimen(v))
+        result = store.clear_specimen(v)
+        self.assertTrue(result)
+        self.assertIsNone(store.get_specimen(v))
+        # 入库编号索引保留
+        self.assertIsNotNone(store._find_index(v))
+        # undo 恢复
+        store.undo_last()
+        self.assertIsNotNone(store.get_specimen(v))
+        # 无数据时返回 False
+        store.clear_specimen(v)
+        self.assertFalse(store.clear_specimen(v))
+
+    def test_clear_classification(self) -> None:
+        store = ExcelStore(self.tmp)
+        v = store.create_specimen()
+        store.set_fields("classification", v, {"种名*": "TestSp", "科*": "TestFam"})
+        self.assertIsNotNone(store.get_classification(v))
+        result = store.clear_classification(v)
+        self.assertTrue(result)
+        self.assertIsNone(store.get_classification(v))
+        # 标本信息保留
+        self.assertIsNotNone(store.get_specimen(v))
+        # undo 恢复
+        store.undo_last()
+        self.assertIsNotNone(store.get_classification(v))
+        # 无数据时返回 False
+        store.clear_classification(v)
+        self.assertFalse(store.clear_classification(v))
+
+    def test_clear_all_associations(self) -> None:
+        store = ExcelStore(self.tmp)
+        v = store.create_specimen()
+        store.set_fields("classification", v, {"种名*": "TestSp", "科*": "TestFam"})
+        result = store.clear_all_associations(v)
+        self.assertTrue(result["specimen"])
+        self.assertTrue(result["classification"])
+        self.assertEqual(result["photo_count"], 0)
+        self.assertIsNone(store.get_specimen(v))
+        self.assertIsNone(store.get_classification(v))
+        # 入库编号索引保留
+        self.assertIsNotNone(store._find_index(v))
+        # undo 恢复
+        store.undo_last()
+        self.assertIsNotNone(store.get_specimen(v))
+        self.assertIsNotNone(store.get_classification(v))
+        # 全空时返回零值
+        store.clear_all_associations(v)
+        empty = store.clear_all_associations(v)
+        self.assertFalse(empty["specimen"])
+        self.assertFalse(empty["classification"])
+        self.assertEqual(empty["photo_count"], 0)
 
 
 class Phase1DataSafetyTests(unittest.TestCase):

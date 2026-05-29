@@ -41,8 +41,10 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QProgressDialog,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSpinBox,
     QSplitter,
@@ -1123,7 +1125,7 @@ class SpecimenWindow(QMainWindow):
     # voucher_table 列宽/字体基准值（系统默认字号下的原始值）。
     # 全局字体缩放时按 (当前字号 - 默认字号) 的差值同比放大，避免文字被覆盖。
     # 列0(入库编号)基准宽 110:YZZ000001 等 9 字 Consolas 在 85px 下挤,加宽到不截断。
-    _VOUCHER_COL_BASE_WIDTHS = (110, 36, 36, 36, 52, 42)
+    _VOUCHER_COL_BASE_WIDTHS = (110, 36, 36, 36, 52, 42, 200)
     # 基准字号 11(旧 10):默认就略大、更清晰。A-/A+ 在此基础上叠加 voucher_table_font_delta。
     _VOUCHER_TABLE_BASE_PT = 11
 
@@ -1802,6 +1804,10 @@ class SpecimenWindow(QMainWindow):
         self._update_auto_save_action_text()
         self._main_toolbar.addSeparator()
         self._main_toolbar.addAction(self._auto_save_action)
+        history_action = QAction("⏪ 操作历史", self)
+        history_action.setToolTip("查看操作历史快照，可回退到任意历史状态（需管理员密码）")
+        history_action.triggered.connect(self.open_version_manager)
+        self._main_toolbar.addAction(history_action)
 
         # 应用辅栏可见性（settings 持久化，默认隐藏）。
         self._aux_toolbar.setVisible(bool(load_settings().aux_toolbar_visible))
@@ -1999,12 +2005,20 @@ class SpecimenWindow(QMainWindow):
         # 「人员记录」按钮已从左侧面板移除（干扰「新增编号」）。
         # 入口保留在菜单栏「入库 → 入库人员记录…」。
 
-        # 行1：＋ 新增编号（满宽）。
+        # 行1：新增编号（左宽）+ 批量新增（右）并排。
+        voucher_btn_row = QHBoxLayout()
+        voucher_btn_row.setSpacing(6)
         self._new_voucher_btn = QPushButton("＋ 新增编号")
         self._new_voucher_btn.setEnabled(False)
         self._new_voucher_btn.setToolTip("请先开始录入任务")
         self._new_voucher_btn.clicked.connect(self.new_specimen)
-        voucher_layout.addWidget(self._new_voucher_btn)
+        self._batch_new_btn = QPushButton("批量新增")
+        self._batch_new_btn.setEnabled(False)
+        self._batch_new_btn.setToolTip("请先开始录入任务")
+        self._batch_new_btn.clicked.connect(self._open_batch_new_specimens)
+        voucher_btn_row.addWidget(self._new_voucher_btn, stretch=2)
+        voucher_btn_row.addWidget(self._batch_new_btn, stretch=1)
+        voucher_layout.addLayout(voucher_btn_row)
         # 旧（v0.10.5 及之前）：「⇩ 接管未入库编号…」按钮 + TakeoverPickerDialog 流程。
         # v0.10.6 删除——用户反馈太复杂；改为 voucher list 直接显示未入库领取号 + 点击即建。
         # 工作量按 specimen 表的「信息录入人员」字段聚合，谁最终录入算谁的。
@@ -2025,18 +2039,6 @@ class SpecimenWindow(QMainWindow):
         manage_series_btn.setToolTip("新增 / 编辑 / 删除 入库编号系列")
         manage_series_btn.clicked.connect(self._open_series_manager)
         series_row.addWidget(manage_series_btn)
-        history_btn = QPushButton("⏪ 操作历史")
-        history_btn.setToolTip("查看操作历史快照，可回退到任意历史状态（需管理员密码）")
-        history_btn.clicked.connect(self.open_version_manager)
-        series_row.addWidget(history_btn)
-        self._pin_fields_btn = QPushButton("📌 固定字段")
-        self._pin_fields_btn.setCheckable(True)
-        self._pin_fields_btn.setToolTip(
-            "切换入库编号时，右侧编辑器中下列字段保持不变：\n"
-            + "、".join(CARRY_OVER_SPECIMEN_FIELDS)
-        )
-        self._pin_fields_btn.toggled.connect(self._on_field_pinning_toggled)
-        series_row.addWidget(self._pin_fields_btn)
         series_row.addStretch(1)
         voucher_layout.addLayout(series_row)
         # Search + quick filter
@@ -2063,11 +2065,11 @@ class SpecimenWindow(QMainWindow):
         self._refresh_series_filter_combo()
         self._series_filter_combo.currentIndexChanged.connect(self._apply_voucher_filter)
         filter_row.addWidget(self._series_filter_combo)
-        # 复选框：显示/隐藏关联照片列
-        self._show_photos_checkbox = QCheckBox("照片名")
-        self._show_photos_checkbox.setToolTip("在凭证列表中显示关联的照片文件名")
-        self._show_photos_checkbox.toggled.connect(self._toggle_photo_names_column)
-        filter_row.addWidget(self._show_photos_checkbox)
+        self._col_toggle_btn = QPushButton("列 ▾")
+        self._col_toggle_btn.setFixedWidth(36)
+        self._col_toggle_btn.setToolTip("切换凭证列表列的显示/隐藏")
+        self._col_toggle_btn.clicked.connect(self._show_column_popup)
+        filter_row.addWidget(self._col_toggle_btn)
         voucher_layout.addLayout(filter_row)
         quick_row = QHBoxLayout()
         quick_row.setSpacing(2)
@@ -2143,7 +2145,6 @@ class SpecimenWindow(QMainWindow):
         self._sc_zoom_reset = QShortcut(QKeySequence("Ctrl+0"), self, self._zoom_font_reset)
         self._col_filters: dict[int, str] = {}  # col_index -> filter value
         self._col_header_labels = ["入库编号","标本","照片","分类","认领","照片数","关联照片"]
-        self._show_photo_names = False
         # 按当前全局字号设置表格字体与列宽（默认字号时与旧版完全一致）。
         self._refresh_scaled_fonts()
         voucher_layout.addWidget(self.voucher_table, stretch=1)
@@ -2456,6 +2457,7 @@ class SpecimenWindow(QMainWindow):
             action.toggled.connect(lambda checked, p=panel_ref: p.setVisible(checked))
             view_menu.addAction(action)
         view_menu.addSeparator()
+        view_menu.addAction("操作历史", self.open_version_manager)
         # 辅助工具栏可见性切换（规范化软件设计 2026-05 新增）：状态持久化到 settings.aux_toolbar_visible
         self._aux_toolbar_action = QAction("辅助工具栏", self, checkable=True)
         self._aux_toolbar_action.setChecked(load_settings().aux_toolbar_visible)
@@ -3162,6 +3164,9 @@ class SpecimenWindow(QMainWindow):
             self._task_end_btn.setVisible(True)
             self._new_voucher_btn.setEnabled(True)
             self._new_voucher_btn.setToolTip("")
+            if hasattr(self, "_batch_new_btn"):
+                self._batch_new_btn.setEnabled(True)
+                self._batch_new_btn.setToolTip("")
             if hasattr(self, "_batch_new_specimens_action"):
                 self._batch_new_specimens_action.setEnabled(True)
         else:
@@ -3172,6 +3177,9 @@ class SpecimenWindow(QMainWindow):
             self._task_end_btn.setVisible(False)
             self._new_voucher_btn.setEnabled(False)
             self._new_voucher_btn.setToolTip("请先开始录入任务")
+            if hasattr(self, "_batch_new_btn"):
+                self._batch_new_btn.setEnabled(False)
+                self._batch_new_btn.setToolTip("请先开始录入任务")
             if hasattr(self, "_batch_new_specimens_action"):
                 self._batch_new_specimens_action.setEnabled(False)
 
@@ -3188,30 +3196,36 @@ class SpecimenWindow(QMainWindow):
         if dlg.exec_() != QDialog.Accepted:
             return
         n = dlg.count
-        first_voucher = None
-        for i in range(n):
-            try:
-                carry: dict[str, str] = {}
-                if self.current_voucher:
-                    prev = self.store.get_specimen(self.current_voucher) or {}
-                    carry = {
-                        f: str(prev.get(f, ""))
-                        for f in CARRY_OVER_SPECIMEN_FIELDS
-                        if str(prev.get(f, "")).strip()
-                    }
-                if self._active_task:
-                    carry["信息录入人员"] = self._active_task.get("人员", "")
-                voucher = self.store.create_specimen()
-                if carry:
-                    self.store.set_fields("specimen", voucher, carry)
-                if self._active_task:
-                    self._active_task["本任务编号"].add(voucher)
-                if i == 0:
-                    first_voucher = voucher
-                self.patch_voucher_row(voucher, "added")
-            except Exception as exc:
-                QMessageBox.critical(self, "新增失败", f"第 {i+1} 条时出错：{exc}")
-                break
+        # 旧：循环 n 次调 create_specimen() + set_fields()，写 n*2 条 action → 需撤 n 次。
+        # 新：构建 carry 一次，调 create_specimens_batch()，写一条批量 action → 一次撤回全部。
+        # 按编号范围模式：调 create_specimens_batch_range()，跳过已存在编号，同样原子撤回。
+        carry: dict[str, str] = {}
+        if self.current_voucher:
+            prev = self.store.get_specimen(self.current_voucher) or {}
+            carry = {
+                f: str(prev.get(f, ""))
+                for f in CARRY_OVER_SPECIMEN_FIELDS
+                if str(prev.get(f, "")).strip()
+            }
+        if self._active_task:
+            carry["信息录入人员"] = self._active_task.get("人员", "")
+        try:
+            if dlg.mode == "range":
+                from specimen_app.parsing import parse_voucher_serial, format_voucher
+                s = parse_voucher_serial(dlg.start_voucher)
+                e = parse_voucher_serial(dlg.end_voucher)
+                voucher_list = [format_voucher(i) for i in range(s, e + 1)]
+                vouchers = self.store.create_specimens_batch_range(voucher_list, carry or None)
+            else:
+                vouchers = self.store.create_specimens_batch(n, carry or None)
+        except Exception as exc:
+            QMessageBox.critical(self, "批量新增失败", str(exc))
+            return
+        if self._active_task:
+            self._active_task["本任务编号"].update(vouchers)
+        first_voucher = vouchers[0] if vouchers else None
+        for v in vouchers:
+            self.patch_voucher_row(v, "added")
         if first_voucher:
             self.select_voucher(first_voucher)
 
@@ -3565,13 +3579,38 @@ class SpecimenWindow(QMainWindow):
         self._voucher_page = 0
         self._apply_voucher_filter()
 
-    def _toggle_photo_names_column(self, show: bool) -> None:
-        """切换凭证列表中'关联照片'列的显示/隐藏。"""
-        self._show_photo_names = show
-        if show:
-            self.voucher_table.setColumnWidth(6, 200)
+    def _show_column_popup(self) -> None:
+        """弹出列显隐选择面板（Qt.Popup, 点击外部自动关闭）。"""
+        popup = QWidget(self, Qt.Popup)
+        popup.setWindowTitle("列显隐")
+        layout = QVBoxLayout(popup)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(2)
+        for col, label in [(1, "标本"), (2, "照片"), (3, "分类"),
+                           (4, "认领"), (5, "照片数"), (6, "关联照片")]:
+            cb = QCheckBox(label)
+            cb.setChecked(not self.voucher_table.isColumnHidden(col))
+            cb.toggled.connect(lambda checked, c=col: self._set_column_visible(c, checked))
+            layout.addWidget(cb)
+        btn = self._col_toggle_btn
+        popup.move(btn.mapToGlobal(QPoint(0, btn.height())))
+        popup.show()
+
+    def _set_column_visible(self, col: int, visible: bool) -> None:
+        """设置凭证列表单列显隐（隐藏列不会被 _refresh_scaled_fonts 覆盖宽度）。"""
+        if visible:
+            self.voucher_table.setColumnHidden(col, False)
+            app = QApplication.instance()
+            cur_pt = app.font().pointSize() if app else self._VOUCHER_TABLE_BASE_PT
+            base_pt = _default_app_font_point or cur_pt
+            delta = cur_pt - base_pt
+            user_delta = getattr(load_settings(), "voucher_table_font_delta", 0)
+            table_pt = max(7, self._VOUCHER_TABLE_BASE_PT + delta + user_delta)
+            scale = table_pt / self._VOUCHER_TABLE_BASE_PT
+            base = self._VOUCHER_COL_BASE_WIDTHS[col]
+            self.voucher_table.setColumnWidth(col, max(base, int(base * scale)))
         else:
-            self.voucher_table.setColumnWidth(6, 0)
+            self.voucher_table.setColumnHidden(col, True)
 
     def _voucher_prev_page(self) -> None:
         if self._voucher_page > 0:
@@ -4157,21 +4196,21 @@ class SpecimenWindow(QMainWindow):
         if not self._active_task:
             return
         try:
-            carry: dict[str, str] = {}
+            initial: dict[str, str] = {}
             # 旧逻辑：仅当工具栏「沿用上条信息」开关勾选时才沿用。
             # 现在：开关已移除，沿用是固定模式规则，只要存在当前标本就沿用。
-            # if (
-            #     getattr(self, "_carry_over_action", None) is not None
-            #     and self._carry_over_action.isChecked()
-            #     and self.current_voucher
-            # ):
             if self.current_voucher:
                 prev = self.store.get_specimen(self.current_voucher) or {}
-                carry = {
-                    field: str(prev.get(field, ""))
-                    for field in CARRY_OVER_SPECIMEN_FIELDS
-                    if str(prev.get(field, "")).strip()
-                }
+                for field in CARRY_OVER_SPECIMEN_FIELDS:
+                    val = str(prev.get(field, "")).strip()
+                    if val:
+                        initial[field] = val
+            # plan v0.10.6 S3：任务激活时把"信息录入人员"自动填为当前任务人员。
+            # CARRY_OVER_SPECIMEN_FIELDS 已含"信息录入人员"（沿用上条），任务激活时优先用任务人员覆盖。
+            if self._active_task is not None:
+                task_recorder_name = self._active_task.get("人员", "")
+                if task_recorder_name:
+                    initial["信息录入人员"] = task_recorder_name
             # 完全自定义系列(前缀留空)→ 手动输入编号,不走自增;否则按系列规则自动生成。
             if self._active_series_is_custom():
                 text, ok = QInputDialog.getText(
@@ -4184,19 +4223,9 @@ class SpecimenWindow(QMainWindow):
                 if not text:
                     QMessageBox.information(self, "新增入库编号", "入库编号不能为空。")
                     return
-                voucher = self.store.create_specimen_with_voucher(text)
+                voucher = self.store.create_specimen_with_voucher(text, initial_fields=initial or None)
             else:
-                voucher = self.store.create_specimen()
-            # plan v0.10.6 S3：任务激活时把"信息录入人员"自动填为当前任务人员，
-            # 让工作量按 specimen.信息录入人员 字段聚合的口径成立（最终入库状态为准）。
-            # 用户可手动改字段，不锁。CARRY_OVER_SPECIMEN_FIELDS 已含"信息录入人员"
-            # （沿用上条），任务激活时优先用任务人员覆盖。
-            if self._active_task is not None:
-                task_recorder_name = self._active_task.get("人员", "")
-                if task_recorder_name:
-                    carry["信息录入人员"] = task_recorder_name
-            if carry:
-                self.store.set_fields("specimen", voucher, carry)
+                voucher = self.store.create_specimen(initial_fields=initial or None)
             if self._active_task:
                 self._active_task["本任务编号"].add(voucher)
             # 旧：调 self.refresh_list() 全量重读 3 表 + 重建 5 个大字典，5000 行 100-500ms。
@@ -4275,6 +4304,9 @@ class SpecimenWindow(QMainWindow):
 
         if voucher_text not in reserved_pending:
             menu.addAction("清除照片关联", lambda v=voucher_text: self._context_clear_photos(v))
+            menu.addAction("清除标本关联", lambda v=voucher_text: self._context_clear_specimen(v))
+            menu.addAction("清除分类关联", lambda v=voucher_text: self._context_clear_classification(v))
+            menu.addAction("清除所有关联", lambda v=voucher_text: self._context_clear_all(v))
             has_photos = bool(self.store.get_photos(voucher_text))
             if not has_photos:
                 menu.addAction(
@@ -4339,6 +4371,77 @@ class SpecimenWindow(QMainWindow):
         count = self.store.clear_photos(voucher)
         self.statusBar().showMessage(f"已清除 {voucher} 的 {count} 张照片关联", 3000)
         self._refresh_image_index_after_photo_change()
+        self.patch_voucher_row(voucher, "updated")
+        if self.current_voucher == voucher:
+            self.select_voucher(voucher)
+
+    def _context_clear_specimen(self, voucher: str) -> None:
+        if not self.store.get_specimen(voucher):
+            QMessageBox.information(self, "清除标本关联", f"{voucher} 没有标本信息。")
+            return
+        if QMessageBox.question(
+            self,
+            "清除标本关联",
+            f"确定清除 {voucher} 的标本信息吗？\n\n照片和分类信息将保留不变。",
+            QMessageBox.Yes | QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        self.store.clear_specimen(voucher)
+        self.statusBar().showMessage(f"已清除 {voucher} 的标本信息", 3000)
+        self.patch_voucher_row(voucher, "updated")
+        if self.current_voucher == voucher:
+            self.select_voucher(voucher)
+
+    def _context_clear_classification(self, voucher: str) -> None:
+        if not self.store.get_classification(voucher):
+            QMessageBox.information(self, "清除分类关联", f"{voucher} 没有分类信息。")
+            return
+        if QMessageBox.question(
+            self,
+            "清除分类关联",
+            f"确定清除 {voucher} 的分类信息吗？\n\n标本信息和照片将保留不变。",
+            QMessageBox.Yes | QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        self.store.clear_classification(voucher)
+        self.statusBar().showMessage(f"已清除 {voucher} 的分类信息", 3000)
+        self.patch_voucher_row(voucher, "updated")
+        if self.current_voucher == voucher:
+            self.select_voucher(voucher)
+
+    def _context_clear_all(self, voucher: str) -> None:
+        spec = self.store.get_specimen(voucher)
+        classif = self.store.get_classification(voucher)
+        photos = self.store.get_photos(voucher)
+        if not spec and not classif and not photos:
+            QMessageBox.information(self, "清除所有关联", f"{voucher} 没有任何关联数据。")
+            return
+        parts = []
+        if spec:
+            parts.append("标本信息")
+        if classif:
+            parts.append("分类信息")
+        if photos:
+            parts.append(f"{len(photos)} 张照片")
+        if QMessageBox.question(
+            self,
+            "清除所有关联",
+            f"确定清除 {voucher} 的全部关联（{'、'.join(parts)}）吗？\n\n"
+            "入库编号将保留，但以上数据全部删除。未被其他记录引用的照片归档文件也会删除。",
+            QMessageBox.Yes | QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        result = self.store.clear_all_associations(voucher)
+        summary = []
+        if result["specimen"]:
+            summary.append("标本信息")
+        if result["classification"]:
+            summary.append("分类信息")
+        if result["photo_count"]:
+            summary.append(f"{result['photo_count']} 张照片")
+        self.statusBar().showMessage(f"已清除 {voucher} 的{'、'.join(summary)}", 3000)
+        if result["photo_count"]:
+            self._refresh_image_index_after_photo_change()
         self.patch_voucher_row(voucher, "updated")
         if self.current_voucher == voucher:
             self.select_voucher(voucher)
@@ -4822,9 +4925,13 @@ class SpecimenWindow(QMainWindow):
     def undo(self) -> None:
         if self.store is None:
             return
-        action = self.store.undo_last()
-        if action:
-            self.statusBar().showMessage(f"已撤回：{action}", 3000)
+        result = self.store.undo_last()
+        if result:
+            self.statusBar().showMessage(f"已撤回：{result['action_type']}", 3000)
+            # 撤回新增编号时同步清理任务计数
+            if self._active_task:
+                for v in result.get("vouchers", []):
+                    self._active_task["本任务编号"].discard(v)
             self.reload_current()
         else:
             self.statusBar().showMessage("没有可撤回的操作", 2000)
@@ -4832,9 +4939,13 @@ class SpecimenWindow(QMainWindow):
     def redo(self) -> None:
         if self.store is None:
             return
-        action = self.store.redo_last()
-        if action:
-            self.statusBar().showMessage(f"已重做：{action}", 3000)
+        result = self.store.redo_last()
+        if result:
+            self.statusBar().showMessage(f"已重做：{result['action_type']}", 3000)
+            # 重做新增编号时同步补回任务计数
+            if self._active_task and result["action_type"] in ("create_specimen", "create_specimen_manual", "create_specimens_batch"):
+                for v in result.get("vouchers", []):
+                    self._active_task["本任务编号"].add(v)
             self.reload_current()
         else:
             self.statusBar().showMessage("没有可重做的操作", 2000)
@@ -7367,7 +7478,8 @@ class SpecimenWindow(QMainWindow):
         table.verticalHeader().setDefaultSectionSize(row_h)
         scale = table_pt / self._VOUCHER_TABLE_BASE_PT
         for col, base in enumerate(self._VOUCHER_COL_BASE_WIDTHS):
-            table.setColumnWidth(col, max(base, int(base * scale)))
+            if not table.isColumnHidden(col):
+                table.setColumnWidth(col, max(base, int(base * scale)))
 
     def _adjust_voucher_table_font(self, step: int) -> None:
         """A- / A+ 按钮:调编号列表字体微调档（持久化 + 立即刷新）。"""
@@ -9753,6 +9865,71 @@ class WindowManager:
         return window
 
 
+class CrashReportDialog(QDialog):
+    """显示运行时异常堆栈，支持一键复制，替代无窗口 Windows 下的静默崩溃。"""
+
+    def __init__(self, traceback_text: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("程序异常")
+        self.resize(720, 420)
+        layout = QVBoxLayout(self)
+        lbl = QLabel("发生了一个未预期的错误。请将以下内容反馈给开发者：")
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+        from PyQt5.QtGui import QFont
+        tb_edit = QPlainTextEdit(traceback_text)
+        tb_edit.setReadOnly(True)
+        tb_edit.setFont(QFont("Consolas", 9))
+        layout.addWidget(tb_edit)
+        btn_row = QHBoxLayout()
+        copy_btn = QPushButton("复制日志")
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(traceback_text))
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(copy_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+
+def _install_qt_exception_dialog() -> None:
+    """Wrap sys.excepthook + threading.excepthook to show CrashReportDialog on unhandled exceptions.
+
+    Windows frozen binary has no console; without this, crashes are silent.
+    crash_log.py's file-write hook runs first (unchanged), then the dialog appears.
+    """
+    import traceback as _tb
+    _orig = sys.excepthook
+
+    def _hook(exc_type, exc_value, exc_tb):
+        _orig(exc_type, exc_value, exc_tb)
+        if exc_type is KeyboardInterrupt:
+            return
+        text = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
+        try:
+            dlg = CrashReportDialog(text)
+            dlg.exec_()
+        except Exception:
+            pass
+
+    sys.excepthook = _hook
+
+    import threading
+    _orig_th = getattr(threading, "excepthook", None)
+    if _orig_th:
+        def _thread_hook(args):
+            _orig_th(args)
+            if args.exc_type is SystemExit:
+                return
+            text = "".join(_tb.format_exception(args.exc_type, args.exc_value, args.exc_tb))
+            try:
+                dlg = CrashReportDialog(text)
+                dlg.exec_()
+            except Exception:
+                pass
+        threading.excepthook = _thread_hook
+
+
 def run_app(workspace_root: Path | str | None) -> None:
     # 规范化软件设计 2026-05 启动卡死优化:
     # 1. QApplication 先创建,Splash 立刻可见 (无视觉反馈是"卡死"误判主因)
@@ -9766,6 +9943,7 @@ def run_app(workspace_root: Path | str | None) -> None:
         list_recent_crash_logs,
     )
     install_excepthook()
+    _install_qt_exception_dialog()
     _last_exit_was_clean = mark_app_started()
 
     if workspace_root is None:
@@ -9891,13 +10069,15 @@ def run_app(workspace_root: Path | str | None) -> None:
     if not _last_exit_was_clean:
         def _show_crash_hint() -> None:
             # 后台 WoRMS/测试线程日志不代表主窗口崩溃，不能冒充上次应用异常退出。
-            recent = list_recent_crash_logs(limit=3, context="main_thread")
+            recent = list_recent_crash_logs(limit=1, context="main_thread")
             if recent:
-                paths_text = "\n".join(f"  · {p.name}" for p in recent)
+                try:
+                    log_text = recent[0].read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    log_text = f"（日志文件读取失败：{recent[0]}）"
                 detail = (
-                    f"检测到上次应用未正常退出。最近的崩溃日志：\n{paths_text}\n\n"
-                    f"位置：{recent[0].parent}\n\n"
-                    "如反复出现，请把日志反馈给开发者。"
+                    f"检测到上次应用未正常退出。崩溃日志（{recent[0].name}）：\n\n"
+                    + log_text
                 )
             else:
                 detail = (
@@ -9905,7 +10085,8 @@ def run_app(workspace_root: Path | str | None) -> None:
                     "没有崩溃日志说明属于系统级中止，本次启动一切正常。"
                 )
             try:
-                QMessageBox.information(window, "上次异常退出", detail)
+                dlg = CrashReportDialog(detail, window)
+                dlg.exec_()
             except Exception:
                 pass
 
@@ -10683,30 +10864,61 @@ class BatchGenerateDialog(QDialog):
 
 
 class BatchNewSpecimensDialog(QDialog):
-    """一次新增多条空白入库编号（本地直接创建，连续编号，无断档）。"""
+    """一次新增多条空白入库编号：按数量连续生成，或指定入库编号范围。"""
 
     def __init__(self, active_task: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle("批量新增入库编号")
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(440)
         self.count = 10
+        self.mode = "count"
+        self.start_voucher = ""
+        self.end_voucher = ""
 
         layout = QVBoxLayout(self)
+        layout.setSpacing(10)
 
         info = QLabel(
-            "系统将连续生成指定数量的空白入库编号，直接出现在入库列表中，"
-            "您可以逐条填写标本信息。编号连续，不会产生断档。"
+            "按数量：系统连续生成指定数量的空白入库编号，直接出现在入库列表中。\n"
+            "按编号范围：指定 YZZ 开始和结束编号，在该范围内批量新增（已存在编号自动跳过）。"
         )
         info.setWordWrap(True)
         info.setStyleSheet("color:#2a6fbd; background:#e8f0fb; border-radius:4px; padding:8px;")
         layout.addWidget(info)
 
-        form = QFormLayout()
+        mode_row = QHBoxLayout()
+        self._radio_count = QRadioButton("按数量")
+        self._radio_range = QRadioButton("按编号范围")
+        self._radio_count.setChecked(True)
+        mode_row.addWidget(self._radio_count)
+        mode_row.addWidget(self._radio_range)
+        mode_row.addStretch()
+        layout.addLayout(mode_row)
+
+        self._count_widget = QWidget()
+        count_form = QFormLayout(self._count_widget)
+        count_form.setContentsMargins(0, 0, 0, 0)
         self._spin = QSpinBox()
-        self._spin.setRange(1, 99)
+        self._spin.setRange(1, 500)
         self._spin.setValue(10)
-        form.addRow("新增数量（1–99）", self._spin)
-        layout.addLayout(form)
+        count_form.addRow("新增数量（1–500）", self._spin)
+        layout.addWidget(self._count_widget)
+
+        self._range_widget = QWidget()
+        self._range_widget.setVisible(False)
+        range_form = QFormLayout(self._range_widget)
+        range_form.setContentsMargins(0, 0, 0, 0)
+        self._start_edit = QLineEdit()
+        self._start_edit.setPlaceholderText("例：YZZ000050")
+        self._end_edit = QLineEdit()
+        self._end_edit.setPlaceholderText("例：YZZ000060")
+        range_form.addRow("开始编号", self._start_edit)
+        range_form.addRow("结束编号", self._end_edit)
+        self._range_preview = QLabel("")
+        self._range_preview.setWordWrap(True)
+        self._range_preview.setStyleSheet("color:#555; font-size:11px;")
+        range_form.addRow("", self._range_preview)
+        layout.addWidget(self._range_widget)
 
         person = active_task.get("人员", "")
         purpose = active_task.get("用途", "")
@@ -10723,12 +10935,72 @@ class BatchNewSpecimensDialog(QDialog):
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
-        self._spin.valueChanged.connect(
-            lambda v: self._ok_btn.setText(f"确认新增 {v} 条")
-        )
+        self._spin.valueChanged.connect(self._update_ok_btn)
+        self._radio_count.toggled.connect(self._on_mode_changed)
+        self._start_edit.textChanged.connect(self._update_ok_btn)
+        self._end_edit.textChanged.connect(self._update_ok_btn)
+
+    def _on_mode_changed(self, count_checked: bool):
+        self._count_widget.setVisible(count_checked)
+        self._range_widget.setVisible(not count_checked)
+        self._update_ok_btn()
+
+    def _update_ok_btn(self):
+        from specimen_app.parsing import VOUCHER_RE, parse_voucher_serial
+        if self._radio_count.isChecked():
+            n = self._spin.value()
+            self._ok_btn.setText(f"确认新增 {n} 条")
+            self._ok_btn.setEnabled(True)
+        else:
+            s_text = self._start_edit.text().strip()
+            e_text = self._end_edit.text().strip()
+            if not s_text or not e_text:
+                self._range_preview.setText("")
+                self._ok_btn.setText("确认新增")
+                self._ok_btn.setEnabled(False)
+                return
+            s_m = VOUCHER_RE.match(s_text)
+            e_m = VOUCHER_RE.match(e_text)
+            if not s_m or not e_m:
+                self._range_preview.setText("编号范围模式仅支持 YZZ 系列，请输入如 YZZ000050 格式。")
+                self._range_preview.setStyleSheet("color:#c0392b; font-size:11px;")
+                self._ok_btn.setText("确认新增")
+                self._ok_btn.setEnabled(False)
+                return
+            s_serial = parse_voucher_serial(s_text)
+            e_serial = parse_voucher_serial(e_text)
+            if s_serial > e_serial:
+                self._range_preview.setText("开始编号必须 ≤ 结束编号。")
+                self._range_preview.setStyleSheet("color:#c0392b; font-size:11px;")
+                self._ok_btn.setText("确认新增")
+                self._ok_btn.setEnabled(False)
+                return
+            n = e_serial - s_serial + 1
+            if n > 500:
+                self._range_preview.setText(f"范围包含 {n} 条，超过单次上限 500，请缩小范围。")
+                self._range_preview.setStyleSheet("color:#c0392b; font-size:11px;")
+                self._ok_btn.setText("确认新增")
+                self._ok_btn.setEnabled(False)
+                return
+            self._range_preview.setText(
+                f"将新增最多 {n} 条　（{s_text} … {e_text}，已存在编号自动跳过）"
+            )
+            self._range_preview.setStyleSheet("color:#1a7a1a; font-size:11px;")
+            self._ok_btn.setText(f"确认新增 {n} 条")
+            self._ok_btn.setEnabled(True)
 
     def _on_accept(self):
-        self.count = self._spin.value()
+        if self._radio_count.isChecked():
+            self.mode = "count"
+            self.count = self._spin.value()
+        else:
+            self.mode = "range"
+            self.start_voucher = self._start_edit.text().strip()
+            self.end_voucher = self._end_edit.text().strip()
+            from specimen_app.parsing import parse_voucher_serial
+            s = parse_voucher_serial(self.start_voucher)
+            e = parse_voucher_serial(self.end_voucher)
+            self.count = e - s + 1
         self.accept()
 
 
