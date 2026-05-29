@@ -60,7 +60,7 @@ class ServerSyncAggregateTests(unittest.TestCase):
                 voucher,
                 {
                     "管内编号*": f"{tube_prefix}-LSD-SC{i+1:03d}-1-R-250923",
-                    "采集地点缩写*": "QD",
+                    "采集地缩写*": "QD",
                 },
             )
         if with_manifest:
@@ -225,7 +225,7 @@ class ServerSyncAggregateTests(unittest.TestCase):
         nested_ws.mkdir()
         store = ExcelStore(nested_ws)
         v = store.create_specimen()
-        store.set_fields("specimen", v, {"管内编号*": "A-001", "采集地点缩写*": "QD"})
+        store.set_fields("specimen", v, {"管内编号*": "A-001", "采集地缩写*": "QD"})
 
         target = ExcelStore(self.central)
         report = aggregate_incoming(target, self.incoming)
@@ -245,7 +245,7 @@ class ServerSyncAggregateTests(unittest.TestCase):
             sub.mkdir(parents=True)
             s = ExcelStore(sub)
             v = s.create_specimen()
-            s.set_fields("specimen", v, {"管内编号*": f"{name}-001", "采集地点缩写*": "QD"})
+            s.set_fields("specimen", v, {"管内编号*": f"{name}-001", "采集地缩写*": "QD"})
 
         target = ExcelStore(self.central)
         report = aggregate_incoming(target, self.incoming)

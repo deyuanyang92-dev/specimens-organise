@@ -108,7 +108,7 @@ class CoreTests(unittest.TestCase):
         store = ExcelStore(self.tmp)
         first = store.create_specimen()
         second = store.create_specimen()
-        store.set_fields("specimen", first, {"管内编号*": "QD-CK-SC008", "采集地点缩写*": "QD"})
+        store.set_fields("specimen", first, {"管内编号*": "QD-CK-SC008", "采集地缩写*": "QD"})
         store.set_fields("classification", first, {
             "种名*": "Nicon moniloceras",
             "科*": "Nereididae",
@@ -372,11 +372,11 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(extract_save_method_from_tube_number("XM-ABC-SC001-79-250924"), "79")
         self.assertEqual(
             derive_specimen_fields_from_tube_number("QD-LSD-SC001-1-R-250923"),
-            {"采集地点缩写*": "QD-LSD", "采集日期": "2025-09-23", "保存方式": "RE"},
+            {"采集地缩写*": "QD-LSD", "采集日期": "2025-09-23", "保存方式": "RE"},
         )
         self.assertEqual(
             derive_specimen_fields_from_tube_number("GXRG-A-BZC001"),
-            {"采集地点缩写*": "GXRG-A"},
+            {"采集地缩写*": "GXRG-A"},
         )
 
     def test_photo_filename_fill_helpers_are_conservative(self) -> None:
@@ -387,20 +387,20 @@ class CoreTests(unittest.TestCase):
             updates,
             {
                 "管内编号*": "QD-LSD-SC001-1-R-250923",
-                "采集地点缩写*": "QD-LSD",
+                "采集地缩写*": "QD-LSD",
                 "采集日期": "2025-09-23",
                 "保存方式": "RE",
             },
         )
         defaults = default_photo_filename_fill_fields(
             updates,
-            {"管内编号*": "", "采集地点缩写*": "OLD", "采集日期": "", "保存方式": "FE"},
+            {"管内编号*": "", "采集地缩写*": "OLD", "采集日期": "", "保存方式": "FE"},
         )
         self.assertEqual(defaults, ["管内编号*", "采集日期"])
 
         # 兼容无日期/保存方式的文件名：至少能从核心编号填充管内编号和采集地点。
         gxrg_updates = specimen_updates_from_photo_filename("GXRG-A-BZC001.tif")
-        self.assertEqual(gxrg_updates, {"管内编号*": "GXRG-A-BZC001", "采集地点缩写*": "GXRG-A"})
+        self.assertEqual(gxrg_updates, {"管内编号*": "GXRG-A-BZC001", "采集地缩写*": "GXRG-A"})
 
     def test_set_field_autofills_tube_derived_fields(self) -> None:
         store = ExcelStore(self.tmp)
@@ -408,12 +408,12 @@ class CoreTests(unittest.TestCase):
         store.set_fields("specimen", voucher, {"管内编号*": "QD-LSD-SC001-1-R-250923"})
         row = store.get_specimen(voucher)
         self.assertEqual(row["采集日期"], "2025-09-23")
-        self.assertEqual(row["采集地点缩写*"], "QD-LSD")
+        self.assertEqual(row["采集地缩写*"], "QD-LSD")
         self.assertEqual(row["保存方式"], "RE")
         store.set_fields("specimen", voucher, {"管内编号*": "XM-ABC-SC001-1-R-250924"})
         row = store.get_specimen(voucher)
         self.assertEqual(row["采集日期"], "2025-09-24")
-        self.assertEqual(row["采集地点缩写*"], "XM-ABC")
+        self.assertEqual(row["采集地缩写*"], "XM-ABC")
         self.assertEqual(row["保存方式"], "RE")
         store.set_fields("specimen", voucher, {"管内编号*": "XM-ABC-SC001-FE-250924"})
         row = store.get_specimen(voucher)
@@ -422,7 +422,7 @@ class CoreTests(unittest.TestCase):
     def test_photo_filename_fill_can_disable_hidden_derived_overwrite(self) -> None:
         store = ExcelStore(self.tmp)
         voucher = store.create_specimen()
-        store.set_fields("specimen", voucher, {"采集日期": "2024-01-01", "采集地点缩写*": "OLD"})
+        store.set_fields("specimen", voucher, {"采集日期": "2024-01-01", "采集地缩写*": "OLD"})
         store.set_fields(
             "specimen",
             voucher,
@@ -432,7 +432,7 @@ class CoreTests(unittest.TestCase):
         row = store.get_specimen(voucher)
         self.assertEqual(row["管内编号*"], "QD-LSD-SC001-1-R-250923")
         self.assertEqual(row["采集日期"], "2024-01-01")
-        self.assertEqual(row["采集地点缩写*"], "OLD")
+        self.assertEqual(row["采集地缩写*"], "OLD")
 
     def test_undo_redo_field_update(self) -> None:
         store = ExcelStore(self.tmp)
@@ -562,7 +562,7 @@ class CoreTests(unittest.TestCase):
         source = self.tmp / "source.xlsx"
         wb = Workbook()
         ws = wb.active
-        ws.append(["入库编号*", "管内编号*", "保存方式", "采集日期", "采集地点缩写*", "入库日期", "标本存放位置", "信息录入人员", "核对人员", "备注"])
+        ws.append(["入库编号*", "管内编号*", "保存方式", "采集日期", "采集地缩写*", "入库日期", "标本存放位置", "信息录入人员", "核对人员", "备注"])
         ws.append(["YZZ000003", "QD-LSD-SC001-1-R-250923", "", "", "", "", "", "", "", ""])
         wb.save(source)
 
@@ -578,7 +578,7 @@ class CoreTests(unittest.TestCase):
         source = self.tmp / "source_duplicate.xlsx"
         wb = Workbook()
         ws = wb.active
-        ws.append(["入库编号*", "管内编号*", "保存方式", "采集日期", "采集地点缩写*", "入库日期", "标本存放位置", "信息录入人员", "核对人员", "备注"])
+        ws.append(["入库编号*", "管内编号*", "保存方式", "采集日期", "采集地缩写*", "入库日期", "标本存放位置", "信息录入人员", "核对人员", "备注"])
         ws.append(["YZZ000003", "QD-LSD-SC001-1-R-250923", "", "", "", "", "", "", "", ""])
         ws.append(["YZZ000003", "QD-CK-SC008-1-R-250923", "", "", "", "", "", "", "", ""])
         wb.save(source)
@@ -593,7 +593,7 @@ class CoreTests(unittest.TestCase):
         path = self.tmp / "数据" / "标本信息.xlsx"
         wb = Workbook()
         ws = wb.active
-        ws.append(["入库编号*", "管内编号*", "保存方式", "采集日期", "采集地点缩写*", "入库日期", "标本存放位置", "备注"])
+        ws.append(["入库编号*", "管内编号*", "保存方式", "采集日期", "采集地缩写*", "入库日期", "标本存放位置", "备注"])
         ws.append(["YZZ000001", "A", "", "", "", "", "", ""])
         ws.append(["YZZ000001", "B", "", "", "", "", "", ""])
         wb.save(path)
@@ -991,7 +991,7 @@ class CoreTests(unittest.TestCase):
         second = store.create_specimen()  # 故意不填分类信息，验证左连接
         store.set_fields("specimen", first, {
             "管内编号*": "QD-CK-SC008",
-            "采集地点缩写*": "QD",
+            "采集地缩写*": "QD",
             "备注": "标本备注",
         })
         store.set_fields("classification", first, {
@@ -1440,7 +1440,7 @@ class CoreTests(unittest.TestCase):
         for path in [first, second, unrelated]:
             path.write_bytes(b"image")
 
-        specimen = {"管内编号*": "QD-CK-SC008-260827", "采集地点缩写*": "QD-CK"}
+        specimen = {"管内编号*": "QD-CK-SC008-260827", "采集地缩写*": "QD-CK"}
         self.assertEqual(default_image_query(specimen), "QD-CK-SC008")
         self.assertEqual(extract_core_identifier("QD_CK_SC008_260827"), "QD-CK-SC008")
         results = image_search_results(self.tmp, "YZZ000003", specimen, {}, [], query="QD-CK-SC008-260827")
@@ -1837,7 +1837,7 @@ class CoreTests(unittest.TestCase):
         store.add_photo(v, f)
         self.assertFalse(store.is_voucher_ingestion_complete(v))
         # specimen 必填 + 照片 + 分类必填 全填 → 完整
-        store.set_fields("specimen", v, {"管内编号*": "QD-LSD-SC001-1-R-250923", "采集地点缩写*": "QD"})
+        store.set_fields("specimen", v, {"管内编号*": "QD-LSD-SC001-1-R-250923", "采集地缩写*": "QD"})
         from specimen_app.classification_fields import REQUIRED_CLASSIFICATION_COLUMNS
         cls = {field: "X" for field in REQUIRED_CLASSIFICATION_COLUMNS if field != "入库编号*"}
         store.set_fields("classification", v, cls)
@@ -1858,7 +1858,7 @@ class CoreTests(unittest.TestCase):
         photo_dir = self.tmp / "照片"; photo_dir.mkdir()
         p = photo_dir / "a.jpg"; p.write_bytes(b"a")
         store.add_photo(v1, p)
-        store.set_fields("specimen", v1, {"管内编号*": "T1", "采集地点缩写*": "QD"})
+        store.set_fields("specimen", v1, {"管内编号*": "T1", "采集地缩写*": "QD"})
         from specimen_app.classification_fields import REQUIRED_CLASSIFICATION_COLUMNS
         store.set_fields("classification", v1, {f: "X" for f in REQUIRED_CLASSIFICATION_COLUMNS if f != "入库编号*"})
         self.assertTrue(store.is_voucher_ingestion_complete(v1))
@@ -2454,20 +2454,18 @@ class Phase4PerformanceTests(unittest.TestCase):
 
     def test_photo_field_save_merges_into_single_action_log(self) -> None:
         from specimen_app.excel_store import ExcelStore
-        from specimen_app.models import ACTION_LOG_FILE
         store = ExcelStore(self.tmp)
         voucher = store.create_specimen()
         src = self.tmp / "photo.jpg"
         Image.new("RGB", (16, 16), color="blue").save(src, "JPEG")
         store.add_photo(voucher, src)
         # 单次 batch 同时改两个字段
-        before_rows = store._read_plain_rows(store.data_dir / ACTION_LOG_FILE)
-        before_count = len(before_rows)
+        # Tier B: 操作记录现在写 SQLite，通过 _action_log_db 计数
+        before_count = len(store._action_log_db.get_all())
         changed = store.set_photo_fields_batch(voucher, 0, {"描述": "新描述", "文件名": "renamed.jpg"})
         self.assertTrue(changed)
-        after_rows = store._read_plain_rows(store.data_dir / ACTION_LOG_FILE)
-        new_actions = after_rows[before_count:]
-        self.assertEqual(len(new_actions), 1, "batch 改 2 个字段应只增 1 条 action-log")
+        after_count = len(store._action_log_db.get_all())
+        self.assertEqual(after_count - before_count, 1, "batch 改 2 个字段应只增 1 条 action-log")
         # 一次 undo 应同时还原两个字段
         store.undo_last()
         photo_after_undo = [r for r in store.read_rows("photo") if r.get("入库编号*") == voucher][0]

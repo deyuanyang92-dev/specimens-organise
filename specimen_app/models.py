@@ -22,14 +22,14 @@ DATA_VERSION_LOG_FILE = "数据版本记录.xlsx"
 ALLOC_LOG_FILE = "编号分发记录.xlsx"
 WORKSPACE_CONFIG_FILE = "工作区配置.json"
 DATA_VERSION_DIR = "数据版本"
-CURRENT_DATA_SCHEMA_VERSION = "1.1.2"
+CURRENT_DATA_SCHEMA_VERSION = "1.1.3"
 
 SPECIMEN_HEADERS = [
     "入库编号*",
     "管内编号*",
     "保存方式",
     "采集日期",
-    "采集地点缩写*",
+    "采集地缩写*",
     "入库日期",
     "标本存放位置",
     "信息录入人员",
@@ -118,7 +118,7 @@ ALLOC_LOG_HEADERS = [
     "接管编号",     # 接管的编号列表，分号分隔，供审计/反查 creator
 ]
 
-SPECIMEN_REQUIRED = ["入库编号*", "管内编号*", "采集地点缩写*"]
+SPECIMEN_REQUIRED = ["入库编号*", "管内编号*", "采集地缩写*"]
 CLASSIFICATION_REQUIRED = list(REQUIRED_CLASSIFICATION_COLUMNS)
 
 SAVE_METHOD_OPTIONS = ["9E", "7E", "79", "RE", "FE"]

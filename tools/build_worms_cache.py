@@ -44,6 +44,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from specimen_app.worms_client import (  # noqa: E402
     crawl_full_rest,
+    crawl_by_date,
     import_dwca,
     export_cache_gz,
     cache_stats,
@@ -59,24 +60,45 @@ def _output_name() -> str:
     return f"worms_cache_{today.year}-{_quarter(today)}.sqlite.gz"
 
 
-def _do_rest_crawl() -> int:
-    """REST 递归全量抓取。返回写入条数。"""
-    print("Crawling WoRMS via REST API (AphiaChildrenByAphiaID, recursive)…")
-    print("  Rate limit: ~3 req/s, expect 30-60 minutes for the full tree.")
-    print("  Resume state: ~/.specimen_inventory/worms_crawl_state.json")
+def _progress_fn() -> tuple:
+    """Return (last_taxon, progress_cb) for reuse in crawl modes."""
     last_taxon = [""]
     last_print_at = [0]
 
     def _progress(n: int, current: str) -> None:
         last_taxon[0] = current or last_taxon[0]
-        # 节流 stdout：每 500 条打印一次
         if n - last_print_at[0] >= 500 or n < 100:
             last_print_at[0] = n
             print(f"\r  Imported {n:,} records (current: {last_taxon[0][:40]})", end="", flush=True)
 
+    return last_taxon, _progress
+
+
+def _do_rest_crawl() -> int:
+    """REST 递归全量抓取（BFS）。返回写入条数。"""
+    print("Crawling WoRMS via REST API (AphiaChildrenByAphiaID, recursive)…")
+    print("  Rate limit: ~3 req/s, expect 30-60 minutes for the full tree.")
+    print("  Resume state: ~/.specimen_inventory/worms_crawl_state.json")
+    _, _progress = _progress_fn()
     from specimen_app.app_settings import app_config_dir
     state_path = app_config_dir() / "worms_crawl_state.json"
     count = crawl_full_rest(
+        progress_cb=_progress,
+        resume_state_path=state_path,
+    )
+    print(f"\n  Wrote {count:,} new records this session.")
+    return count
+
+
+def _do_date_crawl() -> int:
+    """平铺日期分页抓取（AphiaRecordsByDate）。每次 API call 稳定 50 条，比 BFS 快 ~7×。"""
+    print("Crawling WoRMS via AphiaRecordsByDate (flat pagination, faster)…")
+    print("  Rate limit: ~3 req/s, expect 50-70 minutes for all records.")
+    print("  Resume state: ~/.specimen_inventory/worms_crawl_state_date.json")
+    _, _progress = _progress_fn()
+    from specimen_app.app_settings import app_config_dir
+    state_path = app_config_dir() / "worms_crawl_state_date.json"
+    count = crawl_by_date(
         progress_cb=_progress,
         resume_state_path=state_path,
     )
@@ -113,7 +135,12 @@ def main() -> None:
     parser.add_argument(
         "--rest",
         action="store_true",
-        help="Crawl full WoRMS via public REST API (Option A, replaces --download)",
+        help="Crawl full WoRMS via public REST API BFS (Option A, replaces --download)",
+    )
+    parser.add_argument(
+        "--date",
+        action="store_true",
+        help="Faster: flat AphiaRecordsByDate pagination (~7× faster than --rest BFS)",
     )
     parser.add_argument(
         "--export",
@@ -143,14 +170,23 @@ def main() -> None:
         args.rest = True
 
     # 必须选一个数据来源
-    if not args.zip_path and not args.rest and not args.export:
+    if not args.zip_path and not args.rest and not args.date and not args.export:
         parser.print_help()
         sys.exit(1)
 
     output = Path(args.output or _output_name())
 
     # --- acquire data ---
-    if args.rest:
+    if args.date:
+        try:
+            _do_date_crawl()
+        except KeyboardInterrupt:
+            print("\nInterrupted. Resume state saved; rerun with --date to continue.", file=sys.stderr)
+            sys.exit(2)
+        except Exception as exc:
+            print(f"\nDate crawl failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+    elif args.rest:
         try:
             _do_rest_crawl()
         except KeyboardInterrupt:

@@ -28,7 +28,7 @@ class AggregateSourcesTests(unittest.TestCase):
         d.mkdir()
         s = ExcelStore(d)
         v = s.create_specimen()
-        s.set_fields("specimen", v, {"管内编号*": f"{tube}-001", "采集地点缩写*": "QD"})
+        s.set_fields("specimen", v, {"管内编号*": f"{tube}-001", "采集地缩写*": "QD"})
         return d
 
     def test_empty_source_list(self) -> None:
@@ -46,7 +46,7 @@ class AggregateSourcesTests(unittest.TestCase):
         v1 = s.create_specimen()  # YZZ000001
         v2 = s.create_specimen()  # YZZ000002
         s.delete_specimen(v1)
-        s.set_fields("specimen", v2, {"管内编号*": "S-001", "采集地点缩写*": "QD"})
+        s.set_fields("specimen", v2, {"管内编号*": "S-001", "采集地缩写*": "QD"})
 
         store = ExcelStore(self.central)
         report = aggregate_sources(store, [ydy, yss])

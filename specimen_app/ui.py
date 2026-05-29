@@ -97,6 +97,7 @@ from .image_search import (
 )
 from .accession_series import AccessionSeries, BUILTIN_PRESETS, format_series_number
 from .batch_export import BatchExportDialog  # 批量导出功能
+from .store_worker import StoreWorkerThread  # Tier A: 后台 store 写操作
 from .startup_diag import mark as _startup_mark
 from .models import (
     CARRY_OVER_SPECIMEN_FIELDS,
@@ -217,7 +218,7 @@ def classification_column_value_from_taxonomy_match(
     return ""
 
 
-PHOTO_FILENAME_FILL_FIELDS = ("管内编号*", "采集地点缩写*", "采集日期", "保存方式")
+PHOTO_FILENAME_FILL_FIELDS = ("管内编号*", "采集地缩写*", "采集日期", "保存方式")
 
 
 def photo_filename_source_for_specimen_fill(photo_row: dict[str, Any]) -> str:
@@ -1158,6 +1159,12 @@ class SpecimenWindow(QMainWindow):
             self.store = None
             self.matcher = None
             self._lock_heartbeat_thread: LockHeartbeatThread | None = None  # plan B1: 无 store 时无心跳
+            # Tier A: 无 store 时也建 worker（但不会被用到）
+            self._store_worker = StoreWorkerThread(parent=self)
+            self._store_worker.operation_done.connect(self._on_store_op_done)
+            self._store_worker.operation_error.connect(self._on_store_op_error)
+            self._store_worker.busy_changed.connect(self._on_store_worker_busy)
+            self._store_worker.start()
         else:
             self.workspace_root, create_workspace_files = prepared
             # 只读副本不抢已存在的主窗口焦点(允许同工作区多只读副本共存)
@@ -1200,6 +1207,12 @@ class SpecimenWindow(QMainWindow):
             if not self.read_only and self.store is not None:
                 self._lock_heartbeat_thread = LockHeartbeatThread(self.store, interval_seconds=60.0, parent=self)
                 self._lock_heartbeat_thread.start()
+            # Tier A: 后台 store 写线程（create_specimen / undo_last / redo_last）
+            self._store_worker = StoreWorkerThread(parent=self)
+            self._store_worker.operation_done.connect(self._on_store_op_done)
+            self._store_worker.operation_error.connect(self._on_store_op_error)
+            self._store_worker.busy_changed.connect(self._on_store_worker_busy)
+            self._store_worker.start()
             # plan C1: 启动恢复对话框由 UI 层负责（不在 ExcelStore.__init__ 内弹，保 headless 可用）
             if not self.read_only and self.store is not None and self.store.pending_transaction_records:
                 self._prompt_for_pending_transactions()
@@ -1675,6 +1688,11 @@ class SpecimenWindow(QMainWindow):
         _stop_worker(getattr(self, "_startup_update_worker", None), wait_ms=2000, label="update_check")
         # Stop photo import thread if one is running
         _stop_worker(getattr(self, "_import_thread", None), wait_ms=2000, label="photo_import")
+        # Tier A: 停后台 store 写线程（等待当前操作完成，最多 5s）
+        sw = getattr(self, "_store_worker", None)
+        if sw is not None and sw.isRunning():
+            sw.request_stop()
+            sw.wait(5000)
         # C1: 接管所有注册到 WindowManager 的 dialog 的 worker（如 DbManagerDialog 的 worms worker）
         if self.manager is not None:
             try:
@@ -2371,6 +2389,7 @@ class SpecimenWindow(QMainWindow):
             number_menu, "撤销批量预领…", self._open_cancel_batch_reservation, "cancel_batch_reservation"
         )
         _add(number_menu, "管理员按范围删除编号…", self._open_admin_delete_range, "admin_delete_range")
+        _add(number_menu, "管理员补录断号段…", self._open_admin_backfill_vouchers, "admin_backfill_vouchers")
         number_menu.addSeparator()
         _add(number_menu, "编号操作记录…", self._open_voucher_audit_log, "voucher_audit_log")
 
@@ -3209,6 +3228,9 @@ class SpecimenWindow(QMainWindow):
             }
         if self._active_task:
             carry["信息录入人员"] = self._active_task.get("人员", "")
+        # 旧：无 carry 时 保存方式 为空。新：默认 95E，有 carry 值时保留原值。
+        if not carry.get("保存方式", "").strip():
+            carry["保存方式"] = "95E"
         try:
             if dlg.mode == "range":
                 from specimen_app.parsing import parse_voucher_serial, format_voucher
@@ -3268,6 +3290,77 @@ class SpecimenWindow(QMainWindow):
         dlg.destroyed.connect(lambda: setattr(self, "_admin_delete_dialog", None))
         dlg.show()
         self._admin_delete_dialog = dlg
+
+    def _open_admin_backfill_vouchers(self) -> None:
+        """管理员补录断号段：指定起止编号，补录缺失编号，跳过已存在编号，无需开启录入任务。"""
+        if self.store is None:
+            return
+        if not _check_admin_password_with_session(self):
+            return
+        from .parsing import format_voucher
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("管理员补录断号段")
+        layout = QFormLayout(dlg)
+        start_edit = QLineEdit()
+        start_edit.setPlaceholderText("例：YZZ000071")
+        end_edit = QLineEdit()
+        end_edit.setPlaceholderText("例：YZZ000081")
+        layout.addRow("起始编号", start_edit)
+        layout.addRow("结束编号", end_edit)
+        info_label = QLabel("")
+        layout.addRow(info_label)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setEnabled(False)
+        layout.addRow(btns)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+
+        def _validate() -> None:
+            s = start_edit.text().strip()
+            e = end_edit.text().strip()
+            s_serial = parse_voucher_serial(s)
+            e_serial = parse_voucher_serial(e)
+            ok_btn = btns.button(QDialogButtonBox.Ok)
+            if not s_serial or not e_serial or s_serial > e_serial:
+                info_label.setText("")
+                ok_btn.setEnabled(False)
+                return
+            n = e_serial - s_serial + 1
+            if n > 500:
+                info_label.setText(f"范围过大（{n} 个），最多 500 个")
+                ok_btn.setEnabled(False)
+                return
+            info_label.setText(f"将补录 {s} … {e}（最多 {n} 个，已存在自动跳过）")
+            ok_btn.setEnabled(True)
+
+        start_edit.textChanged.connect(_validate)
+        end_edit.textChanged.connect(_validate)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        s_serial = parse_voucher_serial(start_edit.text().strip())
+        e_serial = parse_voucher_serial(end_edit.text().strip())
+        if not s_serial or not e_serial:
+            return
+        voucher_list = [format_voucher(i) for i in range(s_serial, e_serial + 1)]
+        try:
+            self._flush_pending_saves()
+            created = self.store.create_specimens_batch_range(voucher_list)
+        except Exception as exc:
+            QMessageBox.critical(self, "补录失败", str(exc))
+            return
+        skipped = len(voucher_list) - len(created)
+        msg = f"已补录 {len(created)} 个编号"
+        if created:
+            msg += f"：{created[0]} … {created[-1]}"
+        if skipped:
+            msg += f"（跳过已存在 {skipped} 个）"
+        self.refresh_list()
+        if created:
+            self.select_voucher(created[0])
+        self.statusBar().showMessage(msg, 5000)
+        QMessageBox.information(self, "补录完成", msg)
 
     def _on_reset_or_admin_delete_done(self, result: int) -> None:
         """截断重置 / 管理员删除完成后刷新主列表。"""
@@ -4054,7 +4147,7 @@ class SpecimenWindow(QMainWindow):
                     specimen = self.store.get_specimen(voucher) or {}
                     self._loading = True
                     try:
-                        for auto_field in ("采集日期", "采集地点缩写*", "保存方式"):
+                        for auto_field in ("采集日期", "采集地缩写*", "保存方式"):
                             widget = self.specimen_widgets[auto_field]
                             widget.blockSignals(True)
                             value = str(specimen.get(auto_field, ""))
@@ -4106,8 +4199,8 @@ class SpecimenWindow(QMainWindow):
                 if changed:
                     specimen = self.store.get_specimen(voucher) or {}
                     self._loading = True
-                    # 原代码只刷新"采集日期"和"采集地点缩写*"；现在管内编号也会派生"保存方式"。
-                    for auto_field in ("采集日期", "采集地点缩写*", "保存方式"):
+                    # 原代码只刷新"采集日期"和"采集地缩写*"；现在管内编号也会派生"保存方式"。
+                    for auto_field in ("采集日期", "采集地缩写*", "保存方式"):
                         w = self.specimen_widgets[auto_field]
                         w.blockSignals(True)
                         value = str(specimen.get(auto_field, ""))
@@ -4193,47 +4286,49 @@ class SpecimenWindow(QMainWindow):
         # 现在：新增入库编号时把上一条的标本信息字段（CARRY_OVER_SPECIMEN_FIELDS）
         # 带入新记录，减少重复录入。沿用是本工作模式的固定规则。
         # 需先「开始录入任务」才能新增编号（门控）。
+        # Tier A：create_specimen 走后台 StoreWorkerThread，主线程立即返回。
         if not self._active_task:
             return
-        try:
-            initial: dict[str, str] = {}
-            # 旧逻辑：仅当工具栏「沿用上条信息」开关勾选时才沿用。
-            # 现在：开关已移除，沿用是固定模式规则，只要存在当前标本就沿用。
-            if self.current_voucher:
-                prev = self.store.get_specimen(self.current_voucher) or {}
-                for field in CARRY_OVER_SPECIMEN_FIELDS:
-                    val = str(prev.get(field, "")).strip()
-                    if val:
-                        initial[field] = val
-            # plan v0.10.6 S3：任务激活时把"信息录入人员"自动填为当前任务人员。
-            # CARRY_OVER_SPECIMEN_FIELDS 已含"信息录入人员"（沿用上条），任务激活时优先用任务人员覆盖。
-            if self._active_task is not None:
-                task_recorder_name = self._active_task.get("人员", "")
-                if task_recorder_name:
-                    initial["信息录入人员"] = task_recorder_name
-            # 完全自定义系列(前缀留空)→ 手动输入编号,不走自增;否则按系列规则自动生成。
-            if self._active_series_is_custom():
-                text, ok = QInputDialog.getText(
-                    self, "新增入库编号",
-                    "当前为完全自定义系列，请输入入库编号：",
-                )
-                if not ok:
-                    return
-                text = text.strip()
-                if not text:
-                    QMessageBox.information(self, "新增入库编号", "入库编号不能为空。")
-                    return
-                voucher = self.store.create_specimen_with_voucher(text, initial_fields=initial or None)
-            else:
-                voucher = self.store.create_specimen(initial_fields=initial or None)
-            if self._active_task:
-                self._active_task["本任务编号"].add(voucher)
-            # 旧：调 self.refresh_list() 全量重读 3 表 + 重建 5 个大字典，5000 行 100-500ms。
-            # 新：patch_voucher_row 仅维护新 voucher 项，再 _apply_voucher_filter 重渲染当前页（~5-20ms）。
-            self.patch_voucher_row(voucher, "added")
-            self.select_voucher(voucher)
-        except Exception as exc:
-            QMessageBox.critical(self, "新增失败", str(exc))
+        initial: dict[str, str] = {}
+        # 旧逻辑：仅当工具栏「沿用上条信息」开关勾选时才沿用。
+        # 现在：开关已移除，沿用是固定模式规则，只要存在当前标本就沿用。
+        if self.current_voucher:
+            prev = self.store.get_specimen(self.current_voucher) or {}
+            for field in CARRY_OVER_SPECIMEN_FIELDS:
+                val = str(prev.get(field, "")).strip()
+                if val:
+                    initial[field] = val
+        # 旧：无 carry 时 保存方式 为空。新：默认 95E，有 carry 值时保留原值。
+        if not initial.get("保存方式", "").strip():
+            initial["保存方式"] = "95E"
+        # plan v0.10.6 S3：任务激活时把"信息录入人员"自动填为当前任务人员。
+        if self._active_task is not None:
+            task_recorder_name = self._active_task.get("人员", "")
+            if task_recorder_name:
+                initial["信息录入人员"] = task_recorder_name
+        # 完全自定义系列(前缀留空)→ 手动输入编号,不走自增;否则按系列规则自动生成。
+        if self._active_series_is_custom():
+            text, ok = QInputDialog.getText(
+                self, "新增入库编号",
+                "当前为完全自定义系列，请输入入库编号：",
+            )
+            if not ok:
+                return
+            text = text.strip()
+            if not text:
+                QMessageBox.information(self, "新增入库编号", "入库编号不能为空。")
+                return
+            self._flush_pending_saves()
+            self._store_worker.enqueue(
+                "create_specimen_custom", self.store.create_specimen_with_voucher,
+                text, initial_fields=initial or None,
+            )
+        else:
+            self._flush_pending_saves()
+            self._store_worker.enqueue(
+                "create_specimen", self.store.create_specimen,
+                initial_fields=initial or None,
+            )
 
     def clear_photos(self) -> None:
         if not self.current_voucher:
@@ -4923,45 +5018,88 @@ class SpecimenWindow(QMainWindow):
         self.statusBar().showMessage(f"已取消 {written} 个占位编号（编号可复用）", 5000)
 
     def undo(self) -> None:
+        # Tier A：undo_last 走后台 StoreWorkerThread，避免 O(n) xlsx 重写阻塞主线程。
         if self.store is None:
             return
-        result = self.store.undo_last()
-        if result:
-            self.statusBar().showMessage(f"已撤回：{result['action_type']}", 3000)
-            # 撤回新增编号时同步清理任务计数
-            if self._active_task:
-                for v in result.get("vouchers", []):
-                    self._active_task["本任务编号"].discard(v)
-            self.reload_current()
-        else:
-            self.statusBar().showMessage("没有可撤回的操作", 2000)
+        self._flush_pending_saves()
+        self._store_worker.enqueue("undo_last", self.store.undo_last)
 
     def redo(self) -> None:
+        # Tier A：redo_last 走后台 StoreWorkerThread。
         if self.store is None:
             return
-        result = self.store.redo_last()
-        if result:
-            self.statusBar().showMessage(f"已重做：{result['action_type']}", 3000)
-            # 重做新增编号时同步补回任务计数
-            if self._active_task and result["action_type"] in ("create_specimen", "create_specimen_manual", "create_specimens_batch"):
-                for v in result.get("vouchers", []):
-                    self._active_task["本任务编号"].add(v)
-            self.reload_current()
+        self._flush_pending_saves()
+        self._store_worker.enqueue("redo_last", self.store.redo_last)
+
+    # ------------------------------------------------------------------
+    # Tier A: StoreWorkerThread 信号处理
+    # ------------------------------------------------------------------
+
+    def _on_store_worker_busy(self, busy: bool) -> None:
+        """后台 store 写线程忙/闲切换：更新状态栏 + 控制按钮可用性。"""
+        if busy:
+            self.statusBar().showMessage("正在写入...", 0)
         else:
-            self.statusBar().showMessage("没有可重做的操作", 2000)
+            # 空闲时清除"写入中"提示（3s 后自动清空）
+            self.statusBar().showMessage("", 100)
+
+    def _on_store_op_done(self, op_id: str, result: object, elapsed_ms: float) -> None:
+        """后台操作完成：根据操作类型更新 UI。"""
+        if op_id in ("create_specimen", "create_specimen_custom"):
+            voucher = result  # type: ignore[assignment]
+            if self._active_task:
+                self._active_task["本任务编号"].add(voucher)
+            # 旧：调 self.refresh_list() 全量重读 3 表 + 重建 5 个大字典，5000 行 100-500ms。
+            # 新：patch_voucher_row 仅维护新 voucher 项，再 _apply_voucher_filter 重渲染当前页（~5-20ms）。
+            self.patch_voucher_row(voucher, "added")
+            self.select_voucher(voucher)
+            self.statusBar().showMessage(f"已新增 {voucher}（{elapsed_ms:.0f}ms）", 3000)
+        elif op_id == "undo_last":
+            result_dict = result  # type: ignore[assignment]
+            if result_dict:
+                self.statusBar().showMessage(
+                    f"已撤回：{result_dict['action_type']}（{elapsed_ms:.0f}ms）", 3000
+                )
+                if self._active_task:
+                    for v in result_dict.get("vouchers", []):
+                        self._active_task["本任务编号"].discard(v)
+                self.reload_current()
+            else:
+                self.statusBar().showMessage("没有可撤回的操作", 2000)
+        elif op_id == "redo_last":
+            result_dict = result  # type: ignore[assignment]
+            if result_dict:
+                self.statusBar().showMessage(
+                    f"已重做：{result_dict['action_type']}（{elapsed_ms:.0f}ms）", 3000
+                )
+                if self._active_task and result_dict["action_type"] in (
+                    "create_specimen", "create_specimen_manual", "create_specimens_batch"
+                ):
+                    for v in result_dict.get("vouchers", []):
+                        self._active_task["本任务编号"].add(v)
+                self.reload_current()
+            else:
+                self.statusBar().showMessage("没有可重做的操作", 2000)
+
+    def _on_store_op_error(self, op_id: str, error_msg: str) -> None:
+        """后台操作失败：弹错误提示。"""
+        op_label = {
+            "create_specimen": "新增入库编号",
+            "create_specimen_custom": "新增入库编号",
+            "undo_last": "撤回",
+            "redo_last": "重做",
+        }.get(op_id, op_id)
+        QMessageBox.critical(self, f"{op_label}失败", error_msg)
+        self.reload_current()
 
     def _undo_redo_counts(self) -> tuple[int, int]:
         """Return (undo_count, redo_count) for display."""
-        rows = self.store._read_plain_rows(self.store.data_dir / "操作记录.xlsx")
-        if not rows:
+        # Tier B：从 SQLite 计数，O(1) 无论行数多少。
+        try:
+            voided = self.store.list_voided_vouchers()
+            return self.store._action_log_db.count_active_and_undone(voided)
+        except Exception:
             return 0, 0
-        undone = sum(1 for r in rows if self.store._value(r, "是否撤销") == "是")
-        # Find last non-undone index
-        depth = int(self.store.config.get("undo_depth", 200))
-        candidates = [r for r in rows[-depth:] if self.store._value(r, "是否撤销") != "是"]
-        undo_count = len(candidates)
-        redo_count = undone
-        return undo_count, redo_count
 
     def reload_current(self) -> None:
         vouchers = self.store.list_vouchers()

@@ -73,8 +73,8 @@ class UpgradeTests(unittest.TestCase):
         store = ExcelStore(self.tmp)
         v1 = store.create_specimen()
         v2 = store.create_specimen()
-        store.set_fields("specimen", v1, {"管内编号*": "T1", "采集地点缩写*": "QD"})
-        store.set_fields("specimen", v2, {"管内编号*": "T2", "采集地点缩写*": "QD"})
+        store.set_fields("specimen", v1, {"管内编号*": "T1", "采集地缩写*": "QD"})
+        store.set_fields("specimen", v2, {"管内编号*": "T2", "采集地缩写*": "QD"})
         before_count = len(store.list_vouchers())
         before_v1 = store.get_specimen(v1)
 

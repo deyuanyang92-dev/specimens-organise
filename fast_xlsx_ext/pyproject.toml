@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "fast-xlsx-ext"
+version = "0.1.0"
+description = "Fast xlsx read/write for specimen_app"
+requires-python = ">=3.9"
+
+[tool.maturin]
+module-name = "specimen_app._fast_xlsx"
+features = ["pyo3/extension-module"]

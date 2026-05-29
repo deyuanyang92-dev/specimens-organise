@@ -49,6 +49,7 @@ def _ensure_openpyxl() -> None:
     load_workbook = _lwb
 
 from . import __version__
+from .action_log_db import ActionLogDatabase  # Tier B: SQLite 操作日志
 from .models import (
     ACTION_LOG_FILE,
     ACTION_LOG_HEADERS,
@@ -193,6 +194,9 @@ class ExcelStore:
         # settings 不可用 fallback 到 8 (老默认)。
         self._row_cache: OrderedDict[str, list[Row]] = OrderedDict()
         self._file_mtimes: dict[str, float] = {}
+        # Tier A 后台写线程保护：RLock（可重入）确保主线程读和后台线程写不发生 race。
+        # 同一线程内的嵌套调用（如 _append_row_incremental 回退时调 read_rows）仍可安全获取。
+        self._rw_lock = threading.RLock()
         # S3.1: voucher -> sparse row index 缓存。读 specimen/classification 表时同步建立；
         # _invalidate_cache 删除对应类目。_find_one 由 O(n) 线性扫降到 O(1) 字典查。
         self._voucher_index: dict[str, dict[str, int]] = {}
@@ -271,6 +275,12 @@ class ExcelStore:
 
         `__init__` 已注册 atexit 钩子，但显式调用更可靠。
         """
+        adb = getattr(self, "_action_log_db", None)
+        if adb is not None:
+            try:
+                adb.close()
+            except Exception:
+                pass
         self.release_lock()
 
     def _install_readonly_guards(self) -> None:
@@ -524,6 +534,9 @@ class ExcelStore:
         self._ensure_workbook(self.data_dir / ACTION_LOG_FILE, ACTION_LOG_HEADERS)
         self._ensure_workbook(self.data_dir / DATA_VERSION_LOG_FILE, DATA_VERSION_LOG_HEADERS)
         self._ensure_alloc_log()
+        # Tier B: SQLite 操作日志初始化（替代 xlsx 全量重写路径）
+        self._action_log_db = ActionLogDatabase(self.data_dir)
+        self._ensure_action_log_db()
 
     def _has_workspace_seed_files(self) -> bool:
         return any(
@@ -1168,7 +1181,7 @@ class ExcelStore:
             updates: ``{字段名: 新值}``；不在该表表头里的键会被忽略。
             action_type: 写入操作日志的类型标签（用于撤销/重做）。
             auto_derive_specimen_fields: 为 True 且更新了 ``管内编号*`` 时，
-                自动联动推导 ``采集日期`` / ``采集地点缩写*`` / ``保存方式``。
+                自动联动推导 ``采集日期`` / ``采集地缩写*`` / ``保存方式``。
 
         Returns:
             是否有字段真正发生变化（无变化返回 False，不写日志）。
@@ -1197,7 +1210,7 @@ class ExcelStore:
         rows[index].update(changed)
         if auto_derive_specimen_fields and category == "specimen" and "管内编号*" in changed:
             tube = rows[index].get("管内编号*", "")
-            # 原代码只自动派生“采集日期”和“采集地点缩写*”；旧版本还支持保存方式。
+            # 原代码只自动派生”采集日期”和”采集地缩写*”；旧版本还支持保存方式。
             # 现在统一走管内编号派生函数，恢复保存方式，同时保留原字段兼容。
             auto_updates = derive_specimen_fields_from_tube_number(tube)
             for field, value in auto_updates.items():
@@ -2522,77 +2535,78 @@ class ExcelStore:
         self._sync_next_serial()
 
     def undo_last(self) -> dict | None:
-        # 规范化软件设计 2026-05 P1 审查修复:_apply_action 失败时不能把 action 标"已撤销",
-        # 否则下次 undo 跳过它造成"幽灵 action"。包 try/except,异常时清晰传播给上层,
-        # 不修改 action 状态。Excel 文件多步写入仍无真事务(已知限制),日后专项重构。
-        rows = self._read_plain_rows(self.data_dir / ACTION_LOG_FILE)
+        # 规范化软件设计 2026-05 P1 审查修复:_apply_action 失败时不能把 action 标"已撤销"。
+        # Tier B 新：SQLite SELECT+UPDATE 替代 O(n) xlsx 全量重写，无论行数多少 ~2ms。
         depth = int(self.config.get("undo_depth", 200))
         voided = self.list_voided_vouchers()
-        # 旧：注销本身不写 action-log 后，历史 create/update action 仍可能被 undo 反向复活。
-        # 新：已注销编号的历史 action 一律跳过，保证「注销不可撤回」语义。
-        candidates = [
-            row for row in rows[-depth:]
-            if self._value(row, "是否撤销") != "是"
-            and self._value(row, "入库编号") not in voided
-        ]
-        if not candidates:
+        action = self._action_log_db.get_last_active(depth, voided)
+        if action is None:
             return None
-        action = candidates[-1]
+        # 把 SQLite row dict 转为 _apply_action 期望的格式（字段名与 xlsx 头一致）
+        action_row: Row = {
+            "操作ID":   action.get("op_id", ""),
+            "时间":     action.get("ts", ""),
+            "操作类型": action.get("op_type", ""),
+            "入库编号": action.get("voucher", ""),
+            "信息类别": action.get("category", ""),
+            "字段名":   action.get("field", ""),
+            "旧值JSON": action.get("old_json", "null"),
+            "新值JSON": action.get("new_json", "null"),
+            "是否撤销": "是" if action.get("is_undone") else "",
+        }
         try:
-            self._apply_action(action, undo=True)
+            self._apply_action(action_row, undo=True)
         except Exception:
-            # apply 失败 → 不标记 + 重抛,让上层弹错误对话框。
-            # 注意:数据可能部分被 undo(_apply_action 内多个写入步骤)。
             raise
-        action["是否撤销"] = "是"
-        self._write_plain_rows(self.data_dir / ACTION_LOG_FILE, ACTION_LOG_HEADERS, rows)
-        # 旧：仅返回 action_type 字符串；新：返回 dict 含 vouchers 列表，供 UI 同步 _active_task。
-        action_type = self._value(action, "操作类型")
-        new_val = self._json(action.get("新值JSON"))
+        self._action_log_db.mark_undone(action["id"])
+        action_type = action_row.get("操作类型", "")
+        # 旧：撤回新增编号后 next_serial / next_counter 不回滚 → 再新增时跳号。
+        # 新：新增撤回后立即重算，下次新增从实际最大编号+1 续接，不跳号。
+        if action_type in ("create_specimen", "create_specimen_manual", "create_specimens_batch"):
+            self._sync_next_serial()
+            self._sync_all_series_counters()
+        new_val = self._json(action_row.get("新值JSON"))
         if action_type == "create_specimens_batch":
             vouchers = list(new_val.get("vouchers") or []) if isinstance(new_val, dict) else []
         else:
-            v = self._value(action, "入库编号")
+            v = action_row.get("入库编号", "")
             vouchers = [v] if v else []
-        return {"action_type": action_type, "voucher": self._value(action, "入库编号"), "vouchers": vouchers}
+        return {"action_type": action_type, "voucher": action_row.get("入库编号", ""), "vouchers": vouchers}
 
     def redo_last(self) -> dict | None:
-        # 同 undo_last 的 try/except 保护。
-        rows = self._read_plain_rows(self.data_dir / ACTION_LOG_FILE)
+        # Tier B 新：SQLite SELECT+UPDATE 替代 O(n) xlsx 全量重写。
         voided = self.list_voided_vouchers()
-        if not any(
-            self._value(row, "是否撤销") == "是"
-            and self._value(row, "入库编号") not in voided
-            for row in rows
-        ):
+        action = self._action_log_db.get_next_redoable(voided)
+        if action is None:
             return None
-        start = len(rows) - 1
-        while start >= 0 and (
-            self._value(rows[start], "是否撤销") == "是"
-            or self._value(rows[start], "入库编号") in voided
-        ):
-            start -= 1
-        action_index = start + 1
-        while action_index < len(rows) and self._value(rows[action_index], "入库编号") in voided:
-            action_index += 1
-        if action_index >= len(rows):
-            return None
-        action = rows[action_index]
+        action_row: Row = {
+            "操作ID":   action.get("op_id", ""),
+            "时间":     action.get("ts", ""),
+            "操作类型": action.get("op_type", ""),
+            "入库编号": action.get("voucher", ""),
+            "信息类别": action.get("category", ""),
+            "字段名":   action.get("field", ""),
+            "旧值JSON": action.get("old_json", "null"),
+            "新值JSON": action.get("new_json", "null"),
+            "是否撤销": "是" if action.get("is_undone") else "",
+        }
         try:
-            self._apply_action(action, undo=False)
+            self._apply_action(action_row, undo=False)
         except Exception:
             raise
-        action["是否撤销"] = ""
-        self._write_plain_rows(self.data_dir / ACTION_LOG_FILE, ACTION_LOG_HEADERS, rows)
-        # 旧：仅返回 action_type 字符串；新：返回 dict 含 vouchers 列表，供 UI 同步 _active_task。
-        action_type = self._value(action, "操作类型")
-        new_val = self._json(action.get("新值JSON"))
+        self._action_log_db.mark_redone(action["id"])
+        action_type = action_row.get("操作类型", "")
+        # redo 恢复编号后同步 serial，确保再次撤回后能正确归位。
+        if action_type in ("create_specimen", "create_specimen_manual", "create_specimens_batch"):
+            self._sync_next_serial()
+            self._sync_all_series_counters()
+        new_val = self._json(action_row.get("新值JSON"))
         if action_type == "create_specimens_batch":
             vouchers = list(new_val.get("vouchers") or []) if isinstance(new_val, dict) else []
         else:
-            v = self._value(action, "入库编号")
+            v = action_row.get("入库编号", "")
             vouchers = [v] if v else []
-        return {"action_type": action_type, "voucher": self._value(action, "入库编号"), "vouchers": vouchers}
+        return {"action_type": action_type, "voucher": action_row.get("入库编号", ""), "vouchers": vouchers}
 
     def set_undo_depth(self, depth: int) -> None:
         self.config["undo_depth"] = max(1, min(int(depth), 1000))
@@ -2990,14 +3004,15 @@ class ExcelStore:
         本方法出口处按 CATEGORY_HEADERS 把每行补成 dense，保证下游 `row["字段"]`
         直接索引不会 KeyError（向后兼容 v0.5.0 及以前的 dense 契约）。
         """
-        file_key = CATEGORY_FILES[category]
-        headers = CATEGORY_HEADERS[category]
-        sparse_rows = self._cached_rows(
-            file_key,
-            lambda: self._read_plain_rows(self.data_dir / file_key, headers),
-        )
-        # _cached_rows 已 [row.copy()]，这里返回的 dense 是临时局部表，调用方用完即回收。
-        return [{h: row.get(h, "") for h in headers} for row in sparse_rows]
+        with self._rw_lock:
+            file_key = CATEGORY_FILES[category]
+            headers = CATEGORY_HEADERS[category]
+            sparse_rows = self._cached_rows(
+                file_key,
+                lambda: self._read_plain_rows(self.data_dir / file_key, headers),
+            )
+            # _cached_rows 已 [row.copy()]，这里返回的 dense 是临时局部表，调用方用完即回收。
+            return [{h: row.get(h, "") for h in headers} for row in sparse_rows]
 
     def record_fingerprint(
         self,
@@ -3117,9 +3132,27 @@ class ExcelStore:
         current = str(self.config.get("data_schema_version", "1.0.0"))
         if _version_tuple(current) < _version_tuple("1.1.1"):
             self._migrate_hash_prefixed_photos()
+        if _version_tuple(current) < _version_tuple("1.1.3"):
+            self._migrate_rename_locality_column()
         if _version_tuple(current) < _version_tuple(CURRENT_DATA_SCHEMA_VERSION):
             self.config["data_schema_version"] = CURRENT_DATA_SCHEMA_VERSION
             self._save_config()
+
+    def _migrate_rename_locality_column(self) -> None:
+        """v1.1.2 → v1.1.3: 重命名标本信息列 '采集地点缩写*' → '采集地缩写*'。"""
+        path = self.data_dir / SPECIMEN_FILE
+        if not path.exists():
+            return
+        old_name, new_name = "采集地点缩写*", "采集地缩写*"
+        existing = self._headers(path)
+        if old_name not in existing or new_name in existing:
+            return
+        rows = self._read_plain_rows(path)
+        for row in rows:
+            if old_name in row:
+                row[new_name] = row.pop(old_name)
+        new_headers = [new_name if h == old_name else h for h in existing]
+        self._write_plain_rows(path, new_headers, rows)
 
     def _migrate_hash_prefixed_photos(self) -> None:
         rows = self.read_rows("photo")
@@ -3225,6 +3258,26 @@ class ExcelStore:
     def _ensure_alloc_log(self) -> None:
         # plan A2: 只读契约由 _ensure_workbook 守门，这里无需重复判断。
         self._ensure_workbook(self.data_dir / ALLOC_LOG_FILE, ALLOC_LOG_HEADERS)
+
+    def _ensure_action_log_db(self) -> None:
+        """Tier B：首次打开时把 操作记录.xlsx 迁移到 操作记录.sqlite，此后 xlsx 保留为备份。
+
+        旧：全部 undo/redo/record 操作走 xlsx O(n) 重写（行数多时 200-500ms）。
+        新：SQLite WAL INSERT/UPDATE/SELECT O(1)（约 1-2ms）。
+        迁移策略：
+        - 若 sqlite 已存在：直接使用，跳过迁移（幂等）。
+        - 若 xlsx 存在但 sqlite 不存在：读 xlsx 行 → 批量 INSERT → sqlite 就绪。
+        - xlsx 不改动（保留为人工可查的备份）。
+        """
+        if self._action_log_db.exists():
+            return  # 已迁移或已初始化，直接用
+        xlsx_path = self.data_dir / ACTION_LOG_FILE
+        if xlsx_path.exists():
+            try:
+                rows = self._read_plain_rows(xlsx_path, ACTION_LOG_HEADERS)
+                self._action_log_db.migrate_from_rows(rows)
+            except Exception:
+                pass  # 迁移失败不阻断启动；_record_action 会从头建 sqlite
 
     def _verify_workbook_file_can_be_reopened(self, workbook_path: Path) -> None:
         """plan A5（v0.10.1 hotfix）：把 openpyxl 刚写完的 xlsx 当 ZIP 打开校验完整性。
@@ -3910,10 +3963,8 @@ class ExcelStore:
         # 批量新增模式下跳过单条记录；由 create_specimens_batch 统一写一条批量 action。
         if self._batch_mode:
             return
-        # 旧：_read_plain_rows + append + _write_plain_rows 全量重写（小表也要 50-80ms）。
-        # 新：openpyxl load_workbook + ws.append + 原子 replace，省全量序列化。
-        # 失败回退全量重写。
-        path = self.data_dir / ACTION_LOG_FILE
+        # 旧：openpyxl load_workbook + ws.append + save (~100ms/次)。
+        # Tier B 新：SQLite INSERT ~1ms，与操作记录行数无关。
         new_row = {
             "操作ID": str(uuid.uuid4()),
             "时间": self._now(),
@@ -3926,25 +3977,29 @@ class ExcelStore:
             "是否撤销": "",
         }
         try:
-            _ensure_openpyxl()
-            wb = load_workbook(path)
-            try:
-                ws = wb.active
-                ws.append([new_row.get(h, "") for h in ACTION_LOG_HEADERS])
-                tmp = path.with_suffix(f".{os.getpid()}.tmp")
-                wb.save(tmp)
-                self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
-                tmp.replace(path)
-            finally:
-                try:
-                    wb.close()
-                except Exception:
-                    pass
+            self._action_log_db.insert_action(new_row)
         except Exception:
-            # 降级：全量重写
-            rows = self._read_plain_rows(path, ACTION_LOG_HEADERS)
-            rows.append(new_row)
-            self._write_plain_rows(path, ACTION_LOG_HEADERS, rows)
+            # SQLite 失败降级：写 xlsx 保证数据不丢
+            path = self.data_dir / ACTION_LOG_FILE
+            try:
+                _ensure_openpyxl()
+                wb = load_workbook(path)
+                try:
+                    ws = wb.active
+                    ws.append([new_row.get(h, "") for h in ACTION_LOG_HEADERS])
+                    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+                    wb.save(tmp)
+                    self._verify_workbook_file_can_be_reopened(tmp)
+                    tmp.replace(path)
+                finally:
+                    try:
+                        wb.close()
+                    except Exception:
+                        pass
+            except Exception:
+                rows = self._read_plain_rows(path, ACTION_LOG_HEADERS)
+                rows.append(new_row)
+                self._write_plain_rows(path, ACTION_LOG_HEADERS, rows)
 
     def _apply_action(self, action: Row, undo: bool) -> None:
         action_type = self._value(action, "操作类型")
@@ -4144,6 +4199,7 @@ class ExcelStore:
         headers = CATEGORY_HEADERS[category]
         path = self.data_dir / file_key
         fitted = self._fit_headers(row, headers)
+        disk_ok = True
         try:
             _ensure_openpyxl()
             wb = load_workbook(path)
@@ -4160,38 +4216,43 @@ class ExcelStore:
                 except Exception:
                     pass
         except Exception:
+            disk_ok = False
+        if not disk_ok:
             # 失败回退：load/save 异常 → 全量重写兜底
             rows = self.read_rows(category)
             rows.append(fitted)
             self._write_rows(category, rows)
             return
-        # 缓存增量更新：保持 _row_cache + voucher_index/photo_voucher_index 与磁盘一致
-        if file_key in self._row_cache:
-            cached = self._row_cache[file_key]
-            # 缓存内是 sparse dict（_read_plain_rows 只保留非空字段）
-            sparse_new = {k: v for k, v in fitted.items() if v != ""}
-            cached.append(sparse_new)
-            new_idx = len(cached) - 1
-            voucher = fitted.get("入库编号*", "")
-            if voucher:
-                if file_key == PHOTO_FILE:
-                    self._photo_voucher_index.setdefault(voucher, []).append(new_idx)
-                elif file_key in (SPECIMEN_FILE, CLASSIFICATION_FILE):
-                    self._voucher_index.setdefault(file_key, {}).setdefault(voucher, new_idx)
-            try:
-                self._file_mtimes[file_key] = path.stat().st_mtime
-            except OSError:
-                self._file_mtimes[file_key] = 0.0
+        # 缓存增量更新（RLock 仅保护内存 dict 操作，不持锁等待磁盘 I/O）
+        # 旧：无锁，后台线程写缓存与主线程读缓存存在 race。新：_rw_lock 保护。
+        with self._rw_lock:
+            if file_key in self._row_cache:
+                cached = self._row_cache[file_key]
+                # 缓存内是 sparse dict（_read_plain_rows 只保留非空字段）
+                sparse_new = {k: v for k, v in fitted.items() if v != ""}
+                cached.append(sparse_new)
+                new_idx = len(cached) - 1
+                voucher = fitted.get("入库编号*", "")
+                if voucher:
+                    if file_key == PHOTO_FILE:
+                        self._photo_voucher_index.setdefault(voucher, []).append(new_idx)
+                    elif file_key in (SPECIMEN_FILE, CLASSIFICATION_FILE):
+                        self._voucher_index.setdefault(file_key, {}).setdefault(voucher, new_idx)
+                try:
+                    self._file_mtimes[file_key] = path.stat().st_mtime
+                except OSError:
+                    self._file_mtimes[file_key] = 0.0
         # plan D2: _append_row_incremental 绕过 _write_rows，必须自己触发汇总缓存失效
         if category in ("specimen", "classification", "photo"):
             self._mark_inventory_summary_cache_invalid()
 
     def _write_rows(self, category: str, rows: list[Row]) -> None:
-        self._write_plain_rows(self.data_dir / CATEGORY_FILES[category], CATEGORY_HEADERS[category], rows)
-        self._invalidate_cache(CATEGORY_FILES[category])
-        # plan D2: 主表三类（specimen / classification / photo）任一写入都让汇总缓存失效
-        if category in ("specimen", "classification", "photo"):
-            self._mark_inventory_summary_cache_invalid()
+        with self._rw_lock:
+            self._write_plain_rows(self.data_dir / CATEGORY_FILES[category], CATEGORY_HEADERS[category], rows)
+            self._invalidate_cache(CATEGORY_FILES[category])
+            # plan D2: 主表三类（specimen / classification / photo）任一写入都让汇总缓存失效
+            if category in ("specimen", "classification", "photo"):
+                self._mark_inventory_summary_cache_invalid()
 
     def _delete_rows(self, category: str, voucher: str) -> None:
         rows = [row for row in self.read_rows(category) if self._value(row, "入库编号*") != voucher]
@@ -4329,6 +4390,34 @@ class ExcelStore:
         if reserved > 0 and max_s < reserved:
             self.config.pop("reserved_through_serial", None)
             changed = True
+        if changed:
+            self._save_config()
+
+    def _sync_all_series_counters(self) -> None:
+        """非 YZZ 系列：根据现存编号重算 next_counter，撤回/重做后防跳号。
+
+        旧：_advance_series_counter 只递增，从不回滚；撤回后 counter 偏高，再新增跳号。
+        新：扫描 index 中该系列前缀的全部编号，取最大流水 + step 作为新 next_counter。
+        """
+        from .accession_series import extract_series_counter
+        series_list = self.config.get("accession_series", [])
+        if not series_list:
+            return
+        all_vouchers = list(self._get_index_voucher_set())
+        changed = False
+        for item in series_list:
+            series = AccessionSeries.from_dict(item)
+            if not series.prefix:  # 完全自定义系列，无前缀规律，跳过
+                continue
+            max_c = 0
+            for v in all_vouchers:
+                c = extract_series_counter(v, series)
+                if c is not None and c > max_c:
+                    max_c = c
+            new_next = max_c + series.step if max_c > 0 else 1
+            if item.get("next_counter") != new_next:
+                item["next_counter"] = new_next
+                changed = True
         if changed:
             self._save_config()
 
@@ -4534,7 +4623,7 @@ class ExcelStore:
         classification = classification or {}
         parts = [
             f"管内编号={self._value(specimen, '管内编号*')}",
-            f"地点={self._value(specimen, '采集地点缩写*')}",
+            f"地点={self._value(specimen, '采集地缩写*')}",
             f"日期={self._value(specimen, '采集日期')}",
         ]
         parts.extend(

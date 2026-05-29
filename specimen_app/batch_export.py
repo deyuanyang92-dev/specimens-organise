@@ -88,7 +88,7 @@ def _species_dirname(cls: dict) -> str:
 # Each resolver: (spec_dict, cls_dict) → folder name string (already safe).
 # Order of keys = default display order in the UI list.
 _LEVEL_RESOLVERS = {
-    "采集地点缩写": lambda spec, cls: _safe_dirname(spec.get("采集地点缩写*") or "未知地点"),
+    "采集地缩写": lambda spec, cls: _safe_dirname(spec.get("采集地缩写*") or "未知地点"),
     "目":          lambda spec, cls: _safe_dirname(cls.get("目") or "未知目"),
     "科":          lambda spec, cls: _safe_dirname(cls.get("科*") or "未分类"),
     "属":          lambda spec, cls: _safe_dirname(cls.get("属名") or "未知属"),

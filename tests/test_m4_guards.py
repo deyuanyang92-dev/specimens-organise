@@ -129,7 +129,7 @@ class PhotoDuplicatePolicyTests(unittest.TestCase):
         root.mkdir(parents=True, exist_ok=True)
         store = ExcelStore(root)
         v = store.create_specimen()
-        store.set_fields("specimen", v, {"管内编号*": voucher_tube[1], "采集地点缩写*": voucher_tube[0]})
+        store.set_fields("specimen", v, {"管内编号*": voucher_tube[1], "采集地缩写*": voucher_tube[0]})
         photo = root / photo_name
         photo.write_bytes(photo_bytes)
         store.add_photo(v, photo, allow_outside=True)
@@ -153,7 +153,7 @@ class PhotoDuplicatePolicyTests(unittest.TestCase):
         # 推进到 YZZ000002
         v2 = source_store.create_specimen()  # YZZ000002
         source_store.delete_specimen(v_src)   # 删掉 YZZ000001 避免与 central 冲突
-        source_store.set_fields("specimen", v2, {"管内编号*": "T2", "采集地点缩写*": "QD"})
+        source_store.set_fields("specimen", v2, {"管内编号*": "T2", "采集地缩写*": "QD"})
         photo = source / "y.jpg"
         photo.write_bytes(b"photo-bytes-same")  # 同字节 → 同 SHA256
         source_store.add_photo(v2, photo, allow_outside=True)
@@ -185,7 +185,7 @@ class PhotoDuplicatePolicyTests(unittest.TestCase):
         v_src = source_store.create_specimen()
         v2 = source_store.create_specimen()
         source_store.delete_specimen(v_src)
-        source_store.set_fields("specimen", v2, {"管内编号*": "T2", "采集地点缩写*": "QD"})
+        source_store.set_fields("specimen", v2, {"管内编号*": "T2", "采集地缩写*": "QD"})
         photo = source / "y.jpg"
         photo.write_bytes(b"photo-bytes-same")
         source_store.add_photo(v2, photo, allow_outside=True)
@@ -216,7 +216,7 @@ class PhotoDuplicatePolicyTests(unittest.TestCase):
         source_store = ExcelStore(source)
         v_src = source_store.create_specimen()
         # source 也用同 voucher（与 central 同号且同 tube → 指纹相同 → skipped）
-        source_store.set_fields("specimen", v_src, {"管内编号*": "T1", "采集地点缩写*": "QD"})
+        source_store.set_fields("specimen", v_src, {"管内编号*": "T1", "采集地缩写*": "QD"})
         photo = source / "y.jpg"
         photo.write_bytes(b"shared-bytes")
         source_store.add_photo(v_src, photo, allow_outside=True)
@@ -284,7 +284,7 @@ class AggregateDuplicatesTests(unittest.TestCase):
         # 中心已有照片
         central_store = ExcelStore(self.central)
         v_center = central_store.create_specimen()
-        central_store.set_fields("specimen", v_center, {"管内编号*": "T1", "采集地点缩写*": "QD"})
+        central_store.set_fields("specimen", v_center, {"管内编号*": "T1", "采集地缩写*": "QD"})
         center_photo = self.central / "x.jpg"
         center_photo.write_bytes(b"abc")
         central_store.add_photo(v_center, center_photo, allow_outside=True)
@@ -296,7 +296,7 @@ class AggregateDuplicatesTests(unittest.TestCase):
         v_src1 = sub_store.create_specimen()
         v_src2 = sub_store.create_specimen()
         sub_store.delete_specimen(v_src1)
-        sub_store.set_fields("specimen", v_src2, {"管内编号*": "T2", "采集地点缩写*": "QD"})
+        sub_store.set_fields("specimen", v_src2, {"管内编号*": "T2", "采集地缩写*": "QD"})
         src_photo = sub / "y.jpg"
         src_photo.write_bytes(b"abc")  # 同 SHA256
         sub_store.add_photo(v_src2, src_photo, allow_outside=True)

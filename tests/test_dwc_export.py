@@ -88,7 +88,7 @@ class DwcExportTests(unittest.TestCase):
             {
                 "保存方式": "9E",
                 "采集日期": "2025-09-23",
-                "采集地点缩写*": "QD",
+                "采集地缩写*": "QD",
                 "信息录入人员": "张三",
                 "核对人员": "李四",
                 "备注": "test note",
@@ -141,7 +141,7 @@ class DwcExportTests(unittest.TestCase):
     def test_chinese_utf8_roundtrip(self) -> None:
         store = ExcelStore(self.workspace)
         voucher = store.create_specimen()
-        store.set_fields("specimen", voucher, {"采集地点缩写*": "青岛", "信息录入人员": "张三"})
+        store.set_fields("specimen", voucher, {"采集地缩写*": "青岛", "信息录入人员": "张三"})
 
         dest = self.tmp / "out.zip"
         export_dwc_archive(store, dest)

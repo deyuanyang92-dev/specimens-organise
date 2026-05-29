@@ -52,6 +52,42 @@ def format_series_number(series: AccessionSeries, counter: int | None = None) ->
     return "".join(parts)
 
 
+def extract_series_counter(voucher: str, series: "AccessionSeries") -> int | None:
+    """从格式化编号字符串中提取流水号整数。失败返回 None。
+    支持 year_pos = none / before / after 三种格式。
+    供 ExcelStore._sync_all_series_counters() 使用。
+    """
+    import re
+    sep = series.separator or ""
+    prefix = series.prefix
+    if series.year_pos == "before":
+        # 格式：{YYYY}{sep}{prefix}{sep}{counter}
+        pat = r"^\d{4}" + re.escape(sep) + re.escape(prefix) + re.escape(sep) + r"(\d+)$"
+        m = re.match(pat, voucher)
+        return int(m.group(1)) if m else None
+    elif series.year_pos == "after":
+        # 格式：{prefix}{sep}{YYYY}{sep}{counter}
+        start = prefix + sep
+        if not voucher.startswith(start):
+            return None
+        remainder = voucher[len(start):]
+        parts = remainder.split(sep, 1) if sep else [remainder]
+        if len(parts) >= 2:
+            try:
+                return int(parts[1])
+            except ValueError:
+                return None
+        return None
+    else:  # year_pos == "none"：{prefix}{sep}{counter}
+        start = prefix + sep
+        if not voucher.startswith(start):
+            return None
+        try:
+            return int(voucher[len(start):])
+        except ValueError:
+            return None
+
+
 def series_prefix_of(voucher: str) -> str:
     """从编号字符串提取前缀，用于按系列筛选。取第一个分隔符前的字母段。"""
     for sep in ("-", ".", "/", "_"):

@@ -18,7 +18,7 @@ DwC = TDWG 标准生物多样性数据交换格式；DwC-A = ZIP 含 meta.xml + 
 - 管内编号*  → fieldNumber
 - 保存方式   → preparations
 - 采集日期   → eventDate
-- 采集地点缩写* → verbatimLocality（短码，原样保留）
+- 采集地缩写* → verbatimLocality（短码，原样保留）
 - 信息录入人员 → recordedBy（注：与 DwC 严格语义略有差异，DwC.recordedBy 是采集人；
                               本工作区缺独立"采集人"字段，先用录入员代替，A3 字段补全后再分开）
 - 核对人员   → identifiedBy
@@ -65,7 +65,7 @@ _OCCURRENCE_FIELDS: list[tuple[str, str, str]] = [
     ("fieldNumber", "specimen", "管内编号*"),
     ("preparations", "specimen", "保存方式"),
     ("eventDate", "specimen", "采集日期"),
-    ("verbatimLocality", "specimen", "采集地点缩写*"),
+    ("verbatimLocality", "specimen", "采集地缩写*"),
     ("recordedBy", "specimen", "信息录入人员"),
     ("identifiedBy", "specimen", "核对人员"),
     ("occurrenceRemarks", "specimen", "备注"),

@@ -22,9 +22,12 @@ def format_voucher(serial: int) -> str:
 
 
 def extract_location_code(tube_number: str) -> str:
-    # 原代码：这里单独 split("-") 取前两段；现在统一复用 _parse_tube_info，避免各函数规则不一致。
+    # 原代码：取前两段无条件 join，导致 HC-DLC003-240804 → "HC-DLC003"（错误）。
+    # 新逻辑：第二段含数字（采样点代码如 DLC003）→ 只取第一段；第二段纯字母（如 LSD）→ 取两段。
     parts = _parse_tube_info(tube_number)["core_parts"]
-    return "-".join(parts[:2]) if len(parts) >= 2 else ""
+    if len(parts) >= 2 and parts[1].isalpha():
+        return "-".join(parts[:2])
+    return parts[0] if parts else ""
 
 
 def extract_bottle_label(tube_number: str) -> str:
@@ -44,14 +47,14 @@ def extract_photo_seq(tube_number: str) -> int:
 
 def derive_specimen_fields_from_tube_number(tube_number: str) -> dict[str, str]:
     """Derive specimen fields from a manually entered tube number."""
-    # 原代码只在 ExcelStore.set_fields 中单独派生采集日期和采集地点缩写。
+    # 原代码只在 ExcelStore.set_fields 中单独派生采集日期和采集地缩写。
     # 现在统一在这里派生，恢复旧版本对保存方式的自动识别，并让照片文件名填充复用同一规则。
     updates: dict[str, str] = {}
     location = extract_location_code(tube_number)
     collection_date = extract_collection_date(tube_number)
     save_method = extract_save_method_from_tube_number(tube_number)
     if location:
-        updates["采集地点缩写*"] = location
+        updates["采集地缩写*"] = location
     if collection_date:
         updates["采集日期"] = collection_date
     if save_method:
