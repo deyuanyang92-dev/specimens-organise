@@ -61,6 +61,13 @@ def default_workspace() -> Path | None:
     candidates: list[Path] = []
     settings = load_settings()
     if settings.last_workspace:
+        # 旧：last_workspace 仍与其他候选一起遍历。新：若有效则直接返回，跳过后续 I/O 扫描。
+        try:
+            p = Path(settings.last_workspace).resolve()
+            if not is_generated_workspace_path(p) and has_workspace_data(p):
+                return p
+        except OSError:
+            pass
         candidates.append(Path(settings.last_workspace))
     candidates.append(Path.cwd())
     executable_parent = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]

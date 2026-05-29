@@ -1180,9 +1180,14 @@ class SpecimenWindow(QMainWindow):
                                         read_only=self.read_only)
             except WorkspaceLockedError as exc:
                 lock_path = self.workspace_root / "数据" / ".workspace.lock"
-                msg = f'{exc}\n\n如果软件已退出但仍然被占用，可以点击"强制解锁"。'
-                btn = QMessageBox.critical(self, "工作区被占用", msg, QMessageBox.Abort | QMessageBox.Retry)
-                if btn == QMessageBox.Retry and lock_path.exists():
+                msg = f'{exc}\n\n如果软件已退出但仍然被占用，可以点击"强制解锁"；或选择其他工作区继续工作。'
+                mb = QMessageBox(QMessageBox.Critical, "工作区被占用", msg, parent=self)
+                unlock_btn = mb.addButton("强制解锁", QMessageBox.AcceptRole)
+                choose_btn = mb.addButton("选择其他工作区", QMessageBox.ResetRole)
+                mb.addButton(QMessageBox.Cancel)
+                mb.exec_()
+                clicked = mb.clickedButton()
+                if clicked == unlock_btn and lock_path.exists():
                     try:
                         lock_path.unlink()
                         self.store = ExcelStore(self.workspace_root, lock=True,
@@ -1191,6 +1196,21 @@ class SpecimenWindow(QMainWindow):
                     except Exception:
                         self.close()
                         raise SystemExit
+                elif clicked == choose_btn:
+                    new_dir = QFileDialog.getExistingDirectory(self, "选择工作区目录")
+                    if new_dir:
+                        self.workspace_root = Path(new_dir)
+                        try:
+                            self.store = ExcelStore(self.workspace_root, lock=True,
+                                                    create_if_missing=True,
+                                                    read_only=self.read_only)
+                        except Exception as e2:
+                            QMessageBox.critical(self, "无法打开工作区", str(e2))
+                            self.close()
+                            raise SystemExit from e2
+                    else:
+                        self.close()
+                        raise SystemExit from exc
                 else:
                     self.close()
                     raise SystemExit from exc
@@ -6815,15 +6835,25 @@ class SpecimenWindow(QMainWindow):
             new_store = ExcelStore(target_path, lock=True, create_if_missing=create_files)
         except WorkspaceLockedError as exc:
             lock_path = target_path / "数据" / ".workspace.lock"
-            msg = f'{exc}\n\n如果软件已退出但仍然被占用，可以点击"强制解锁"。'
-            btn = QMessageBox.critical(self, "工作区被占用", msg, QMessageBox.Abort | QMessageBox.Retry)
-            if btn == QMessageBox.Retry and lock_path.exists():
+            msg = f'{exc}\n\n如果软件已退出但仍然被占用，可以点击"强制解锁"；或选择其他工作区继续工作。'
+            mb = QMessageBox(QMessageBox.Critical, "工作区被占用", msg, parent=self)
+            unlock_btn = mb.addButton("强制解锁", QMessageBox.AcceptRole)
+            choose_btn = mb.addButton("选择其他工作区", QMessageBox.ResetRole)
+            mb.addButton(QMessageBox.Cancel)
+            mb.exec_()
+            clicked = mb.clickedButton()
+            if clicked == unlock_btn and lock_path.exists():
                 try:
                     lock_path.unlink()
                     new_store = ExcelStore(target_path, lock=True, create_if_missing=create_files)
                 except Exception as exc2:
                     QMessageBox.critical(self, "切换失败", str(exc2))
                     return False
+            elif clicked == choose_btn:
+                new_dir = QFileDialog.getExistingDirectory(self, "选择工作区目录")
+                if new_dir:
+                    return self._load_workspace_into_window(Path(new_dir), create_files=False)
+                return False
             else:
                 return False
         except WorkspaceNotInitializedError as exc:
@@ -9529,8 +9559,8 @@ class VersionManagerDialog(QDialog):
 
     def _start_update_download(self, release) -> None:
         dest_root = default_download_root(self.app.workspace_root)
-        # local_roots：增量更新扫描这些 releases 根目录，找运行时可复用的本地版本。
         local_roots = release_roots(self.app.workspace_root)
+        self._download_release = release  # 供 _on_update_downloaded 读取版本号
         self._update_status_label.setText(f"正在下载 v{release.version} … 0%")
         worker = UpdateDownloadWorker(release, dest_root, local_roots, self)
         worker.progress.connect(
@@ -9547,15 +9577,38 @@ class VersionManagerDialog(QDialog):
             QMessageBox.critical(self, "下载失败", str(error))
             return
         self._populate_releases()
-        mode_note = (
-            "本次为增量更新（仅下载应用包，运行时已复用本地版本）。\n\n"
-            if incremental else ""
-        )
+        # 旧：弹对话框让用户手动选列表 + 点"启动选中版本"。
+        # 新：写 pending + 主窗口横幅一键重启（VS Code 风格）；旧流程仍可通过列表操作。
+        if path is not None:
+            try:
+                from .ui_upgrade import _locate_bundle
+                from .updater_pending import PendingUpdate, now_iso, write_pending
+                bundle_dir, exe_name = _locate_bundle(Path(path))
+                if bundle_dir and exe_name:
+                    release_version = getattr(self._download_release, "version", "") if hasattr(self, "_download_release") else ""
+                    # 从路径名推断版本（releases/v0.10.28/ → "0.10.28"）
+                    if not release_version:
+                        release_version = Path(path).name.lstrip("v")
+                    pending = PendingUpdate(
+                        version=release_version,
+                        bundle_dir=str(bundle_dir),
+                        exe_name=exe_name,
+                        from_version=__version__,
+                        staged_at=now_iso(),
+                        incremental=bool(incremental),
+                        workspace=str(self.app.workspace_root or ""),
+                    )
+                    write_pending(pending)
+                    self.app._show_pending_update_ready_banner(pending)
+                    return
+            except Exception:
+                pass
+        # 兜底：若 pending 机制失败，仍弹旧式对话框
+        mode_note = "本次为增量更新（仅下载应用包，运行时已复用本地版本）。\n\n" if incremental else ""
         QMessageBox.information(
             self, "下载完成",
             f"{mode_note}新版本已下载到：\n{path}\n\n"
-            '请在上方列表中选择该版本并点击"启动选中版本"。\n'
-            "启动前会提示创建数据快照，建议保留。",
+            '请在上方列表中选择该版本并点击"启动选中版本"。',
         )
 
 
