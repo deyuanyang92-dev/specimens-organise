@@ -1911,6 +1911,9 @@ class SpecimenWindow(QMainWindow):
         _ub_text.setObjectName("_update_banner_text")
         _ub_text.setStyleSheet("color: #856404;")
         _ub_layout.addWidget(_ub_text, stretch=1)
+        _ub_detail = QPushButton("查看详情")
+        _ub_detail.clicked.connect(self._upgrade_banner_detail)
+        _ub_layout.addWidget(_ub_detail)
         _ub_install = QPushButton("立即升级")
         _ub_install.clicked.connect(self._upgrade_banner_install)
         _ub_layout.addWidget(_ub_install)
@@ -1922,6 +1925,18 @@ class SpecimenWindow(QMainWindow):
         _ub_layout.addWidget(_ub_skip)
         self._update_banner.hide()
         central_layout.addWidget(self._update_banner)
+
+        # VS Code 风格状态栏持久更新徽标（点"稍后"后 banner 消失但此徽标保留）
+        self._update_status_btn = QPushButton("[新版]")
+        self._update_status_btn.setFlat(True)
+        self._update_status_btn.setStyleSheet(
+            "QPushButton { color: #856404; font-size: 11px; border: none; padding: 0 6px; }"
+            "QPushButton:hover { text-decoration: underline; color: #533f03; }"
+        )
+        self._update_status_btn.setToolTip("有可用更新，点击查看")
+        self._update_status_btn.clicked.connect(self._on_update_status_clicked)
+        self._update_status_btn.hide()
+        self.statusBar().addPermanentWidget(self._update_status_btn)
 
         # Stacked: graphics view (single) + grid frame (grid)
         self._photo_stack_container = QWidget()
@@ -7157,10 +7172,21 @@ class SpecimenWindow(QMainWindow):
         self._update_banner_release = release
         label = banner.findChild(QLabel, "_update_banner_text")
         if label is not None:
+            # 发布说明第一行截断预览（VS Code 风格：让用户知道更新了什么）
+            notes_preview = ""
+            notes = getattr(release, "notes", "") or ""
+            if notes.strip():
+                first_line = notes.strip().split("\n")[0][:100]
+                notes_preview = f"  ·  {first_line}"
             label.setText(
-                f"🔔 发现新版 v{release.version}（当前 v{__version__}）"
+                f"[新版] 发现新版 v{release.version}（当前 v{__version__}）{notes_preview}"
             )
         banner.show()
+        # 同步更新状态栏持久徽标（点"稍后"后 banner 消失但徽标保留）
+        btn = getattr(self, "_update_status_btn", None)
+        if btn is not None:
+            btn.setText(f"[新版] v{release.version} 可更新")
+            btn.show()
 
     def _start_background_download_for_pending(self, release) -> None:
         """download/install 模式:启动后台下载,写 pending,下次启动安装。"""
@@ -7210,6 +7236,10 @@ class SpecimenWindow(QMainWindow):
             if banner is not None:
                 banner.hide()
             self._pending_update_ready_for_banner = None
+            # 安装触发后隐藏状态栏徽标
+            btn = getattr(self, "_update_status_btn", None)
+            if btn is not None:
+                btn.hide()
             self._launch_pending_swap_with_confirm(pending_ready)
             return
         self._oneclick_upgrade_now(source="banner")
@@ -7387,6 +7417,24 @@ class SpecimenWindow(QMainWindow):
         if box.clickedButton() is btn_now:
             self._launch_pending_swap(pending)
 
+    def _upgrade_banner_detail(self) -> None:
+        """查看详情：打开版本管理器，展示完整发布说明和升级选项。"""
+        dlg = VersionManagerDialog(self)
+        # 跳到「软件版本」Tab（index 1 = 软件版本）
+        tab_widget = dlg.findChild(QTabWidget)
+        if tab_widget is not None and tab_widget.count() > 1:
+            tab_widget.setCurrentIndex(1)
+        dlg.exec_()
+
+    def _on_update_status_clicked(self) -> None:
+        """点状态栏更新徽标 → 重新弹出 banner（或打开版本管理器）。"""
+        release = getattr(self, "_update_banner_release", None)
+        if release is not None:
+            self._show_update_banner(release)
+        else:
+            dlg = VersionManagerDialog(self)
+            dlg.exec_()
+
     def _upgrade_banner_later(self) -> None:
         banner = getattr(self, "_update_banner", None)
         if banner is not None:
@@ -7422,6 +7470,10 @@ class SpecimenWindow(QMainWindow):
                 save_settings(settings)
         if banner is not None:
             banner.hide()
+        # 跳过此版时隐藏状态栏徽标
+        btn = getattr(self, "_update_status_btn", None)
+        if btn is not None:
+            btn.hide()
 
     # ---- D3+D11 启动入口:apply pending + sentinel 健康检查 ----
 

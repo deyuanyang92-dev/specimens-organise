@@ -90,6 +90,7 @@ from .models import (
     SPECIMEN_OVERRIDE_FIELD,
     PHOTO_OVERRIDE_FIELD,
     CLASS_OVERRIDE_FIELD,
+    SPECIMEN_HAS_PHYSICAL,
     SUMMARY_COLUMNS,
     SUMMARY_COLUMN_SOURCE,
     HeartbeatThreadStalled,
@@ -582,10 +583,11 @@ class ExcelStore:
         - ``tube_numbers``: dict[voucher -> str]
         - ``photo_filenames``: dict[voucher -> list[str]]
         """
-        # 只读必要列(具体字段集随 StatusFlags 必需字段变化)；含三个覆盖字段供手动状态覆盖。
-        spec_cols = set(SPECIMEN_REQUIRED) | {
+        # 只读必要列：标本列由"有实物"字段决定，照片/分类覆盖字段供手动覆盖。
+        spec_cols = {
             "入库编号*", "管内编号*",
-            SPECIMEN_OVERRIDE_FIELD, PHOTO_OVERRIDE_FIELD, CLASS_OVERRIDE_FIELD,
+            SPECIMEN_HAS_PHYSICAL,
+            PHOTO_OVERRIDE_FIELD, CLASS_OVERRIDE_FIELD,
         }
         class_cols = set(CLASSIFICATION_REQUIRED) | {"入库编号*"}
         photo_cols = {"入库编号*", "文件名"}
@@ -626,10 +628,8 @@ class ExcelStore:
                 tube_numbers[voucher] = tube
             class_row = class_by_voucher.get(voucher, {})
             flags[voucher] = StatusFlags(
-                specimen_complete=self._resolve_status(
-                    row.get(SPECIMEN_OVERRIDE_FIELD, ""),
-                    all(row.get(f, "") for f in SPECIMEN_REQUIRED),
-                ),
+                # 标本列：直接由"有实物"字段决定（旧：检查管内编号*/采集地缩写*等字段完整性）
+                specimen_complete=row.get(SPECIMEN_HAS_PHYSICAL, "") == "√",
                 has_photo=self._resolve_status(
                     row.get(PHOTO_OVERRIDE_FIELD, ""),
                     photo_counts.get(voucher, 0) > 0,
@@ -742,10 +742,8 @@ class ExcelStore:
                 elif col == PHOTO_DESC_COLUMN:
                     record[col] = photo_descs.get(voucher, [])
                 elif col == SPECIMEN_STATUS_COLUMN:
-                    record[col] = "√" if self._resolve_status(
-                        self._value(row, SPECIMEN_OVERRIDE_FIELD),
-                        all(self._value(row, f) for f in SPECIMEN_REQUIRED),
-                    ) else "×"
+                    # 标本列：直接由"有实物"字段决定（旧：检查管内编号*/采集地缩写*等字段完整性）
+                    record[col] = "√" if self._value(row, SPECIMEN_HAS_PHYSICAL) == "√" else "×"
                 elif col == PHOTO_STATUS_COLUMN:
                     record[col] = "√" if self._resolve_status(
                         self._value(row, PHOTO_OVERRIDE_FIELD),
@@ -791,10 +789,8 @@ class ExcelStore:
         classification = self.get_classification(voucher) or {}
         photos = self.get_photos(voucher)
         return StatusFlags(
-            specimen_complete=self._resolve_status(
-                self._value(specimen, SPECIMEN_OVERRIDE_FIELD),
-                all(self._value(specimen, f) for f in SPECIMEN_REQUIRED),
-            ),
+            # 标本列：直接由"有实物"字段决定（旧：检查管内编号*/采集地缩写*等字段完整性）
+            specimen_complete=self._value(specimen, SPECIMEN_HAS_PHYSICAL) == "√",
             has_photo=self._resolve_status(
                 self._value(specimen, PHOTO_OVERRIDE_FIELD),
                 bool(photos),
@@ -822,10 +818,8 @@ class ExcelStore:
                 continue
             class_row = class_by_voucher.get(v, {})
             result[v] = StatusFlags(
-                specimen_complete=self._resolve_status(
-                    self._value(row, SPECIMEN_OVERRIDE_FIELD),
-                    all(self._value(row, f) for f in SPECIMEN_REQUIRED),
-                ),
+                # 标本列：直接由"有实物"字段决定（旧：检查管内编号*/采集地缩写*等字段完整性）
+                specimen_complete=self._value(row, SPECIMEN_HAS_PHYSICAL) == "√",
                 has_photo=self._resolve_status(
                     self._value(row, PHOTO_OVERRIDE_FIELD),
                     v in photo_vouchers,
@@ -4844,7 +4838,14 @@ class ExcelStore:
             wb.close()
 
     def _fit_headers(self, row: Row, headers: list[str]) -> Row:
-        return {header: self._string((row or {}).get(header, "")) for header in headers}
+        result = {}
+        for header in headers:
+            val = self._string((row or {}).get(header, ""))
+            if not val and header in COLUMN_ALIASES:
+                # header 是旧列名，_read_plain_rows 已将值归一到新列名下
+                val = self._string((row or {}).get(COLUMN_ALIASES[header], ""))
+            result[header] = val
+        return result
 
     def _value(self, row: Row | None, field: str) -> str:
         if not row:

@@ -96,7 +96,7 @@ class AppSettings:
     # 升级中心 v0.8.0 (D3 / D11 / D12 / D18):自动升级状态机 + Sparkle 风跳过此版本 +
     # Claude Code 风 channel 切换。旧 check_updates_on_startup=True 会在 load_settings()
     # 里一次性迁到 auto_update_mode="notify"。
-    auto_update_mode: str = "off"
+    auto_update_mode: str = "notify"  # 旧：off；新安装默认自动检查+通知，旧用户 settings.json 已有值不受影响
     auto_update_interval_hours: int = 24
     auto_update_pending_version: str = ""
     auto_update_install_dir: str = ""

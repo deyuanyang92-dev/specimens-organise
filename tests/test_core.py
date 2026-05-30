@@ -108,7 +108,7 @@ class CoreTests(unittest.TestCase):
         store = ExcelStore(self.tmp)
         first = store.create_specimen()
         second = store.create_specimen()
-        store.set_fields("specimen", first, {"管内编号*": "QD-CK-SC008", "采集地缩写*": "QD"})
+        store.set_fields("specimen", first, {"管内编号*": "QD-CK-SC008", "采集地缩写*": "QD", "有实物": "√"})
         store.set_fields("classification", first, {
             "种名*": "Nicon moniloceras",
             "科*": "Nereididae",
@@ -1836,8 +1836,8 @@ class CoreTests(unittest.TestCase):
         f = photo_dir / "x.jpg"; f.write_bytes(b"x")
         store.add_photo(v, f)
         self.assertFalse(store.is_voucher_ingestion_complete(v))
-        # specimen 必填 + 照片 + 分类必填 全填 → 完整
-        store.set_fields("specimen", v, {"管内编号*": "QD-LSD-SC001-1-R-250923", "采集地缩写*": "QD"})
+        # 有实物=√ + 照片 + 分类必填 全填 → 完整（新版：标本列由"有实物"字段决定）
+        store.set_fields("specimen", v, {"管内编号*": "QD-LSD-SC001-1-R-250923", "采集地缩写*": "QD", "有实物": "√"})
         from specimen_app.classification_fields import REQUIRED_CLASSIFICATION_COLUMNS
         cls = {field: "X" for field in REQUIRED_CLASSIFICATION_COLUMNS if field != "入库编号*"}
         store.set_fields("classification", v, cls)
@@ -1858,7 +1858,7 @@ class CoreTests(unittest.TestCase):
         photo_dir = self.tmp / "照片"; photo_dir.mkdir()
         p = photo_dir / "a.jpg"; p.write_bytes(b"a")
         store.add_photo(v1, p)
-        store.set_fields("specimen", v1, {"管内编号*": "T1", "采集地缩写*": "QD"})
+        store.set_fields("specimen", v1, {"管内编号*": "T1", "采集地缩写*": "QD", "有实物": "√"})
         from specimen_app.classification_fields import REQUIRED_CLASSIFICATION_COLUMNS
         store.set_fields("classification", v1, {f: "X" for f in REQUIRED_CLASSIFICATION_COLUMNS if f != "入库编号*"})
         self.assertTrue(store.is_voucher_ingestion_complete(v1))
