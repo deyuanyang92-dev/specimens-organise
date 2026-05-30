@@ -105,6 +105,14 @@ from .models import (
     PHOTO_COUNT_COLUMN,
     SAVE_METHOD_OPTIONS,
     SPECIMEN_HEADERS,
+    SPECIMEN_ADMIN_ONLY_FIELDS,
+    SPECIMEN_HAS_PHYSICAL,
+    SPECIMEN_OVERRIDE_FIELD,
+    PHOTO_OVERRIDE_FIELD,
+    CLASS_OVERRIDE_FIELD,
+    SPECIMEN_STATUS_COLUMN,
+    PHOTO_STATUS_COLUMN,
+    CLASSIFICATION_STATUS_COLUMN,
     SUMMARY_COLUMNS,
     SUMMARY_COLUMN_SOURCE,
     SUMMARY_DEFAULT_VISIBLE_COLUMNS,
@@ -2219,10 +2227,16 @@ class SpecimenWindow(QMainWindow):
         sf_layout.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         sf_layout.setVerticalSpacing(6)
         for field in SPECIMEN_HEADERS:
+            if field in SPECIMEN_ADMIN_ONLY_FIELDS:
+                continue  # 旧：无此跳过；管理员专用覆盖字段不在右侧栏显示
             if field == "保存方式":
                 widget = QComboBox()
                 widget.addItems(SAVE_METHOD_OPTIONS)
                 widget.setEditable(True)
+                widget.currentTextChanged.connect(lambda text, f=field: self.schedule_save("specimen", f))
+            elif field == SPECIMEN_HAS_PHYSICAL:
+                widget = QComboBox()
+                widget.addItems(["", "√", "×"])
                 widget.currentTextChanged.connect(lambda text, f=field: self.schedule_save("specimen", f))
             else:
                 widget = QLineEdit()
@@ -8603,6 +8617,8 @@ class IngestSummaryDialog(QDialog):
         self._search_text = ""
         # 导入的入库编号列表筛选：None=未启用；非 None=只显示集合内编号。
         self._voucher_list_filter: set[str] | None = None
+        self._admin_mode: bool = False
+        self._admin_name: str = ""
 
         self.filtered_vouchers: list[str] = list(self.all_vouchers)
         self.current_page = 0
@@ -8640,6 +8656,15 @@ class IngestSummaryDialog(QDialog):
         stats.addStretch()
         layout.addLayout(stats)
 
+        # 管理员模式警示 banner（默认隐藏）
+        self._admin_banner = QLabel()
+        self._admin_banner.setStyleSheet(
+            "background:#cc3300;color:white;padding:4px 10px;"
+            "border-radius:3px;font-weight:bold;"
+        )
+        self._admin_banner.setVisible(False)
+        layout.addWidget(self._admin_banner)
+
         # 旧布局：搜索框/范围/导入/页码/上下页/列设置全挤一行。现拆两行更清爽：
         # 第 1 行 = 搜索区，第 2 行 = 分页 + 列设置。控件、信号全部不变。
         search_row = QHBoxLayout()
@@ -8671,6 +8696,12 @@ class IngestSummaryDialog(QDialog):
         nav.addStretch()
         # 「列设置」：开关右侧列选择面板（默认隐藏，可关闭）。
         self._make_btn("列设置", self._toggle_column_panel, nav)
+        nav.addSpacing(16)
+        # 管理员编辑模式切换按钮
+        self._admin_mode_btn = QPushButton("🔒 管理员编辑")
+        self._admin_mode_btn.setToolTip("点击解锁管理员编辑模式（需要密码和操作员姓名）")
+        self._admin_mode_btn.clicked.connect(self._toggle_admin_mode)
+        nav.addWidget(self._admin_mode_btn)
         layout.addLayout(nav)
 
         # 汇总宽表：SUMMARY_COLUMNS 全字段，占满窗口。
@@ -8699,6 +8730,8 @@ class IngestSummaryDialog(QDialog):
             lambda pos: self._voucher_column_menu(pos, from_header=False)
         )
         self._apply_visible_columns()
+        # 管理员模式下单格编辑回写信号
+        self.voucher_table.itemChanged.connect(self._on_admin_cell_changed)
 
         # 表格 + 右侧列选择面板（面板默认隐藏，「列设置」按钮开关）。
         table_row = QHBoxLayout()
@@ -8742,10 +8775,11 @@ class IngestSummaryDialog(QDialog):
         return str(value)
 
     def _make_cell(self, col: str, record: dict) -> QTableWidgetItem:
-        """构造一个汇总宽表单元格；宽表已改全只读，照片数列用数值排序。
+        """构造一个汇总宽表单元格；非管理员模式全只读，管理员模式下 specimen/classification 列可编辑。
 
         旧逻辑：按 SUMMARY_COLUMN_SOURCE 的 category 决定单元格是否带 ItemIsEditable；
         现在宽表整体只读（编辑改到主窗口），所有单元格统一去掉 ItemIsEditable。
+        管理员模式：category != "readonly" 的列加回 ItemIsEditable。
         """
         value = record.get(col, "")
         item = QTableWidgetItem()
@@ -8759,7 +8793,11 @@ class IngestSummaryDialog(QDialog):
             item.setText(self._summary_cell_text(value))
             if isinstance(value, list) and value:
                 item.setToolTip("\n".join(str(v) for v in value))
-        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        category, _ = SUMMARY_COLUMN_SOURCE.get(col, ("readonly", col))
+        if self._admin_mode and category != "readonly":
+            item.setFlags(item.flags() | Qt.ItemIsEditable)
+        else:
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
         return item
 
     def _load_page(self, page: int) -> None:
@@ -8768,15 +8806,17 @@ class IngestSummaryDialog(QDialog):
         end = start + self.PAGE_SIZE
         page_vouchers = self.filtered_vouchers[start:end]
 
-        # 填表期间关排序，避免排序错乱。（旧代码另置 _loading 抑制 itemChanged 回写，
-        # 宽表已改只读、无 itemChanged 连接，_loading 不再需要。）
+        # 填表期间关排序 + 屏蔽信号，避免 itemChanged 触发回写（旧代码用 _loading flag，
+        # 现改用 blockSignals 更可靠；_loading 已废弃）。
         self.voucher_table.setSortingEnabled(False)
+        self.voucher_table.blockSignals(True)
         self.voucher_table.setRowCount(0)
         self.voucher_table.setRowCount(len(page_vouchers))
         for i, voucher in enumerate(page_vouchers):
             record = self._record_by_voucher.get(voucher, {})
             for col_idx, col in enumerate(SUMMARY_COLUMNS):
                 self.voucher_table.setItem(i, col_idx, self._make_cell(col, record))
+        self.voucher_table.blockSignals(False)
         self.voucher_table.setSortingEnabled(True)
 
         self.voucher_table.resizeColumnsToContents()
@@ -8839,6 +8879,146 @@ class IngestSummaryDialog(QDialog):
         self._summary_records = self.store.read_inventory_summary_via_cache()  # plan D2
         self._record_by_voucher = {r["入库编号*"]: r for r in self._summary_records}
 
+    def _toggle_admin_mode(self) -> None:
+        """切换管理员编辑模式：解锁需密码+姓名；锁定时刷新主窗口。"""
+        if self._admin_mode:
+            self._admin_mode = False
+            self._admin_name = ""
+            self._apply_admin_mode_ui()
+            self.app.refresh_list()
+        else:
+            dlg = _AdminUnlockDialog(self)
+            if dlg.exec_() == QDialog.Accepted:
+                self._admin_mode = True
+                self._admin_name = dlg.admin_name
+                self._apply_admin_mode_ui()
+                self._load_page(self.current_page)  # 重绘单元格（加 ItemIsEditable）
+
+    def _apply_admin_mode_ui(self) -> None:
+        """根据 _admin_mode 更新 UI 状态：按钮样式、banner、编辑触发器。"""
+        if self._admin_mode:
+            self._admin_mode_btn.setText(f"🔓 管理员：{self._admin_name}")
+            self._admin_mode_btn.setStyleSheet("background:#cc3300;color:white;font-weight:bold;")
+            self._admin_banner.setText(
+                f"⚠ 管理员编辑模式已启用 — 操作员：{self._admin_name}  |  "
+                "双击单元格可直接修改，修改将写入修改记录。点击右侧按钮退出。"
+            )
+            self._admin_banner.setVisible(True)
+            self.voucher_table.setEditTriggers(
+                QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed
+            )
+        else:
+            self._admin_mode_btn.setText("🔒 管理员编辑")
+            self._admin_mode_btn.setStyleSheet("")
+            self._admin_banner.setVisible(False)
+            self.voucher_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            self._load_page(self.current_page)  # 重绘单元格（去 ItemIsEditable）
+
+    def _on_admin_cell_changed(self, item: "QTableWidgetItem") -> None:
+        """管理员模式单格编辑提交回写：写入 Excel + 修改记录（含操作员姓名）。"""
+        if not self._admin_mode:
+            return
+        col_idx = item.column()
+        if col_idx < 0 or col_idx >= len(SUMMARY_COLUMNS):
+            return
+        col = SUMMARY_COLUMNS[col_idx]
+        category, excel_field = SUMMARY_COLUMN_SOURCE.get(col, ("readonly", col))
+        if category == "readonly":
+            return
+        voucher_item = self.voucher_table.item(item.row(), 0)
+        if voucher_item is None:
+            return
+        voucher = voucher_item.text()
+        if not voucher:
+            return
+        value = item.text()
+        _STATUS_OVERRIDE_MAP = {
+            SPECIMEN_STATUS_COLUMN: SPECIMEN_OVERRIDE_FIELD,
+            PHOTO_STATUS_COLUMN: PHOTO_OVERRIDE_FIELD,
+            CLASSIFICATION_STATUS_COLUMN: CLASS_OVERRIDE_FIELD,
+        }
+        if col in _STATUS_OVERRIDE_MAP:
+            # 状态列写覆盖字段
+            self.store.set_fields(
+                "specimen", voucher,
+                {_STATUS_OVERRIDE_MAP[col]: value},
+                action_type="admin_manual_edit",
+                admin_name=self._admin_name,
+            )
+        else:
+            self.store.set_fields(
+                category, voucher,
+                {excel_field: value},
+                action_type="admin_manual_edit",
+                admin_name=self._admin_name,
+            )
+        self._mark_summary_dirty(voucher)
+        self.app.refresh_list()
+
+    def _mark_summary_dirty(self, voucher: str) -> None:
+        """更新内存汇总记录，使下次翻页/筛选不必全量重读。"""
+        # 简单方案：让 summary cache 失效，下次 _reload_summary 会重算
+        self.store._mark_inventory_summary_cache_invalid()
+
+    def _open_admin_batch_edit(self, col_name: str, selected_vouchers: list) -> None:
+        """管理员批量编辑对话框：支持选中行 / 编号范围 / 粘贴列表三种选择方式。"""
+        if not self._admin_mode:
+            return
+        dlg = _AdminBatchEditDialog(
+            self, col_name, selected_vouchers,
+            list(self.all_vouchers), self._admin_name,
+        )
+        if dlg.exec_() == QDialog.Accepted:
+            target_vouchers = dlg.resolved_vouchers
+            new_value = dlg.new_value
+            _STATUS_OVERRIDE_MAP = {
+                SPECIMEN_STATUS_COLUMN: SPECIMEN_OVERRIDE_FIELD,
+                PHOTO_STATUS_COLUMN: PHOTO_OVERRIDE_FIELD,
+                CLASSIFICATION_STATUS_COLUMN: CLASS_OVERRIDE_FIELD,
+            }
+            category, excel_field = SUMMARY_COLUMN_SOURCE.get(col_name, ("readonly", col_name))
+            for voucher in target_vouchers:
+                if col_name in _STATUS_OVERRIDE_MAP:
+                    self.store.set_fields(
+                        "specimen", voucher,
+                        {_STATUS_OVERRIDE_MAP[col_name]: new_value},
+                        action_type="admin_manual_edit",
+                        admin_name=self._admin_name,
+                    )
+                elif category in ("specimen", "classification"):
+                    self.store.set_fields(
+                        category, voucher,
+                        {excel_field: new_value},
+                        action_type="admin_manual_edit",
+                        admin_name=self._admin_name,
+                    )
+            self.store._mark_inventory_summary_cache_invalid()
+            self._reload_summary()
+            self._apply_filters()
+            self.app.refresh_list()
+            self.status_label.setText(f"批量修改完成：{len(target_vouchers)} 条")
+
+    def _admin_set_status_override(self, value: str, override_field: str) -> None:
+        """管理员手动设置所选入库编号的状态覆盖字段（需密码验证）。
+
+        value: "" = 清除覆盖（恢复自动计算）/ "√" / "×"
+        override_field: SPECIMEN_OVERRIDE_FIELD / PHOTO_OVERRIDE_FIELD / CLASS_OVERRIDE_FIELD
+        """
+        if not self._admin_mode:
+            return
+        vouchers = self._selected_vouchers()
+        if not vouchers:
+            return
+        for voucher in vouchers:
+            self.store.set_fields(
+                "specimen", voucher, {override_field: value},
+                action_type="admin_manual_edit", admin_name=self._admin_name,
+            )
+        self._reload_summary()
+        self._apply_filters()
+        # 通知主窗口刷新左侧状态列（_all_flags 重算）
+        self.app.refresh_list()
+
     def _refresh(self) -> None:
         """重新从 store 拉取最新数据并重算筛选/分页/统计。
 
@@ -8854,7 +9034,14 @@ class IngestSummaryDialog(QDialog):
     # ---- Voucher double-click -> jump to main window ----
 
     def _on_voucher_double_clicked(self, row: int, col: int) -> None:
-        """双击行 -> 主窗口选中该入库编号并聚焦主窗口编辑器（汇总窗口保持打开）。"""
+        """双击行 -> 主窗口选中该入库编号并聚焦主窗口编辑器（汇总窗口保持打开）。
+        管理员模式下双击可编辑列时不跳转（由内联编辑处理）。
+        """
+        if self._admin_mode and 0 <= col < len(SUMMARY_COLUMNS):
+            col_name = SUMMARY_COLUMNS[col]
+            cat, _ = SUMMARY_COLUMN_SOURCE.get(col_name, ("readonly", col_name))
+            if cat != "readonly":
+                return  # 管理员模式 + 可编辑列：让双击触发内联编辑，不跳主窗口
         item = self.voucher_table.item(row, 0)  # 入库编号* 始终第 0 列
         if item is None:
             return
@@ -9079,6 +9266,19 @@ class IngestSummaryDialog(QDialog):
                     lambda sv=sel_vouchers: self._open_worms_match_for_vouchers(sv),
                 )
                 menu.addSeparator()
+                # 管理员模式：右键任意可写列时，显示批量编辑菜单
+                if 0 <= col_idx < len(SUMMARY_COLUMNS):
+                    col_name = SUMMARY_COLUMNS[col_idx]
+                    cat, _ = SUMMARY_COLUMN_SOURCE.get(col_name, ("readonly", col_name))
+                    if self._admin_mode and cat != "readonly":
+                        act = menu.addAction(
+                            f"[管理员] 批量设置「{col_name}」… ({len(sel_vouchers)}条)"
+                        )
+                        act.triggered.connect(
+                            lambda _, cn=col_name, sv=list(sel_vouchers):
+                                self._open_admin_batch_edit(cn, sv)
+                        )
+                        menu.addSeparator()
         if 0 <= col_idx < len(SUMMARY_COLUMNS):
             col = SUMMARY_COLUMNS[col_idx]
             menu.addAction(f"按「{col}」筛选…", lambda: self._open_column_filter(col))
@@ -9957,6 +10157,192 @@ class SettingsDialog(QDialog):
         from .app_settings import MEMORY_PROFILE_OPTIONS
         key = self.memory_profile_combo.currentData()
         return key if isinstance(key, str) and key in MEMORY_PROFILE_OPTIONS else "auto"
+
+
+# ---------------------------------------------------------------------------
+# 入库汇总管理员辅助对话框
+# ---------------------------------------------------------------------------
+
+class _AdminUnlockDialog(QDialog):
+    """管理员解锁对话框：密码 + 操作员姓名（两者均为必填）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("管理员解锁")
+        self.setFixedWidth(340)
+        self.admin_name = ""
+        layout = QFormLayout(self)
+        layout.setLabelAlignment(Qt.AlignRight)
+        self._pwd = QLineEdit()
+        self._pwd.setEchoMode(QLineEdit.Password)
+        self._pwd.setPlaceholderText("请输入管理员密码")
+        self._name = QLineEdit()
+        self._name.setPlaceholderText("请输入操作员姓名（用于审计记录）")
+        layout.addRow("管理员密码：", self._pwd)
+        layout.addRow("操作员姓名：", self._name)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        layout.addRow(btns)
+        self._pwd.setFocus()
+
+    def _on_accept(self) -> None:
+        pwd = self._pwd.text().strip()
+        name = self._name.text().strip()
+        if pwd != ADMIN_PASSWORD:
+            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
+            return
+        if not name:
+            QMessageBox.warning(self, "姓名必填", "请填写操作员姓名，用于审计记录。")
+            return
+        self.admin_name = name
+        self.accept()
+
+
+class _AdminBatchEditDialog(QDialog):
+    """管理员批量编辑对话框：选中行 / 编号范围 / 粘贴列表 三 Tab 选择目标编号，统一设置新值。"""
+
+    STATUS_COLS = {SPECIMEN_STATUS_COLUMN, PHOTO_STATUS_COLUMN, CLASSIFICATION_STATUS_COLUMN}
+
+    def __init__(self, parent, col_name: str, selected_vouchers: list,
+                 all_vouchers: list, admin_name: str):
+        super().__init__(parent)
+        self.setWindowTitle(f"管理员批量设置「{col_name}」")
+        self.resize(500, 400)
+        self.col_name = col_name
+        self._selected = list(selected_vouchers)
+        self._all_vouchers = set(all_vouchers)
+        self.admin_name = admin_name
+        self.resolved_vouchers: list[str] = []
+        self.new_value: str = ""
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            f"列：<b>{self.col_name}</b>　操作员：{self.admin_name}"
+        ))
+
+        # 三 Tab 选择来源
+        tabs = QTabWidget()
+        # Tab 1：选中行
+        t1 = QWidget()
+        t1l = QVBoxLayout(t1)
+        self._selected_list = QListWidget()
+        self._selected_list.addItems(self._selected)
+        t1l.addWidget(QLabel(f"已选中 {len(self._selected)} 条入库编号："))
+        t1l.addWidget(self._selected_list)
+        tabs.addTab(t1, f"选中行（{len(self._selected)}）")
+
+        # Tab 2：编号范围
+        t2 = QWidget()
+        t2l = QFormLayout(t2)
+        self._range_edit = QLineEdit()
+        self._range_edit.setPlaceholderText("例：YZZ000001 - YZZ000050")
+        self._range_preview = QLabel("—")
+        self._range_edit.textChanged.connect(self._update_range_preview)
+        t2l.addRow("范围：", self._range_edit)
+        t2l.addRow("匹配：", self._range_preview)
+        tabs.addTab(t2, "编号范围")
+
+        # Tab 3：粘贴列表
+        t3 = QWidget()
+        t3l = QVBoxLayout(t3)
+        self._paste_edit = QPlainTextEdit()
+        self._paste_edit.setPlaceholderText("每行一个编号，或逗号分隔")
+        self._paste_preview = QLabel("—")
+        self._paste_edit.textChanged.connect(self._update_paste_preview)
+        t3l.addWidget(QLabel("粘贴入库编号列表："))
+        t3l.addWidget(self._paste_edit)
+        t3l.addWidget(self._paste_preview)
+        tabs.addTab(t3, "粘贴列表")
+
+        self._tabs = tabs
+        layout.addWidget(tabs)
+
+        # 新值输入
+        layout.addWidget(QLabel("新值："))
+        if self.col_name in self.STATUS_COLS:
+            self._value_widget = QComboBox()
+            self._value_widget.addItems(["", "√", "×"])
+        else:
+            self._value_widget = QLineEdit()
+            self._value_widget.setPlaceholderText("输入新值（留空则清除该字段）")
+        layout.addWidget(self._value_widget)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("确认修改")
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _parse_range(self) -> list[str]:
+        text = self._range_edit.text().strip()
+        if " - " in text:
+            parts = [p.strip() for p in text.split(" - ", 1)]
+        elif "-" in text:
+            # 避免把编号前缀里的连字符当分隔符：从末尾数字段前分割
+            import re
+            m = re.match(r"^(.+?)(\d+)\s*-\s*(.+?)(\d+)$", text)
+            if m:
+                parts = [m.group(1) + m.group(2), m.group(3) + m.group(4)]
+            else:
+                return []
+        else:
+            return []
+        if len(parts) != 2:
+            return []
+        from .parsing import parse_voucher_serial, format_voucher
+        try:
+            start = parse_voucher_serial(parts[0])
+            end = parse_voucher_serial(parts[1])
+            if start is None or end is None or start > end:
+                return []
+            # format_voucher 只接受 int，内部使用 YZZ 格式；其他系列编号由用户手动输入列表
+            return [v for v in (format_voucher(i) for i in range(start, end + 1))
+                    if v in self._all_vouchers]
+        except Exception:
+            return []
+
+    def _parse_paste(self) -> list[str]:
+        text = self._paste_edit.toPlainText()
+        import re
+        tokens = re.split(r"[\n,，\s]+", text)
+        return [t.strip() for t in tokens if t.strip() and t.strip() in self._all_vouchers]
+
+    def _update_range_preview(self) -> None:
+        result = self._parse_range()
+        self._range_preview.setText(f"匹配 {len(result)} 条" if result else "无匹配（检查格式）")
+
+    def _update_paste_preview(self) -> None:
+        result = self._parse_paste()
+        self._paste_preview.setText(f"识别 {len(result)} 条有效编号")
+
+    def _on_accept(self) -> None:
+        tab = self._tabs.currentIndex()
+        if tab == 0:
+            vouchers = list(self._selected)
+        elif tab == 1:
+            vouchers = self._parse_range()
+        else:
+            vouchers = self._parse_paste()
+        if not vouchers:
+            QMessageBox.warning(self, "无目标", "未找到有效入库编号，请检查输入。")
+            return
+        if isinstance(self._value_widget, QComboBox):
+            value = self._value_widget.currentText()
+        else:
+            value = self._value_widget.text()
+        reply = QMessageBox.question(
+            self, "确认批量修改",
+            f"将把 {len(vouchers)} 条记录的「{self.col_name}」设为：「{value if value else '（空）'}」\n操作员：{self.admin_name}\n\n确认？",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.resolved_vouchers = vouchers
+        self.new_value = value
+        self.accept()
 
 
 # ---------------------------------------------------------------------------

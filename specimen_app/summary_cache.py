@@ -38,7 +38,7 @@ from typing import Any, Callable, Iterable
 
 _SUMMARY_CACHE_FILENAME = "summary_cache.sqlite"
 
-_SCHEMA_VERSION = 1  # 缓存 schema 版本，列变化时 +1，老 db 直接重建
+_SCHEMA_VERSION = 3  # 旧: 2; 增加有实物/标本状态覆盖/照片状态覆盖/分类状态覆盖字段（SPECIMEN_HEADERS 扩展）后 +1
 
 _META_SCHEMA_VERSION_KEY = "schema_version"
 _META_LAST_UPDATED_KEY = "last_updated_iso"
