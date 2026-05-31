@@ -481,29 +481,23 @@ class BatchExportDialog(QDialog):
         )
         self.accept()
 
-    def _export_specimen_sheet(self, wb: Workbook, vouchers: list[str], errors: list[str]) -> None:
-        """导出标本信息 sheet。"""
-        from .models import SPECIMEN_HEADERS
-
-        ws = wb.create_sheet("标本信息")
-        _write_header_row(ws, SPECIMEN_HEADERS)
+    def _export_data_sheet(self, wb: Workbook, sheet_name: str, headers: list, get_fn, vouchers: list[str], errors: list[str]) -> None:
+        """通用数据 sheet 导出：创建 sheet、写表头、逐行填值、自动列宽。"""
+        ws = wb.create_sheet(sheet_name)
+        _write_header_row(ws, headers)
         for row_idx, voucher in enumerate(vouchers, 2):
-            specimen = self.store.get_specimen(voucher) or {}
-            for col_idx, header in enumerate(SPECIMEN_HEADERS, 1):
-                ws.cell(row=row_idx, column=col_idx, value=str(specimen.get(header, "")))
+            row = get_fn(voucher) or {}
+            for col_idx, header in enumerate(headers, 1):
+                ws.cell(row=row_idx, column=col_idx, value=str(row.get(header, "")))
         _auto_width(ws)
+
+    def _export_specimen_sheet(self, wb: Workbook, vouchers: list[str], errors: list[str]) -> None:
+        from .models import SPECIMEN_HEADERS
+        self._export_data_sheet(wb, "标本信息", SPECIMEN_HEADERS, self.store.get_specimen, vouchers, errors)
 
     def _export_classification_sheet(self, wb: Workbook, vouchers: list[str], errors: list[str]) -> None:
-        """导出分类信息 sheet。"""
         from .models import CLASSIFICATION_HEADERS
-
-        ws = wb.create_sheet("分类信息")
-        _write_header_row(ws, CLASSIFICATION_HEADERS)
-        for row_idx, voucher in enumerate(vouchers, 2):
-            classification = self.store.get_classification(voucher) or {}
-            for col_idx, header in enumerate(CLASSIFICATION_HEADERS, 1):
-                ws.cell(row=row_idx, column=col_idx, value=str(classification.get(header, "")))
-        _auto_width(ws)
+        self._export_data_sheet(wb, "分类信息", CLASSIFICATION_HEADERS, self.store.get_classification, vouchers, errors)
 
     def _export_photo_paths_sheet(self, wb: Workbook, vouchers: list[str], errors: list[str]) -> None:
         """导出照片路径清单 sheet。

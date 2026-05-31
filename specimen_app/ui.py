@@ -144,10 +144,29 @@ from .workspace import (
     is_unsafe_workspace_root,
 )
 
+# 状态列 → 对应覆盖字段（管理员编辑模式使用）
+_STATUS_COLUMN_TO_OVERRIDE_FIELD = {
+    SPECIMEN_STATUS_COLUMN: SPECIMEN_OVERRIDE_FIELD,
+    PHOTO_STATUS_COLUMN: PHOTO_OVERRIDE_FIELD,
+    CLASSIFICATION_STATUS_COLUMN: CLASS_OVERRIDE_FIELD,
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _wget(w) -> str:
+    """统一读取 QComboBox 或 QLineEdit 的当前文本。"""
+    return w.currentText() if isinstance(w, QComboBox) else w.text()
+
+
+def _wset(w, value: str) -> None:
+    """统一设置 QComboBox 或 QLineEdit 的当前文本。"""
+    if isinstance(w, QComboBox):
+        w.setCurrentText(value)
+    else:
+        w.setText(value)
+
 
 def grid_shape(count: int) -> tuple[int, int]:
     """根据照片数量计算最佳网格列数和行数。
@@ -1813,6 +1832,7 @@ class SpecimenWindow(QMainWindow):
     # ---- UI building ----
 
     def _build_ui(self) -> None:
+        _s = load_settings()  # 单次读取，_build_ui 内无 save_settings，安全复用
         # Toolbars: main + aux（规范化软件设计 2026-05 起，从单条工具栏拆为两条 + 可拖拽 + 可自定义）。
         # - 主工具栏（main_toolbar）默认可见，放高频按钮，按 file/edit/view/tools 四组用 separator 分隔。
         # - 辅助工具栏（aux_toolbar）默认隐藏，放低频按钮，视图菜单或自定义对话框打开。
@@ -1857,7 +1877,7 @@ class SpecimenWindow(QMainWindow):
         self._main_toolbar.addAction(history_action)
 
         # 应用辅栏可见性（settings 持久化，默认隐藏）。
-        self._aux_toolbar.setVisible(bool(load_settings().aux_toolbar_visible))
+        self._aux_toolbar.setVisible(bool(_s.aux_toolbar_visible))
 
         # Workspace bar
         ws_bar = QHBoxLayout()
@@ -1924,6 +1944,7 @@ class SpecimenWindow(QMainWindow):
         _ub_skip = QPushButton("跳过此版")
         _ub_skip.clicked.connect(self._upgrade_banner_skip)
         _ub_layout.addWidget(_ub_skip)
+        self._update_banner_label = _ub_text  # 缓存避免重复 findChild 调用
         self._update_banner.hide()
         central_layout.addWidget(self._update_banner)
 
@@ -2378,7 +2399,7 @@ class SpecimenWindow(QMainWindow):
         self.setCentralWidget(self.main_splitter)
 
         # Restore saved splitter sizes
-        saved = load_settings()
+        saved = _s
         if saved.splitter_sizes and len(saved.splitter_sizes) >= 2:
             try:
                 self.main_splitter.setSizes([int(x) for x in saved.splitter_sizes[0]])
@@ -2529,7 +2550,7 @@ class SpecimenWindow(QMainWindow):
         view_menu.addAction("操作历史", self.open_version_manager)
         # 辅助工具栏可见性切换（规范化软件设计 2026-05 新增）：状态持久化到 settings.aux_toolbar_visible
         self._aux_toolbar_action = QAction("辅助工具栏", self, checkable=True)
-        self._aux_toolbar_action.setChecked(load_settings().aux_toolbar_visible)
+        self._aux_toolbar_action.setChecked(_s.aux_toolbar_visible)
         self._aux_toolbar_action.toggled.connect(self._on_aux_toolbar_toggled)
         view_menu.addAction(self._aux_toolbar_action)
         # 自定义工具栏 / 自定义快捷键入口（D / E）
@@ -2579,7 +2600,7 @@ class SpecimenWindow(QMainWindow):
         self._current_recorder_combo.member_changed.connect(self._on_current_recorder_changed)
         # 加载团队库 + 预选 settings.current_recorder
         try:
-            current = load_settings().current_recorder
+            current = _s.current_recorder
             self._current_recorder_combo.refresh(preselect=current)
         except Exception:
             self._current_recorder_combo.refresh()
@@ -3206,6 +3227,17 @@ class SpecimenWindow(QMainWindow):
         log_path = self.store.data_dir / ALLOC_LOG_FILE
         self.statusBar().showMessage(f"任务已结束，记录保存至：{log_path}", 8000)
 
+    def _set_entry_actions_enabled(self, enabled: bool) -> None:
+        """统一启用/禁用新增编号相关按钮和菜单项。"""
+        tip = "" if enabled else "请先开始录入任务"
+        self._new_voucher_btn.setEnabled(enabled)
+        self._new_voucher_btn.setToolTip(tip)
+        if hasattr(self, "_batch_new_btn"):
+            self._batch_new_btn.setEnabled(enabled)
+            self._batch_new_btn.setToolTip(tip)
+        if hasattr(self, "_batch_new_specimens_action"):
+            self._batch_new_specimens_action.setEnabled(enabled)
+
     def _update_task_indicator(self) -> None:
         if not hasattr(self, "_task_label"):
             return
@@ -3231,26 +3263,14 @@ class SpecimenWindow(QMainWindow):
             self._task_indicator.setStyleSheet("#task_indicator { background: #d4edda; border-radius: 3px; }")
             self._task_start_btn.setVisible(False)
             self._task_end_btn.setVisible(True)
-            self._new_voucher_btn.setEnabled(True)
-            self._new_voucher_btn.setToolTip("")
-            if hasattr(self, "_batch_new_btn"):
-                self._batch_new_btn.setEnabled(True)
-                self._batch_new_btn.setToolTip("")
-            if hasattr(self, "_batch_new_specimens_action"):
-                self._batch_new_specimens_action.setEnabled(True)
+            self._set_entry_actions_enabled(True)
         else:
             self._task_label.setText("未开始任务")
             self._task_label.setStyleSheet("color: #888;")
             self._task_indicator.setStyleSheet("")
             self._task_start_btn.setVisible(True)
             self._task_end_btn.setVisible(False)
-            self._new_voucher_btn.setEnabled(False)
-            self._new_voucher_btn.setToolTip("请先开始录入任务")
-            if hasattr(self, "_batch_new_btn"):
-                self._batch_new_btn.setEnabled(False)
-                self._batch_new_btn.setToolTip("请先开始录入任务")
-            if hasattr(self, "_batch_new_specimens_action"):
-                self._batch_new_specimens_action.setEnabled(False)
+            self._set_entry_actions_enabled(False)
 
     def _open_batch_generate(self) -> None:
         if self.store is None:
@@ -4013,7 +4033,7 @@ class SpecimenWindow(QMainWindow):
             for field in CARRY_OVER_SPECIMEN_FIELDS:
                 w = self.specimen_widgets.get(field)
                 if w is not None:
-                    val = w.currentText() if isinstance(w, QComboBox) else w.text()
+                    val = _wget(w)
                     if val.strip():
                         _pinned[field] = val.strip()
         self._loading = True
@@ -4027,15 +4047,7 @@ class SpecimenWindow(QMainWindow):
             widget.blockSignals(True)
             # 字段固定：当前编辑器中已修改的 CARRY_OVER 字段值保持不变
             val = _pinned.get(field) if _pinned else None
-            if val is not None:
-                if isinstance(widget, QComboBox):
-                    widget.setCurrentText(val)
-                else:
-                    widget.setText(val)
-            elif isinstance(widget, QComboBox):
-                widget.setCurrentText(str(specimen.get(field, "")))
-            else:
-                widget.setText(str(specimen.get(field, "")))
+            _wset(widget, val if val is not None else str(specimen.get(field, "")))
             widget.blockSignals(False)
         for field, widget in self.class_widgets.items():
             widget.blockSignals(True)
@@ -4191,7 +4203,7 @@ class SpecimenWindow(QMainWindow):
                 updates = {}
                 for field in fields:
                     widget = self.specimen_widgets[field]
-                    updates[field] = widget.currentText() if isinstance(widget, QComboBox) else widget.text()
+                    updates[field] = _wget(widget)
                 changed = self.store.set_fields("specimen", voucher, updates)
                 if changed:
                     specimen = self.store.get_specimen(voucher) or {}
@@ -4200,11 +4212,7 @@ class SpecimenWindow(QMainWindow):
                         for auto_field in ("采集日期", "采集地缩写*", "保存方式"):
                             widget = self.specimen_widgets[auto_field]
                             widget.blockSignals(True)
-                            value = str(specimen.get(auto_field, ""))
-                            if isinstance(widget, QComboBox):
-                                widget.setCurrentText(value)
-                            else:
-                                widget.setText(value)
+                            _wset(widget, str(specimen.get(auto_field, "")))
                             widget.blockSignals(False)
                     finally:
                         self._loading = False
@@ -4223,11 +4231,7 @@ class SpecimenWindow(QMainWindow):
                 for field in fields:
                     widget = widgets[field]
                     widget.blockSignals(True)
-                    stored = str(row.get(field, ""))
-                    if isinstance(widget, QComboBox):
-                        widget.setCurrentText(stored)
-                    else:
-                        widget.setText(stored)
+                    _wset(widget, str(row.get(field, "")))
                     widget.blockSignals(False)
             except Exception:
                 pass
@@ -4244,7 +4248,7 @@ class SpecimenWindow(QMainWindow):
         try:
             if category == "specimen":
                 widget = self.specimen_widgets[field]
-                value = widget.currentText() if isinstance(widget, QComboBox) else widget.text()
+                value = _wget(widget)
                 changed = self.store.set_fields("specimen", voucher, {field: value})
                 if changed:
                     specimen = self.store.get_specimen(voucher) or {}
@@ -4253,11 +4257,7 @@ class SpecimenWindow(QMainWindow):
                     for auto_field in ("采集日期", "采集地缩写*", "保存方式"):
                         w = self.specimen_widgets[auto_field]
                         w.blockSignals(True)
-                        value = str(specimen.get(auto_field, ""))
-                        if isinstance(w, QComboBox):
-                            w.setCurrentText(value)
-                        else:
-                            w.setText(value)
+                        _wset(w, str(specimen.get(auto_field, "")))
                         w.blockSignals(False)
                     self._loading = False
             elif category == "classification":
@@ -4291,11 +4291,7 @@ class SpecimenWindow(QMainWindow):
                     row = self.store.get_specimen(voucher) or {}
                     widget = self.specimen_widgets[field]
                     widget.blockSignals(True)
-                    stored = str(row.get(field, ""))
-                    if isinstance(widget, QComboBox):
-                        widget.setCurrentText(stored)
-                    else:
-                        widget.setText(stored)
+                    _wset(widget, str(row.get(field, "")))
                     widget.blockSignals(False)
                 elif category == "classification":
                     row = self.store.get_classification(voucher) or {}
@@ -6171,12 +6167,8 @@ class SpecimenWindow(QMainWindow):
                 widget = self.specimen_widgets.get(field)
                 if widget is None:
                     continue
-                value = str(specimen.get(field, "") or "")
                 widget.blockSignals(True)
-                if isinstance(widget, QComboBox):
-                    widget.setCurrentText(value)
-                else:
-                    widget.setText(value)
+                _wset(widget, str(specimen.get(field, "") or ""))
                 widget.blockSignals(False)
         finally:
             self._loading = False
@@ -7152,7 +7144,7 @@ class SpecimenWindow(QMainWindow):
             return
         self._update_banner_release = None  # 清掉旧 release 引用避免误触
         self._pending_update_ready_for_banner = pending
-        label = banner.findChild(QLabel, "_update_banner_text")
+        label = getattr(self, "_update_banner_label", None)
         if label is not None:
             label.setText(
                 f"✅ v{pending.version} 已下载就绪 · 点击「立即安装」即刻重启升级"
@@ -7172,7 +7164,7 @@ class SpecimenWindow(QMainWindow):
             )
             return
         self._update_banner_release = release
-        label = banner.findChild(QLabel, "_update_banner_text")
+        label = getattr(self, "_update_banner_label", None)
         if label is not None:
             # 发布说明第一行截断预览（VS Code 风格：让用户知道更新了什么）
             notes_preview = ""
@@ -8986,16 +8978,11 @@ class IngestSummaryDialog(QDialog):
         if not voucher:
             return
         value = item.text()
-        _STATUS_OVERRIDE_MAP = {
-            SPECIMEN_STATUS_COLUMN: SPECIMEN_OVERRIDE_FIELD,
-            PHOTO_STATUS_COLUMN: PHOTO_OVERRIDE_FIELD,
-            CLASSIFICATION_STATUS_COLUMN: CLASS_OVERRIDE_FIELD,
-        }
-        if col in _STATUS_OVERRIDE_MAP:
+        if col in _STATUS_COLUMN_TO_OVERRIDE_FIELD:
             # 状态列写覆盖字段
             self.store.set_fields(
                 "specimen", voucher,
-                {_STATUS_OVERRIDE_MAP[col]: value},
+                {_STATUS_COLUMN_TO_OVERRIDE_FIELD[col]: value},
                 action_type="admin_manual_edit",
                 admin_name=self._admin_name,
             )
@@ -9025,17 +9012,12 @@ class IngestSummaryDialog(QDialog):
         if dlg.exec_() == QDialog.Accepted:
             target_vouchers = dlg.resolved_vouchers
             new_value = dlg.new_value
-            _STATUS_OVERRIDE_MAP = {
-                SPECIMEN_STATUS_COLUMN: SPECIMEN_OVERRIDE_FIELD,
-                PHOTO_STATUS_COLUMN: PHOTO_OVERRIDE_FIELD,
-                CLASSIFICATION_STATUS_COLUMN: CLASS_OVERRIDE_FIELD,
-            }
             category, excel_field = SUMMARY_COLUMN_SOURCE.get(col_name, ("readonly", col_name))
             for voucher in target_vouchers:
-                if col_name in _STATUS_OVERRIDE_MAP:
+                if col_name in _STATUS_COLUMN_TO_OVERRIDE_FIELD:
                     self.store.set_fields(
                         "specimen", voucher,
-                        {_STATUS_OVERRIDE_MAP[col_name]: new_value},
+                        {_STATUS_COLUMN_TO_OVERRIDE_FIELD[col_name]: new_value},
                         action_type="admin_manual_edit",
                         admin_name=self._admin_name,
                     )
@@ -9984,8 +9966,7 @@ class BatchSpecimenFieldsDialog(QDialog):
         for field, (checkbox, editor) in self._rows.items():
             if not checkbox.isChecked():
                 continue
-            value = editor.currentText() if isinstance(editor, QComboBox) else editor.text()
-            updates[field] = value.strip()
+            updates[field] = _wget(editor).strip()
         return updates
 
 
@@ -10383,10 +10364,7 @@ class _AdminBatchEditDialog(QDialog):
         if not vouchers:
             QMessageBox.warning(self, "无目标", "未找到有效入库编号，请检查输入。")
             return
-        if isinstance(self._value_widget, QComboBox):
-            value = self._value_widget.currentText()
-        else:
-            value = self._value_widget.text()
+        value = _wget(self._value_widget)
         reply = QMessageBox.question(
             self, "确认批量修改",
             f"将把 {len(vouchers)} 条记录的「{self.col_name}」设为：「{value if value else '（空）'}」\n操作员：{self.admin_name}\n\n确认？",

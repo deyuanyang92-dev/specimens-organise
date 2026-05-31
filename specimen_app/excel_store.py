@@ -627,17 +627,8 @@ class ExcelStore:
             if tube:
                 tube_numbers[voucher] = tube
             class_row = class_by_voucher.get(voucher, {})
-            flags[voucher] = StatusFlags(
-                # 标本列：直接由"有实物"字段决定（旧：检查管内编号*/采集地缩写*等字段完整性）
-                specimen_complete=row.get(SPECIMEN_HAS_PHYSICAL, "") == "√",
-                has_photo=self._resolve_status(
-                    row.get(PHOTO_OVERRIDE_FIELD, ""),
-                    photo_counts.get(voucher, 0) > 0,
-                ),
-                classification_complete=self._resolve_status(
-                    row.get(CLASS_OVERRIDE_FIELD, ""),
-                    bool(class_row) and all(class_row.get(f, "") for f in CLASSIFICATION_REQUIRED),
-                ),
+            flags[voucher] = self._make_status_flags(
+                row, class_row, photo_counts.get(voucher, 0) > 0,
             )
         vouchers.sort(key=_voucher_sort_key)
         return {
@@ -775,6 +766,24 @@ class ExcelStore:
                 counts[v] = counts.get(v, 0) + 1
         return counts
 
+    def _make_status_flags(self, specimen_row, class_row, has_photo_bool: bool) -> StatusFlags:
+        """集中构造 StatusFlags，避免三处调用各自重复同一逻辑。"""
+        return StatusFlags(
+            # 标本列：管理员覆盖优先；无覆盖时由"有实物"字段决定（旧：检查管内编号*/采集地缩写*等字段完整性）
+            specimen_complete=self._resolve_status(
+                self._value(specimen_row, SPECIMEN_OVERRIDE_FIELD),
+                self._value(specimen_row, SPECIMEN_HAS_PHYSICAL) == "√",
+            ),
+            has_photo=self._resolve_status(
+                self._value(specimen_row, PHOTO_OVERRIDE_FIELD),
+                has_photo_bool,
+            ),
+            classification_complete=self._resolve_status(
+                self._value(specimen_row, CLASS_OVERRIDE_FIELD),
+                bool(class_row) and all(self._value(class_row, f) for f in CLASSIFICATION_REQUIRED),
+            ),
+        )
+
     @staticmethod
     def _resolve_status(override: str, auto: bool) -> bool:
         """管理员手动覆盖优先；覆盖字段为空则走自动计算逻辑（向后兼容）。"""
@@ -788,18 +797,7 @@ class ExcelStore:
         specimen = self.get_specimen(voucher) or {}
         classification = self.get_classification(voucher) or {}
         photos = self.get_photos(voucher)
-        return StatusFlags(
-            # 标本列：直接由"有实物"字段决定（旧：检查管内编号*/采集地缩写*等字段完整性）
-            specimen_complete=self._value(specimen, SPECIMEN_HAS_PHYSICAL) == "√",
-            has_photo=self._resolve_status(
-                self._value(specimen, PHOTO_OVERRIDE_FIELD),
-                bool(photos),
-            ),
-            classification_complete=self._resolve_status(
-                self._value(specimen, CLASS_OVERRIDE_FIELD),
-                bool(classification) and all(self._value(classification, f) for f in CLASSIFICATION_REQUIRED),
-            ),
-        )
+        return self._make_status_flags(specimen, classification, bool(photos))
 
     def all_status_flags(self) -> dict[str, StatusFlags]:
         specimens = self.read_rows("specimen")
@@ -817,18 +815,7 @@ class ExcelStore:
             if not v:
                 continue
             class_row = class_by_voucher.get(v, {})
-            result[v] = StatusFlags(
-                # 标本列：直接由"有实物"字段决定（旧：检查管内编号*/采集地缩写*等字段完整性）
-                specimen_complete=self._value(row, SPECIMEN_HAS_PHYSICAL) == "√",
-                has_photo=self._resolve_status(
-                    self._value(row, PHOTO_OVERRIDE_FIELD),
-                    v in photo_vouchers,
-                ),
-                classification_complete=self._resolve_status(
-                    self._value(row, CLASS_OVERRIDE_FIELD),
-                    bool(class_row) and all(self._value(class_row, f) for f in CLASSIFICATION_REQUIRED),
-                ),
-            )
+            result[v] = self._make_status_flags(row, class_row, v in photo_vouchers)
         return result
 
     def get_specimen(self, voucher: str) -> Row | None:
@@ -1689,12 +1676,18 @@ class ExcelStore:
             "归档状态": "仅记录",
         }
 
+    def _photo_position_for_index(self, rows: list, voucher: str, photo_index: int):
+        """Return the absolute row position of photo_index within voucher, or None if out of bounds."""
+        positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == voucher]
+        if photo_index < 0 or photo_index >= len(positions):
+            return None
+        return positions[photo_index]
+
     def delete_photo(self, voucher: str, photo_index: int) -> bool:
         rows = self.read_rows("photo")
-        matching_positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == voucher]
-        if photo_index < 0 or photo_index >= len(matching_positions):
+        position = self._photo_position_for_index(rows, voucher, photo_index)
+        if position is None:
             return False
-        position = matching_positions[photo_index]
         old_row = rows.pop(position)
         self._write_rows("photo", rows)
         self._delete_unreferenced_photo_file(old_row, rows)
@@ -1738,10 +1731,9 @@ class ExcelStore:
             return False
 
         rows = self.read_rows("photo")
-        matching_positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == voucher]
-        if photo_index < 0 or photo_index >= len(matching_positions):
+        position = self._photo_position_for_index(rows, voucher, photo_index)
+        if position is None:
             return False
-        position = matching_positions[photo_index]
         old_row = rows[position].copy()
         new_row = old_row.copy()
 
@@ -1779,10 +1771,9 @@ class ExcelStore:
         if field not in {"文件名", "描述"}:
             raise ValueError(f"不支持修改照片字段：{field}")
         rows = self.read_rows("photo")
-        matching_positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == voucher]
-        if photo_index < 0 or photo_index >= len(matching_positions):
+        position = self._photo_position_for_index(rows, voucher, photo_index)
+        if position is None:
             return False
-        position = matching_positions[photo_index]
         old_row = rows[position].copy()
         rows[position][field] = self._string(value)
         if old_row == rows[position]:
@@ -1795,10 +1786,9 @@ class ExcelStore:
 
     def _rename_photo_file(self, voucher: str, photo_index: int, filename: str) -> bool:
         rows = self.read_rows("photo")
-        matching_positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == voucher]
-        if photo_index < 0 or photo_index >= len(matching_positions):
+        position = self._photo_position_for_index(rows, voucher, photo_index)
+        if position is None:
             return False
-        position = matching_positions[photo_index]
         old_row = rows[position].copy()
         if self._value(old_row, "归档状态") == "仅记录":
             return self._set_photo_text_field(voucher, photo_index, "文件名", filename)
@@ -1832,10 +1822,9 @@ class ExcelStore:
     ) -> Row | None:
         self._reject_photos_linked_to_other_vouchers(voucher, [photo_path])
         rows = self.read_rows("photo")
-        matching_positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == voucher]
-        if photo_index < 0 or photo_index >= len(matching_positions):
+        position = self._photo_position_for_index(rows, voucher, photo_index)
+        if position is None:
             return None
-        position = matching_positions[photo_index]
         new_row = self._photo_row(
             voucher,
             photo_path,
