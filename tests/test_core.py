@@ -1041,6 +1041,28 @@ class CoreTests(unittest.TestCase):
         workspace.mkdir()
         self.assertFalse(is_unsafe_workspace_root(workspace))
 
+    def test_desktop_is_rejected_as_workspace_root(self) -> None:
+        from specimen_app.workspace import default_workspace, is_unsafe_workspace_root
+
+        desktop = self.tmp / "Desktop"
+        normal = self.tmp / "project_workspace"
+        for root in (desktop, normal):
+            (root / "数据").mkdir(parents=True)
+            (root / "数据" / "工作区配置.json").write_text("{}", encoding="utf-8")
+
+        with patch.object(Path, "home", return_value=self.tmp):
+            self.assertTrue(is_unsafe_workspace_root(desktop))
+            self.assertFalse(is_workspace(desktop))
+            with self.assertRaises(ValueError):
+                initialize_workspace(desktop)
+
+            fake_settings = SimpleNamespace(
+                last_workspace=str(desktop),
+                recent_workspaces=[str(desktop), str(normal)],
+            )
+            with patch("specimen_app.workspace.load_settings", return_value=fake_settings):
+                self.assertEqual(default_workspace(), normal.resolve())
+
     def test_image_decode_respects_pixel_cap(self) -> None:
         from specimen_app import image_cache
 

@@ -1628,9 +1628,10 @@ class SpecimenWindow(QMainWindow):
         if is_unsafe_workspace_root(path):
             QMessageBox.critical(
                 self, "目录范围过大",
-                f"不能把文件系统根目录、盘符根目录或用户主目录作为工作区：\n{path}\n\n"
+                f"不能把文件系统根目录、盘符根目录、用户主目录或桌面作为工作区：\n{path}\n\n"
                 "这类目录过大，软件的全工作区扫描（如图片索引）会遍历海量文件、可能拖垮电脑。\n"
-                "请选择实际保存数据和照片的子目录。",
+                "桌面也不能作为工作区，否则会把数据文件、日志和更新文件散在桌面上。\n"
+                "请选择实际保存数据和照片的专用子目录。",
             )
             return None
         if has_workspace_data(path):
@@ -6835,9 +6836,10 @@ class SpecimenWindow(QMainWindow):
         if is_unsafe_workspace_root(target_path):
             QMessageBox.critical(
                 self, "目录范围过大",
-                f"不能把文件系统根目录、盘符根目录或用户主目录作为工作区：\n{target_path}\n\n"
+                f"不能把文件系统根目录、盘符根目录、用户主目录或桌面作为工作区：\n{target_path}\n\n"
                 "这类目录过大，软件的全工作区扫描（如图片索引）会遍历海量文件、可能拖垮电脑。\n"
-                "请选择实际保存数据和照片的子目录。",
+                "桌面也不能作为工作区，否则会把数据文件、日志和更新文件散在桌面上。\n"
+                "请选择实际保存数据和照片的专用子目录。",
             )
             return
         create_workspace_files = False

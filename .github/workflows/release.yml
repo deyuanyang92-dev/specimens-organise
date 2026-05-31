@@ -36,6 +36,10 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Install Inno Setup (Windows installer)
+        if: matrix.platform == 'windows'
+        run: choco install innosetup --no-progress -y
+
       - name: Resolve version
         id: ver
         shell: bash
@@ -71,8 +75,10 @@ jobs:
 
             | 操作系统 | 下载文件 | 安装方式 |
             |---------|---------|--------|
-            | **Windows 10/11 64位** | [`setup_v${{ steps.ver.outputs.version }}_windows.zip`](https://github.com/deyuanyang92-dev/specimens-organise/releases/download/v${{ steps.ver.outputs.version }}/setup_v${{ steps.ver.outputs.version }}_windows.zip) | 解压 → 双击 `.exe` 运行 |
+            | **Windows 10/11 64位** | [`installer_v${{ steps.ver.outputs.version }}_windows.exe`](https://github.com/deyuanyang92-dev/specimens-organise/releases/download/v${{ steps.ver.outputs.version }}/installer_v${{ steps.ver.outputs.version }}_windows.exe) | 双击安装，可指定安装位置 |
             | **Linux (Ubuntu 20.04+)** | [`setup_v${{ steps.ver.outputs.version }}_linux.zip`](https://github.com/deyuanyang92-dev/specimens-organise/releases/download/v${{ steps.ver.outputs.version }}/setup_v${{ steps.ver.outputs.version }}_linux.zip) | 解压 → `chmod +x 文件名 && ./文件名` |
+
+            Windows 仍保留便携版 `setup_v*_windows.zip`：适合不想安装的用户。注意必须整体解压运行，不能只拷贝单个 `.exe`。
 
             ---
 
@@ -82,6 +88,7 @@ jobs:
 
             | 文件名 | 说明 | 能否直接运行 |
             |--------|------|------------|
+            | `installer_v*_windows.exe` | **Windows 标准安装器**，可指定安装位置 | ✅ 推荐 |
             | `setup_v*_windows.zip` | **完整包**，含 Python 运行时 | ✅ 解压即可运行 |
             | `app_v*_windows.zip` | 仅 app 代码，**无** Python DLL | ❌ 手动解压运行会报错 `Failed to load Python DLL` |
 
@@ -92,6 +99,8 @@ jobs:
             > `.sha256` 文件是完整性校验码，普通用户无需下载。
             > `update_manifest_*.json` 供应用内自动更新读取，无需手动处理。
           files: |
+            releases/v${{ steps.ver.outputs.version }}/installer_*.exe
+            releases/v${{ steps.ver.outputs.version }}/installer_*.exe.sha256
             releases/v${{ steps.ver.outputs.version }}/setup_*.zip
             releases/v${{ steps.ver.outputs.version }}/setup_*.zip.sha256
             releases/v${{ steps.ver.outputs.version }}/app_*.zip

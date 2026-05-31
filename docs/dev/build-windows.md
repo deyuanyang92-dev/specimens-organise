@@ -11,6 +11,9 @@
 
 构建完成后，将 `dist\标本入库管理\` 目录打包为 ZIP 分发即可。
 
+如机器已安装 Inno Setup 6，`build_release.py` 还会生成标准 Windows 安装器
+`installer_v*_windows.exe`。安装器支持选择安装位置，并创建开始菜单入口；不会创建桌面快捷方式。
+
 ---
 
 ## 手动安装
@@ -76,6 +79,8 @@ releases/v0.4.0/
   │   ├── 标本入库管理_v0.4.0.exe   # 主程序
   │   ├── *.dll                     # 依赖库
   │   └── ...
+  ├── setup_v0.4.0_windows.zip      # 便携完整包（整体解压后运行）
+  ├── installer_v0.4.0_windows.exe  # 标准安装器（需 Inno Setup 6）
   ├── build_info.json               # 构建信息
   ├── release_notes.md              # 发布说明
   └── sha256.txt                    # 校验文件
@@ -86,7 +91,25 @@ dist/标本入库管理/                    # 最新稳定版（同上目录结�
 
 ## 分发
 
-将 `dist\标本入库管理\` 整个目录压缩为 ZIP。用户解压后双击 EXE 即可运行，无需安装 Python。
+推荐发布 `installer_v*_windows.exe` 给普通用户：双击安装，可选择安装位置，从开始菜单启动。
+
+仍可发布 `setup_v*_windows.zip` 作为便携版。用户必须整体解压后运行，不能只复制单个 EXE；EXE 依赖同级 `_internal/` 目录。
+
+### 构建标准安装器
+
+安装 Inno Setup 6，并确保 `ISCC.exe` 在 PATH 中；或设置环境变量 `INNO_SETUP_COMPILER` 指向 `ISCC.exe`。
+
+```cmd
+python build_release.py --version 0.4.0
+```
+
+安装器行为：
+
+- 默认可选择当前用户或所有用户安装
+- 默认目录由 Windows 安装范围决定（当前用户为本地 Programs，所有用户为 Program Files）
+- 创建开始菜单快捷方式
+- 不创建桌面快捷方式
+- 安装目录内维护 `current\` 稳定入口，供内置升级使用
 
 ## 常见问题
 
