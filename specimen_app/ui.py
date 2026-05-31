@@ -62,6 +62,12 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QAbstractItemView
 
 from . import __version__
+from .theme import (
+    STATUS_OK, STATUS_OK_BG,
+    STATUS_ERR, STATUS_ERR_BG,
+    STATUS_NEUTRAL,
+    WARN_BG, WARN_TEXT, WARN_BORDER,
+)
 from .app_settings import (
     DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT,
     PHOTO_MANAGEMENT_OPTIONS,
@@ -154,6 +160,21 @@ _STATUS_COLUMN_TO_OVERRIDE_FIELD = {
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _status_item(value: str) -> QTableWidgetItem:
+    """创建带颜色的状态列 cell（√绿 / ×红 / 其他灰），居中对齐。"""
+    item = QTableWidgetItem(value)
+    item.setTextAlignment(Qt.AlignCenter)
+    if value == "√":
+        item.setForeground(QColor(STATUS_OK))
+        item.setBackground(QColor(STATUS_OK_BG))
+    elif value == "×":
+        item.setForeground(QColor(STATUS_ERR))
+        item.setBackground(QColor(STATUS_ERR_BG))
+    else:
+        item.setForeground(QColor(STATUS_NEUTRAL))
+    return item
+
 
 def _wget(w) -> str:
     """统一读取 QComboBox 或 QLineEdit 的当前文本。"""
@@ -1543,7 +1564,7 @@ class SpecimenWindow(QMainWindow):
         # 状态栏永久横幅
         try:
             ro_label = QLabel("🔒 只读副本 — 禁所有写入操作")
-            ro_label.setStyleSheet("color: #c14d4d; font-weight: bold; padding: 0 8px;")
+            ro_label.setStyleSheet(f"color: {STATUS_ERR}; font-weight: bold; padding: 0 8px;")
             self.statusBar().addPermanentWidget(ro_label)
         except Exception:
             pass
@@ -1912,8 +1933,8 @@ class SpecimenWindow(QMainWindow):
         )
         self._preset_warning_banner.setWordWrap(True)
         self._preset_warning_banner.setStyleSheet(
-            "background-color: #fff3cd; color: #856404; padding: 6px 12px;"
-            "border-bottom: 1px solid #ffc107;"
+            f"background-color: {WARN_BG}; color: {WARN_TEXT}; padding: 6px 12px;"
+            f"border-bottom: 1px solid {WARN_BORDER};"
         )
         self._preset_warning_banner.hide()
         central_layout.addWidget(self._preset_warning_banner)
@@ -1923,14 +1944,14 @@ class SpecimenWindow(QMainWindow):
         self._update_banner = QFrame()
         self._update_banner.setObjectName("_update_banner")
         self._update_banner.setStyleSheet(
-            "QFrame#_update_banner { background-color: #fff3cd; color: #856404; "
-            "border-bottom: 1px solid #ffc107; }"
+            f"QFrame#_update_banner {{ background-color: {WARN_BG}; color: {WARN_TEXT}; "
+            f"border-bottom: 1px solid {WARN_BORDER}; }}"
         )
         _ub_layout = QHBoxLayout(self._update_banner)
         _ub_layout.setContentsMargins(12, 6, 12, 6)
         _ub_text = QLabel("发现新版")
         _ub_text.setObjectName("_update_banner_text")
-        _ub_text.setStyleSheet("color: #856404;")
+        _ub_text.setStyleSheet(f"color: {WARN_TEXT};")
         _ub_layout.addWidget(_ub_text, stretch=1)
         _ub_detail = QPushButton("查看详情")
         _ub_detail.clicked.connect(self._upgrade_banner_detail)
@@ -1952,8 +1973,8 @@ class SpecimenWindow(QMainWindow):
         self._update_status_btn = QPushButton("[新版]")
         self._update_status_btn.setFlat(True)
         self._update_status_btn.setStyleSheet(
-            "QPushButton { color: #856404; font-size: 11px; border: none; padding: 0 6px; }"
-            "QPushButton:hover { text-decoration: underline; color: #533f03; }"
+            f"QPushButton {{ color: {WARN_TEXT}; font-size: 11px; border: none; padding: 0 6px; }}"
+            f"QPushButton:hover {{ text-decoration: underline; color: {WARN_BORDER}; }}"
         )
         self._update_status_btn.setToolTip("有可用更新，点击查看")
         self._update_status_btn.clicked.connect(self._on_update_status_clicked)
@@ -3265,8 +3286,8 @@ class SpecimenWindow(QMainWindow):
             self._task_label.setText(
                 f"● {person} · {status} · 认领 {claimed} · 入库 {ingested}"
             )
-            self._task_label.setStyleSheet("color: #1a7a1a; font-weight: bold;")
-            self._task_indicator.setStyleSheet("#task_indicator { background: #d4edda; border-radius: 3px; }")
+            self._task_label.setStyleSheet(f"color: {STATUS_OK}; font-weight: bold;")
+            self._task_indicator.setStyleSheet(f"#task_indicator {{ background: {STATUS_OK_BG}; border-radius: 3px; }}")
             self._task_start_btn.setVisible(False)
             self._task_end_btn.setVisible(True)
             self._set_entry_actions_enabled(True)
@@ -3709,9 +3730,9 @@ class SpecimenWindow(QMainWindow):
             pc = self._all_photo_counts.get(v, 0)
             claimed = "已认领" if pc > 0 else "未认领"
             self.voucher_table.setItem(i, 0, QTableWidgetItem(v))
-            self.voucher_table.setItem(i, 1, QTableWidgetItem(label[0]))
-            self.voucher_table.setItem(i, 2, QTableWidgetItem(label[1]))
-            self.voucher_table.setItem(i, 3, QTableWidgetItem(label[2]))
+            self.voucher_table.setItem(i, 1, _status_item(label[0]))
+            self.voucher_table.setItem(i, 2, _status_item(label[1]))
+            self.voucher_table.setItem(i, 3, _status_item(label[2]))
             self.voucher_table.setItem(i, 4, QTableWidgetItem(claimed))
             self.voucher_table.setItem(i, 5, QTableWidgetItem(str(pc)))
             # 关联照片列：显示逗号分隔的照片文件名（可通过复选框隐藏）
@@ -5845,7 +5866,7 @@ class SpecimenWindow(QMainWindow):
         if exc:
             self._current_qpixmap = None
             self._placeholder_label.setText(f"无法预览照片\n{exc}")
-            self._placeholder_label.setStyleSheet("color: #8b2f2f; font-size: 12px;")
+            self._placeholder_label.setStyleSheet(f"color: {STATUS_ERR}; font-size: 12px;")
             self._placeholder_label.show()
             self.statusBar().showMessage("照片预览加载失败")
             return
@@ -8690,7 +8711,7 @@ class IngestSummaryDialog(QDialog):
         # 管理员模式警示 banner（默认隐藏）
         self._admin_banner = QLabel()
         self._admin_banner.setStyleSheet(
-            "background:#cc3300;color:white;padding:4px 10px;"
+            f"background:{STATUS_ERR};color:white;padding:4px 10px;"
             "border-radius:3px;font-weight:bold;"
         )
         self._admin_banner.setVisible(False)
@@ -8929,7 +8950,7 @@ class IngestSummaryDialog(QDialog):
         """根据 _admin_mode 更新 UI 状态：按钮样式、banner、编辑触发器。"""
         if self._admin_mode:
             self._admin_mode_btn.setText(f"🔓 管理员：{self._admin_name}")
-            self._admin_mode_btn.setStyleSheet("background:#cc3300;color:white;font-weight:bold;")
+            self._admin_mode_btn.setStyleSheet(f"background:{STATUS_ERR};color:white;font-weight:bold;")
             self._admin_banner.setText(
                 f"⚠ 管理员编辑模式已启用 — 操作员：{self._admin_name}  |  "
                 "双击单元格可直接修改，修改将写入修改记录。点击右侧按钮退出。"
@@ -11253,8 +11274,8 @@ class BatchGenerateDialog(QDialog):
         )
         warn.setWordWrap(True)
         warn.setStyleSheet(
-            "background:#fff3cd; color:#856404;"
-            "border:1px solid #ffc107; border-radius:4px; padding:8px;"
+            f"background:{WARN_BG}; color:{WARN_TEXT};"
+            f"border:1px solid {WARN_BORDER}; border-radius:4px; padding:8px;"
         )
         layout.addRow(warn)
 
@@ -11579,7 +11600,7 @@ class BatchNewSpecimensDialog(QDialog):
             self._range_preview.setText(
                 f"将新增最多 {n} 条　（{s_text} … {e_text}，已存在编号自动跳过）"
             )
-            self._range_preview.setStyleSheet("color:#1a7a1a; font-size:11px;")
+            self._range_preview.setStyleSheet(f"color:{STATUS_OK}; font-size:11px;")
             self._ok_btn.setText(f"确认新增 {n} 条")
             self._ok_btn.setEnabled(True)
 
@@ -11615,7 +11636,7 @@ class ResetFromVoucherDialog(QDialog):
             "该编号及之后的所有内容将被清除，下一个新编号从此处连续。"
         )
         info.setWordWrap(True)
-        info.setStyleSheet("background:#fff3cd; color:#856404; border-radius:4px; padding:10px;")
+        info.setStyleSheet(f"background:{WARN_BG}; color:{WARN_TEXT}; border-radius:4px; padding:10px;")
         layout.addWidget(info)
 
         form = QFormLayout()
@@ -11769,7 +11790,7 @@ class CancelBatchReservationDialog(QDialog):
             "右键选中灰条行后使用「取消占位」。"
         )
         info.setWordWrap(True)
-        info.setStyleSheet("color:#155724; background:#d4edda; border-radius:4px; padding:8px;")
+        info.setStyleSheet(f"color:{STATUS_OK}; background:{STATUS_OK_BG}; border-radius:4px; padding:8px;")
         layout.addWidget(info)
 
         self._table = QTableWidget(0, 4)
@@ -11783,7 +11804,7 @@ class CancelBatchReservationDialog(QDialog):
 
         self._detail_lbl = QLabel("")
         self._detail_lbl.setWordWrap(True)
-        self._detail_lbl.setStyleSheet("color:#856404;")
+        self._detail_lbl.setStyleSheet(f"color:{WARN_TEXT};")
         layout.addWidget(self._detail_lbl)
 
         btns = QDialogButtonBox()
@@ -11904,7 +11925,7 @@ class AdminDeleteRangeDialog(QDialog):
             "删除后编号仍可复用（非永久废除）。操作需管理员密码。"
         )
         info.setWordWrap(True)
-        info.setStyleSheet("color:#155724; background:#d4edda; border-radius:4px; padding:8px;")
+        info.setStyleSheet(f"color:{STATUS_OK}; background:{STATUS_OK_BG}; border-radius:4px; padding:8px;")
         layout.addWidget(info)
 
         form = QFormLayout()
@@ -11918,7 +11939,7 @@ class AdminDeleteRangeDialog(QDialog):
 
         self._preview_lbl = QLabel("")
         self._preview_lbl.setWordWrap(True)
-        self._preview_lbl.setStyleSheet("color:#856404;")
+        self._preview_lbl.setStyleSheet(f"color:{WARN_TEXT};")
         layout.addWidget(self._preview_lbl)
 
         btns = QDialogButtonBox()
