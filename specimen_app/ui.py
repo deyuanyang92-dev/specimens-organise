@@ -3121,10 +3121,7 @@ class SpecimenWindow(QMainWindow):
         """打开系列管理对话框（非模态、单实例）。"""
         if self.store is None:
             return
-        dlg = getattr(self, "_series_mgr_dialog", None)
-        if dlg is not None and dlg.isVisible():
-            dlg.raise_()
-            dlg.activateWindow()
+        if self._focus_existing_dialog("_series_mgr_dialog"):
             return
         dlg = AccessionSeriesDialog(self.store, self)
         dlg.setAttribute(Qt.WA_DeleteOnClose)
@@ -3226,6 +3223,15 @@ class SpecimenWindow(QMainWindow):
         from .models import ALLOC_LOG_FILE
         log_path = self.store.data_dir / ALLOC_LOG_FILE
         self.statusBar().showMessage(f"任务已结束，记录保存至：{log_path}", 8000)
+
+    def _focus_existing_dialog(self, attr: str) -> bool:
+        """非模态单实例对话框：若已可见则聚焦并返回 True，否则返回 False。"""
+        dlg = getattr(self, attr, None)
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            return True
+        return False
 
     def _set_entry_actions_enabled(self, enabled: bool) -> None:
         """统一启用/禁用新增编号相关按钮和菜单项。"""
@@ -3332,10 +3338,7 @@ class SpecimenWindow(QMainWindow):
             return
         # 旧：exec_() 模态，阻塞主窗口。
         # 新：show() 非模态、单实例，已开着则聚焦。
-        dlg = getattr(self, "_reset_dialog", None)
-        if dlg is not None and dlg.isVisible():
-            dlg.raise_()
-            dlg.activateWindow()
+        if self._focus_existing_dialog("_reset_dialog"):
             return
         dlg = ResetFromVoucherDialog(self.store, self)
         dlg.setAttribute(Qt.WA_DeleteOnClose)
@@ -3349,10 +3352,7 @@ class SpecimenWindow(QMainWindow):
             return
         # 旧：exec_() 模态，阻塞主窗口。
         # 新：show() 非模态、单实例，已开着则聚焦。
-        dlg = getattr(self, "_admin_delete_dialog", None)
-        if dlg is not None and dlg.isVisible():
-            dlg.raise_()
-            dlg.activateWindow()
+        if self._focus_existing_dialog("_admin_delete_dialog"):
             return
         dlg = AdminDeleteRangeDialog(self.store, self)
         dlg.setAttribute(Qt.WA_DeleteOnClose)
@@ -3446,10 +3446,7 @@ class SpecimenWindow(QMainWindow):
             return
         # 旧：exec_() 模态。
         # 新：show() 非模态、单实例（只读审计日志）。
-        dlg = getattr(self, "_audit_log_dialog", None)
-        if dlg is not None and dlg.isVisible():
-            dlg.raise_()
-            dlg.activateWindow()
+        if self._focus_existing_dialog("_audit_log_dialog"):
             return
         dlg = VoucherAuditLogDialog(self.store, self)
         dlg.setAttribute(Qt.WA_DeleteOnClose)
@@ -3465,10 +3462,7 @@ class SpecimenWindow(QMainWindow):
         from .manual_voucher_dialog import ManualVoucherDialog
         # 旧：exec_() 模态。
         # 新：show() 非模态、单实例。
-        dlg = getattr(self, "_manual_voucher_dialog", None)
-        if dlg is not None and dlg.isVisible():
-            dlg.raise_()
-            dlg.activateWindow()
+        if self._focus_existing_dialog("_manual_voucher_dialog"):
             return
         dlg = ManualVoucherDialog(self.store, self)
         dlg.setAttribute(Qt.WA_DeleteOnClose)
@@ -3581,10 +3575,7 @@ class SpecimenWindow(QMainWindow):
         """工具菜单 → 入库人员记录（非模态、单实例）。"""
         if self.store is None:
             return
-        dlg = getattr(self, "_workload_dialog", None)
-        if dlg is not None and dlg.isVisible():
-            dlg.raise_()
-            dlg.activateWindow()
+        if self._focus_existing_dialog("_workload_dialog"):
             return
         from .persons_dialog import PersonsManagerDialog
         dlg = PersonsManagerDialog(self, workspace=self.workspace_root,
@@ -3969,10 +3960,7 @@ class SpecimenWindow(QMainWindow):
 
     def _open_persons_manager(self) -> None:
         """工具菜单 / 状态栏 → 人员管理（非模态、单实例）。"""
-        dlg = getattr(self, "_persons_mgr_dialog", None)
-        if dlg is not None and dlg.isVisible():
-            dlg.raise_()
-            dlg.activateWindow()
+        if self._focus_existing_dialog("_persons_mgr_dialog"):
             return
         from .persons_dialog import PersonsManagerDialog
         dlg = PersonsManagerDialog(self, workspace=self.workspace_root, store=self.store)
@@ -7058,10 +7046,7 @@ class SpecimenWindow(QMainWindow):
 
     def open_version_manager(self) -> None:
         """打开版本管理 / 操作历史（非模态、单实例）。"""
-        dlg = getattr(self, "_version_mgr_dialog", None)
-        if dlg is not None and dlg.isVisible():
-            dlg.raise_()
-            dlg.activateWindow()
+        if self._focus_existing_dialog("_version_mgr_dialog"):
             return
         dlg = VersionManagerDialog(self)
         dlg.setAttribute(Qt.WA_DeleteOnClose)
