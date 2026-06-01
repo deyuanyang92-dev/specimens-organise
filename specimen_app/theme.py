@@ -28,6 +28,18 @@ BG_PANEL = "#eef2f3"        # 面板 / 表头背景
 BG_BASE = "#ffffff"         # 输入框 / 菜单 / 表格基底
 SEL_BG = "#d8ebff"          # 表格行选中底色
 
+# ---- 语义状态色（用于状态指示器、banner、错误提示）----
+STATUS_OK      = "#2e7d32"  # 完成 / 成功：深绿
+STATUS_OK_BG   = "#e8f5e9"  # 完成背景：浅绿
+STATUS_ERR     = "#c62828"  # 缺失 / 错误：深红
+STATUS_ERR_BG  = "#ffebee"  # 错误背景：浅红
+STATUS_WARN    = "#e65100"  # 警告：深橙
+STATUS_WARN_BG = "#fff3e0"  # 警告背景：浅橙
+STATUS_NEUTRAL = "#546e7a"  # 中性 / 未知：蓝灰
+WARN_BG     = "#fff3cd"     # 告警 banner 背景（保留传统黄，语义化）
+WARN_TEXT   = "#856404"     # 告警 banner 文字
+WARN_BORDER = "#ffc107"     # 告警 banner 边框
+
 # ---- 全局样式表 ----
 # 只设颜色 / 边框 / 圆角 / 内边距 / hover-pressed-selected 态，不碰字体。
 APP_QSS = f"""
@@ -104,16 +116,21 @@ QHeaderView::section {{
     padding: 4px 6px;
     color: {TEXT};
 }}
+QHeaderView::section:hover {{
+    background: {ACCENT_LIGHT};
+    color: {ACCENT_DARK};
+}}
 QTableView, QTableWidget {{
     background: {BG_BASE};
     gridline-color: {BORDER};
     selection-background-color: {SEL_BG};
-    selection-color: {TEXT};
+    selection-color: {ACCENT_DARK};
     border: 1px solid {BORDER};
+    alternate-background-color: {BG_WINDOW};
 }}
 QTableView::item:selected, QTableWidget::item:selected {{
     background: {SEL_BG};
-    color: {TEXT};
+    color: {ACCENT_DARK};
 }}
 
 /* 工具栏 */
@@ -123,6 +140,17 @@ QToolBar {{
     border-bottom: 1px solid {BORDER};
     spacing: 4px;
     padding: 2px;
+}}
+
+/* Splitter：加细线，提升分隔感知 */
+QSplitter::handle {{
+    background: {BORDER};
+}}
+QSplitter::handle:horizontal {{
+    width: 1px;
+}}
+QSplitter::handle:vertical {{
+    height: 1px;
 }}
 
 /* 分组框 */
@@ -137,7 +165,7 @@ QGroupBox::title {{
     subcontrol-position: top left;
     left: 8px;
     padding: 0 4px;
-    color: {TEXT_DIM};
+    color: {ACCENT_DARK};
 }}
 
 /* 标签页 */
@@ -152,9 +180,17 @@ QTabBar::tab {{
     border-top-left-radius: 4px;
     border-top-right-radius: 4px;
     padding: 4px 12px;
+    color: {TEXT_DIM};
 }}
 QTabBar::tab:selected {{
     background: {BG_BASE};
+    color: {ACCENT};
+    border-top: 2px solid {ACCENT};
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
+}}
+QTabBar::tab:hover:!selected {{
+    background: {ACCENT_LIGHT};
     color: {ACCENT_DARK};
 }}
 
@@ -190,25 +226,35 @@ QScrollBar::add-page, QScrollBar::sub-page {{
  * widget 端用 setProperty("class", "xxx") + style().unpolish/polish 触发。
  * 集中规则避免每个 widget 重复 setStyleSheet,实测省 2-3MB QSS 解析对象。 */
 QPushButton[class="view-btn"] {{
-    border: 1px solid #aab;
+    border: 1px solid {BORDER};
     border-radius: 4px;
     padding: 4px 8px;
     font-weight: bold;
 }}
+QPushButton[class="view-btn"]:hover {{
+    background: {ACCENT_LIGHT};
+    border-color: {ACCENT};
+}}
 QPushButton[class="view-btn"]:checked {{
     background-color: {ACCENT};
+    border-color: {ACCENT_DARK};
     color: white;
 }}
 QPushButton[class="filter-btn"] {{
     font-size: 10px;
     padding: 1px 6px;
 }}
+QPushButton[class="filter-btn"]:hover {{
+    background: {ACCENT_LIGHT};
+    border-color: {ACCENT};
+}}
 QPushButton[class="filter-btn"]:checked {{
     background-color: {ACCENT};
+    border-color: {ACCENT_DARK};
     color: white;
 }}
 QToolButton[class="hint"] {{
-    color: #9aa4ad;
+    color: {TEXT_DIM};
     border: none;
 }}
 QToolButton[class="hint"]:hover {{

@@ -1072,16 +1072,13 @@ class _MatchTab(QWidget):
     # Apply
     # ------------------------------------------------------------------
 
+    def _targets_for_name(self, name: str) -> list:
+        """返回分类信息中种拉丁名等于 name 的入库编号列表（按 self._vouchers 或全库过滤）。"""
+        pool = self._vouchers if self._vouchers is not None else self._store.list_vouchers()
+        return [v for v in pool if (self._store.get_classification(v) or {}).get("种拉丁", "").strip() == name]
+
     def _count_affected(self, name: str) -> int:
-        if self._vouchers is not None:
-            return sum(
-                1 for v in self._vouchers
-                if (self._store.get_classification(v) or {}).get("种拉丁", "").strip() == name
-            )
-        return sum(
-            1 for v in self._store.list_vouchers()
-            if (self._store.get_classification(v) or {}).get("种拉丁", "").strip() == name
-        )
+        return len(self._targets_for_name(name))
 
     def _apply_to_store(self) -> None:
         overwrite = self._overwrite_cb.isChecked()
@@ -1098,16 +1095,7 @@ class _MatchTab(QWidget):
 
             name = self._row_names[row]
 
-            if self._vouchers is not None:
-                targets = [
-                    v for v in self._vouchers
-                    if (self._store.get_classification(v) or {}).get("种拉丁", "").strip() == name
-                ]
-            else:
-                targets = [
-                    v for v in self._store.list_vouchers()
-                    if (self._store.get_classification(v) or {}).get("种拉丁", "").strip() == name
-                ]
+            targets = self._targets_for_name(name)
 
             if not targets:
                 continue

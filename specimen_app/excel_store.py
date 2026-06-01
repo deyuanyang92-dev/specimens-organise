@@ -80,9 +80,17 @@ from .models import (
     PHOTO_FILENAME_COLUMN,
     PHOTO_HEADERS,
     PHOTO_PATH_COLUMN,
+    COLUMN_ALIASES,
     SPECIMEN_FILE,
     SPECIMEN_HEADERS,
     SPECIMEN_REQUIRED,
+    SPECIMEN_STATUS_COLUMN,
+    PHOTO_STATUS_COLUMN,
+    CLASSIFICATION_STATUS_COLUMN,
+    SPECIMEN_OVERRIDE_FIELD,
+    PHOTO_OVERRIDE_FIELD,
+    CLASS_OVERRIDE_FIELD,
+    SPECIMEN_HAS_PHYSICAL,
     SUMMARY_COLUMNS,
     SUMMARY_COLUMN_SOURCE,
     HeartbeatThreadStalled,
@@ -575,8 +583,15 @@ class ExcelStore:
         - ``tube_numbers``: dict[voucher -> str]
         - ``photo_filenames``: dict[voucher -> list[str]]
         """
-        # 只读必要列(具体字段集随 StatusFlags 必需字段变化)。
-        spec_cols = set(SPECIMEN_REQUIRED) | {"入库编号*", "管内编号*"}
+        # 只读必要列。⚠️ 修改此集合须谨慎：
+        #   SPECIMEN_HAS_PHYSICAL 必须在此（否则 specimen_complete 永远 False）。
+        #   SPECIMEN_OVERRIDE_FIELD 刻意不在此（见 _make_status_flags 保护注释）。
+        #   PHOTO_OVERRIDE_FIELD / CLASS_OVERRIDE_FIELD 必须在此（admin 覆盖照片/分类状态）。
+        spec_cols = {
+            "入库编号*", "管内编号*",
+            SPECIMEN_HAS_PHYSICAL,
+            PHOTO_OVERRIDE_FIELD, CLASS_OVERRIDE_FIELD,
+        }
         class_cols = set(CLASSIFICATION_REQUIRED) | {"入库编号*"}
         photo_cols = {"入库编号*", "文件名"}
 
@@ -615,10 +630,8 @@ class ExcelStore:
             if tube:
                 tube_numbers[voucher] = tube
             class_row = class_by_voucher.get(voucher, {})
-            flags[voucher] = StatusFlags(
-                specimen_complete=all(row.get(field, "") for field in SPECIMEN_REQUIRED),
-                has_photo=photo_counts.get(voucher, 0) > 0,
-                classification_complete=bool(class_row) and all(class_row.get(field, "") for field in CLASSIFICATION_REQUIRED),
+            flags[voucher] = self._make_status_flags(
+                row, class_row, photo_counts.get(voucher, 0) > 0,
             )
         vouchers.sort(key=_voucher_sort_key)
         return {
@@ -650,17 +663,21 @@ class ExcelStore:
             except StopIteration:
                 return
             headers = [self._string(v) for v in header_row]
-            # 预计算 wanted 列在 raw 中的 (idx, header) 列表,避免每行重判定。
+            # 向后兼容：wanted_columns 含新列名时也匹配旧列名（alias），输出归一为新名。
+            alias_reverse = {new: old for old, new in COLUMN_ALIASES.items()}
+            extra_wanted = {alias_reverse[h] for h in wanted_columns if h in alias_reverse}
+            effective_wanted = wanted_columns | extra_wanted
+            # 预计算 wanted 列在 raw 中的 (idx, canonical_header) 列表,避免每行重判定。
             wanted_idx: list[tuple[int, str]] = [
-                (i, h) for i, h in enumerate(headers) if h in wanted_columns
+                (i, COLUMN_ALIASES.get(h, h)) for i, h in enumerate(headers) if h in effective_wanted
             ]
             for raw in rows_iter:
                 row: dict[str, str] = {}
-                for idx, header in wanted_idx:
+                for idx, canonical in wanted_idx:
                     if idx < len(raw):
                         value = self._string(raw[idx])
                         if value != "":
-                            row[header] = value
+                            row[canonical] = value
                 if row:
                     yield row
         finally:
@@ -718,6 +735,22 @@ class ExcelStore:
                     record[col] = photo_abs_paths.get(voucher, [])
                 elif col == PHOTO_DESC_COLUMN:
                     record[col] = photo_descs.get(voucher, [])
+                elif col == SPECIMEN_STATUS_COLUMN:
+                    # 标本列：直接由"有实物"字段决定（旧：检查管内编号*/采集地缩写*等字段完整性）。
+                    # ⚠️ 与 _make_status_flags 保持一致：不走 SPECIMEN_OVERRIDE_FIELD（见保护注释）。
+                    record[col] = "√" if self._value(row, SPECIMEN_HAS_PHYSICAL) == "√" else "×"
+                elif col == PHOTO_STATUS_COLUMN:
+                    record[col] = "√" if self._resolve_status(
+                        self._value(row, PHOTO_OVERRIDE_FIELD),
+                        photo_counts.get(voucher, 0) > 0,
+                    ) else "×"
+                elif col == CLASSIFICATION_STATUS_COLUMN:
+                    record[col] = "√" if self._resolve_status(
+                        self._value(row, CLASS_OVERRIDE_FIELD),
+                        bool(class_row) and all(
+                            self._value(class_row, f) for f in CLASSIFICATION_REQUIRED
+                        ),
+                    ) else "×"
                 elif category == "classification":
                     record[col] = self._value(class_row, excel_field)
                 else:  # specimen 列与主键"入库编号*"都取自标本行
@@ -737,15 +770,42 @@ class ExcelStore:
                 counts[v] = counts.get(v, 0) + 1
         return counts
 
+    def _make_status_flags(self, specimen_row, class_row, has_photo_bool: bool) -> StatusFlags:
+        """集中构造 StatusFlags，避免三处调用各自重复同一逻辑。"""
+        return StatusFlags(
+            # 标本列：直接由"有实物"字段决定（旧：检查管内编号*/采集地缩写*等字段完整性）。
+            # ⚠️ 禁止改成 _resolve_status(SPECIMEN_OVERRIDE_FIELD, ...)：
+            #    旧数据中 "标本状态覆盖" 可能存有遗留 "×"（早期 bug 写入），
+            #    若走 override 检查会使 "有实物"=√ 的标本全部显示 ×（已知回归）。
+            #    admin 覆盖"标本"列时直接修改 "有实物" 字段，不需要 override 字段。
+            #    参见 v0.10.30 commit 99f42f5 "数据完整性修复"。
+            specimen_complete=self._value(specimen_row, SPECIMEN_HAS_PHYSICAL) == "√",
+            has_photo=self._resolve_status(
+                self._value(specimen_row, PHOTO_OVERRIDE_FIELD),
+                has_photo_bool,
+            ),
+            classification_complete=self._resolve_status(
+                self._value(specimen_row, CLASS_OVERRIDE_FIELD),
+                bool(class_row) and all(self._value(class_row, f) for f in CLASSIFICATION_REQUIRED),
+            ),
+        )
+
+    @staticmethod
+    def _resolve_status(override: str, auto: bool) -> bool:
+        """管理员手动覆盖优先；覆盖字段为空则走自动计算逻辑（向后兼容）。"""
+        if override == "√":
+            return True
+        if override == "×":
+            return False
+        return auto  # 旧：无覆盖字段时与此分支完全等价
+
     def status_for(self, voucher: str) -> StatusFlags:
         specimen = self.get_specimen(voucher) or {}
         classification = self.get_classification(voucher) or {}
         photos = self.get_photos(voucher)
-        return StatusFlags(
-            specimen_complete=all(self._value(specimen, field) for field in SPECIMEN_REQUIRED),
-            has_photo=bool(photos),
-            classification_complete=all(self._value(classification, field) for field in CLASSIFICATION_REQUIRED),
-        )
+        # specimen 是完整行（含所有列）；_make_status_flags 中 specimen_complete
+        # 只读 SPECIMEN_HAS_PHYSICAL，不读 SPECIMEN_OVERRIDE_FIELD（见保护注释）。
+        return self._make_status_flags(specimen, classification, bool(photos))
 
     def all_status_flags(self) -> dict[str, StatusFlags]:
         specimens = self.read_rows("specimen")
@@ -763,11 +823,7 @@ class ExcelStore:
             if not v:
                 continue
             class_row = class_by_voucher.get(v, {})
-            result[v] = StatusFlags(
-                specimen_complete=all(self._value(row, f) for f in SPECIMEN_REQUIRED),
-                has_photo=v in photo_vouchers,
-                classification_complete=bool(class_row) and all(self._value(class_row, f) for f in CLASSIFICATION_REQUIRED),
-            )
+            result[v] = self._make_status_flags(row, class_row, v in photo_vouchers)
         return result
 
     def get_specimen(self, voucher: str) -> Row | None:
@@ -1172,6 +1228,7 @@ class ExcelStore:
         updates: dict[str, Any],
         action_type: str = "update_fields",
         auto_derive_specimen_fields: bool = True,
+        admin_name: str = "",
     ) -> bool:
         """更新某入库编号在 specimen / classification 表中的若干字段。
 
@@ -1220,7 +1277,7 @@ class ExcelStore:
 
         self._write_rows(category, rows)
         new_row = rows[index].copy()
-        self._write_changes_and_summary(voucher, category, old_row, new_row, action_type)
+        self._write_changes_and_summary(voucher, category, old_row, new_row, action_type, admin_name=admin_name)
         self._update_index_fingerprint(voucher)
         self._record_action(action_type, voucher, category, "", old_row, new_row)
         return True
@@ -1627,12 +1684,18 @@ class ExcelStore:
             "归档状态": "仅记录",
         }
 
+    def _photo_position_for_index(self, rows: list, voucher: str, photo_index: int):
+        """Return the absolute row position of photo_index within voucher, or None if out of bounds."""
+        positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == voucher]
+        if photo_index < 0 or photo_index >= len(positions):
+            return None
+        return positions[photo_index]
+
     def delete_photo(self, voucher: str, photo_index: int) -> bool:
         rows = self.read_rows("photo")
-        matching_positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == voucher]
-        if photo_index < 0 or photo_index >= len(matching_positions):
+        position = self._photo_position_for_index(rows, voucher, photo_index)
+        if position is None:
             return False
-        position = matching_positions[photo_index]
         old_row = rows.pop(position)
         self._write_rows("photo", rows)
         self._delete_unreferenced_photo_file(old_row, rows)
@@ -1676,10 +1739,9 @@ class ExcelStore:
             return False
 
         rows = self.read_rows("photo")
-        matching_positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == voucher]
-        if photo_index < 0 or photo_index >= len(matching_positions):
+        position = self._photo_position_for_index(rows, voucher, photo_index)
+        if position is None:
             return False
-        position = matching_positions[photo_index]
         old_row = rows[position].copy()
         new_row = old_row.copy()
 
@@ -1717,10 +1779,9 @@ class ExcelStore:
         if field not in {"文件名", "描述"}:
             raise ValueError(f"不支持修改照片字段：{field}")
         rows = self.read_rows("photo")
-        matching_positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == voucher]
-        if photo_index < 0 or photo_index >= len(matching_positions):
+        position = self._photo_position_for_index(rows, voucher, photo_index)
+        if position is None:
             return False
-        position = matching_positions[photo_index]
         old_row = rows[position].copy()
         rows[position][field] = self._string(value)
         if old_row == rows[position]:
@@ -1733,10 +1794,9 @@ class ExcelStore:
 
     def _rename_photo_file(self, voucher: str, photo_index: int, filename: str) -> bool:
         rows = self.read_rows("photo")
-        matching_positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == voucher]
-        if photo_index < 0 or photo_index >= len(matching_positions):
+        position = self._photo_position_for_index(rows, voucher, photo_index)
+        if position is None:
             return False
-        position = matching_positions[photo_index]
         old_row = rows[position].copy()
         if self._value(old_row, "归档状态") == "仅记录":
             return self._set_photo_text_field(voucher, photo_index, "文件名", filename)
@@ -1770,10 +1830,9 @@ class ExcelStore:
     ) -> Row | None:
         self._reject_photos_linked_to_other_vouchers(voucher, [photo_path])
         rows = self.read_rows("photo")
-        matching_positions = [i for i, row in enumerate(rows) if self._value(row, "入库编号*") == voucher]
-        if photo_index < 0 or photo_index >= len(matching_positions):
+        position = self._photo_position_for_index(rows, voucher, photo_index)
+        if position is None:
             return None
-        position = matching_positions[photo_index]
         new_row = self._photo_row(
             voucher,
             photo_path,
@@ -3132,11 +3191,57 @@ class ExcelStore:
         current = str(self.config.get("data_schema_version", "1.0.0"))
         if _version_tuple(current) < _version_tuple("1.1.1"):
             self._migrate_hash_prefixed_photos()
-        if _version_tuple(current) < _version_tuple("1.1.3"):
-            self._migrate_rename_locality_column()
+        # 旧：_migrate_rename_locality_column() 自动重写 xlsx，违反向后兼容原则。
+        # 现：通过 COLUMN_ALIASES 在读取时内存归一（_read_plain_rows / _stream_columns），
+        # 不改写任何 Excel 文件。_migrate_rename_locality_column 方法保留但不再调用。
+        # ⚠️ 必须保留：旧工作区"有实物"列迁移。
+        # commit 203c8d6 把 specimen_complete 改为检查 SPECIMEN_HAS_PHYSICAL，
+        # 但只升级了 config 版本号，没有向旧 Excel 追加列，导致旧标本全部显示 ×。
+        # 此迁移用列存在性检查（不依赖版本号）确保幂等、向后兼容。
+        self._migrate_add_has_physical_column()
         if _version_tuple(current) < _version_tuple(CURRENT_DATA_SCHEMA_VERSION):
             self.config["data_schema_version"] = CURRENT_DATA_SCHEMA_VERSION
             self._save_config()
+
+    def _migrate_add_has_physical_column(self) -> None:
+        """v1.1.3 迁移：旧工作区 Excel "有实物"列全空时按旧逻辑自动推断初始值。
+
+        ⚠️ 保护注释：此方法在 _upgrade_workspace_schema 中调用，且必须保留。
+        若移除此调用，旧工作区所有标本将显示 × —— "有实物"列存在但全为空值。
+
+        幂等守卫用 config flag "has_physical_column_migrated"，而非检查列是否存在。
+        原因：_write_rows 写 Excel 时对 SPECIMEN_HEADERS 所有字段写 ""（空），
+        导致 read_rows 返回的 row dict 里"有实物" key 已存在但值为 ""。
+        用 key 存在性判断会错误跳过迁移（commit 2a06d64 的缺陷）。
+
+        迁移逻辑（向后兼容）：
+        - config flag 已设 → 立即返回
+        - 无标本 → 标记完成，返回
+        - 任意行"有实物"非空 → 用户已手动设置，跳过推断，标记完成
+        - 全部为空 → 按旧"必填字段是否全填"逻辑推断：
+            SPECIMEN_REQUIRED 字段（入库编号* + 管内编号* + 采集地缩写*）全非空 → "√"
+        参见：commit 203c8d6, 99f42f5, a35cd5b, 2a06d64。
+        """
+        # ⚠️ config flag 守卫：确保只执行一次（不依赖列存在性检查）
+        if self.config.get("has_physical_column_migrated"):
+            return
+
+        spec_path = self.data_dir / CATEGORY_FILES["specimen"]
+        rows = self.read_rows("specimen") if spec_path.exists() else []
+
+        # 无标本 或 已有非空值（用户手动设置）→ 跳过推断
+        if not rows or any(self._value(row, SPECIMEN_HAS_PHYSICAL) for row in rows):
+            self.config["has_physical_column_migrated"] = True
+            self._save_config()
+            return
+
+        # 全部为空：按旧必填字段逻辑推断初始值
+        for row in rows:
+            all_required = all(self._value(row, f) for f in SPECIMEN_REQUIRED)
+            row[SPECIMEN_HAS_PHYSICAL] = "√" if all_required else ""
+        self._write_rows("specimen", rows)
+        self.config["has_physical_column_migrated"] = True
+        self._save_config()
 
     def _migrate_rename_locality_column(self) -> None:
         """v1.1.2 → v1.1.3: 重命名标本信息列 '采集地点缩写*' → '采集地缩写*'。"""
@@ -3231,7 +3336,13 @@ class ExcelStore:
             return
         rows = self._read_plain_rows(path)
         existing_headers = self._headers(path)
-        missing = [header for header in headers if header not in existing_headers]
+        # 向后兼容：若新列名的旧别名已存在于文件中，则不视为缺失（避免双列并存）
+        alias_reverse = {new: old for old, new in COLUMN_ALIASES.items()}
+        missing = [
+            h for h in headers
+            if h not in existing_headers
+            and alias_reverse.get(h, h) not in existing_headers
+        ]
         if missing:
             self._write_plain_rows(path, existing_headers + missing, rows)
 
@@ -3786,7 +3897,7 @@ class ExcelStore:
         )
         self._write_plain_rows(self.data_dir / DATA_VERSION_LOG_FILE, DATA_VERSION_LOG_HEADERS, rows)
 
-    def _write_changes_and_summary(self, voucher: str, category: str, old_row: Row, new_row: Row, action_type: str) -> None:
+    def _write_changes_and_summary(self, voucher: str, category: str, old_row: Row, new_row: Row, action_type: str, admin_name: str = "") -> None:
         """Append field changes and update summary in a single file write."""
         now = self._now()
         path = self.data_dir / CHANGE_LOG_FILE
@@ -3802,17 +3913,18 @@ class ExcelStore:
                 old = self._value(old_row, field)
                 new = self._value(new_row, field)
                 if old != new:
-                    detail_rows.append(
-                        {
-                            "入库编号": voucher,
-                            "信息类别": DISPLAY_CATEGORY_NAMES[category],
-                            "字段名": field,
-                            "旧值": old,
-                            "新值": new,
-                            "修改时间": now,
-                            "操作类型": action_type,
-                        }
-                    )
+                    entry: Row = {
+                        "入库编号": voucher,
+                        "信息类别": DISPLAY_CATEGORY_NAMES[category],
+                        "字段名": field,
+                        "旧值": old,
+                        "新值": new,
+                        "修改时间": now,
+                        "操作类型": action_type,
+                    }
+                    if admin_name:
+                        entry["修改人"] = admin_name
+                    detail_rows.append(entry)
             if not any(self._value(row, "入库编号") == voucher for row in summary_rows):
                 summary_rows.append(
                     {
@@ -4687,6 +4799,11 @@ class ExcelStore:
                         row[header] = value
                 if row:  # 非空行才进数据
                     data.append(row)
+            # 向后兼容：重命名字段的旧列名 → 新列名（内存归一，不改写 Excel 文件）
+            for row in data:
+                for old_col, new_col in COLUMN_ALIASES.items():
+                    if old_col in row and new_col not in row:
+                        row[new_col] = row.pop(old_col)
             return data
         finally:
             wb.close()
@@ -4763,7 +4880,14 @@ class ExcelStore:
             wb.close()
 
     def _fit_headers(self, row: Row, headers: list[str]) -> Row:
-        return {header: self._string((row or {}).get(header, "")) for header in headers}
+        result = {}
+        for header in headers:
+            val = self._string((row or {}).get(header, ""))
+            if not val and header in COLUMN_ALIASES:
+                # header 是旧列名，_read_plain_rows 已将值归一到新列名下
+                val = self._string((row or {}).get(COLUMN_ALIASES[header], ""))
+            result[header] = val
+        return result
 
     def _value(self, row: Row | None, field: str) -> str:
         if not row:

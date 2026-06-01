@@ -34,8 +34,22 @@ SPECIMEN_HEADERS = [
     "标本存放位置",
     "信息录入人员",
     "核对人员",
+    "有实物",
     "备注",
+    # 管理员手动状态覆盖：""=自动计算 / "√"=强制完成 / "×"=强制未完成；不在右侧栏显示。
+    "标本状态覆盖",
+    "照片状态覆盖",
+    "分类状态覆盖",
 ]
+
+# 管理员专用状态覆盖字段 — 右侧栏表单跳过这些字段，仅在入库汇总里管理员可操作。
+SPECIMEN_OVERRIDE_FIELD = "标本状态覆盖"
+PHOTO_OVERRIDE_FIELD    = "照片状态覆盖"
+CLASS_OVERRIDE_FIELD    = "分类状态覆盖"
+SPECIMEN_HAS_PHYSICAL   = "有实物"
+SPECIMEN_ADMIN_ONLY_FIELDS = frozenset([
+    SPECIMEN_OVERRIDE_FIELD, PHOTO_OVERRIDE_FIELD, CLASS_OVERRIDE_FIELD,
+])
 
 PHOTO_HEADERS = [
     "入库编号*",
@@ -64,6 +78,7 @@ CHANGE_LOG_HEADERS = [
     "新值",
     "修改时间",
     "操作类型",
+    "修改人",   # 管理员手动编辑时填姓名，常规操作留空；_ensure_workbook 自动给老文件补空列
 ]
 
 CHANGE_SUMMARY_HEADERS = [
@@ -121,6 +136,13 @@ ALLOC_LOG_HEADERS = [
 SPECIMEN_REQUIRED = ["入库编号*", "管内编号*", "采集地缩写*"]
 CLASSIFICATION_REQUIRED = list(REQUIRED_CLASSIFICATION_COLUMNS)
 
+# 字段重命名向后兼容：旧列名 -> 新列名；读取时内存归一，不改写 Excel 文件。
+# 新增别名时在此追加，excel_store.py 的 _read_plain_rows / _stream_columns /
+# _ensure_workbook 会自动处理。
+COLUMN_ALIASES: dict[str, str] = {
+    "采集地点缩写*": "采集地缩写*",
+}
+
 SAVE_METHOD_OPTIONS = ["9E", "7E", "79", "RE", "FE"]
 
 # 录入加速：一批标本里往往相同的标本信息字段。用于"沿用上条"和"多选批量设置"。
@@ -139,9 +161,14 @@ PHOTO_PATH_COLUMN = "照片绝对路径"
 PHOTO_DESC_COLUMN = "照片描述"
 PHOTO_AGGREGATE_COLUMNS = [PHOTO_FILENAME_COLUMN, PHOTO_PATH_COLUMN, PHOTO_DESC_COLUMN]
 
-# 汇总表列顺序：入库编号* + 标本其余列 + 分类其余列（备注消歧）+ 照片数 + 照片聚合列。
+# 入库汇总状态列：与主窗口左侧栏"标本/照片/分类"列语义相同，只读，值为 √ 或 ×。
+SPECIMEN_STATUS_COLUMN = "标本"
+PHOTO_STATUS_COLUMN = "照片"
+CLASSIFICATION_STATUS_COLUMN = "分类"
+
+# 汇总表列顺序：入库编号* + 状态列 + 标本其余列 + 分类其余列（备注消歧）+ 照片数 + 照片聚合列。
 SUMMARY_COLUMNS = (
-    ["入库编号*"]
+    ["入库编号*", SPECIMEN_STATUS_COLUMN, PHOTO_STATUS_COLUMN, CLASSIFICATION_STATUS_COLUMN]
     + [col for col in SPECIMEN_HEADERS if col != "入库编号*"]
     + [
         CLASSIFICATION_NOTE_DISPLAY if col == "备注" else col
@@ -155,6 +182,9 @@ SUMMARY_COLUMNS = (
 # 汇总列 -> (category, excel_field)。category="readonly" 表示不可编辑（主键 / 计算列）。
 # 可编辑列回写时按 category 调 ExcelStore.set_fields(category, voucher, {excel_field: value})。
 SUMMARY_COLUMN_SOURCE: dict[str, tuple[str, str]] = {"入库编号*": ("readonly", "入库编号*")}
+SUMMARY_COLUMN_SOURCE[SPECIMEN_STATUS_COLUMN] = ("readonly", SPECIMEN_STATUS_COLUMN)
+SUMMARY_COLUMN_SOURCE[PHOTO_STATUS_COLUMN] = ("readonly", PHOTO_STATUS_COLUMN)
+SUMMARY_COLUMN_SOURCE[CLASSIFICATION_STATUS_COLUMN] = ("readonly", CLASSIFICATION_STATUS_COLUMN)
 for _col in SPECIMEN_HEADERS:
     if _col != "入库编号*":
         SUMMARY_COLUMN_SOURCE[_col] = ("specimen", _col)
@@ -171,6 +201,9 @@ del _col, _display
 # 入库汇总对话框默认显示的列（其余列默认隐藏，用户可在表头右键切换）。
 SUMMARY_DEFAULT_VISIBLE_COLUMNS = [
     "入库编号*",
+    SPECIMEN_STATUS_COLUMN,
+    PHOTO_STATUS_COLUMN,
+    CLASSIFICATION_STATUS_COLUMN,
     "管内编号*",
     "保存方式",
     "采集日期",

@@ -25,6 +25,8 @@ from specimen_app import __version__
 
 
 APP_NAME = "标本入库管理"
+APP_PUBLISHER = "Specimen Organise"
+APP_ID = "F19E4ED4-7A4A-46F7-A2A7-8D6E5F4B3A6D"
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -158,6 +160,149 @@ def _write_update_manifest(release_dir: Path, version: str, platform_tag: str, *
     manifest_path = release_dir / manifest_name
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return manifest_path
+
+
+def _find_inno_setup_compiler() -> Path | None:
+    """Return ISCC.exe when Inno Setup is available on Windows."""
+    if not IS_WINDOWS:
+        return None
+    env_path = os.environ.get("INNO_SETUP_COMPILER", "").strip()
+    candidates: list[Path] = []
+    if env_path:
+        candidates.append(Path(env_path))
+    for name in ("ISCC.exe", "ISCC"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(Path(found))
+    for base_env in ("ProgramFiles(x86)", "ProgramFiles"):
+        base = os.environ.get(base_env)
+        if base:
+            candidates.append(Path(base) / "Inno Setup 6" / "ISCC.exe")
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _iss_escape(value: str) -> str:
+    return value.replace("{", "{{").replace("}", "}}").replace('"', '""')
+
+
+def _write_inno_setup_script(
+    *,
+    release_dir: Path,
+    version: str,
+    versioned_dir: Path,
+    versioned_exe: Path,
+    icon_file: Path | None,
+) -> Path:
+    """Create an Inno Setup script for the Windows installer.
+
+    Layout after install:
+      {app}/releases/vX.Y.Z/<PyInstaller onedir bundle>
+      {app}/current -> releases/vX.Y.Z/<bundle>  (NTFS junction)
+
+    The Start Menu shortcut points at current/, so the app is launched in the
+    ``frozen-current`` mode expected by the built-in updater.
+    """
+    scripts_dir = release_dir / "installer"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    script_path = scripts_dir / f"installer_v{version}_windows.iss"
+    output_base = f"installer_v{version}_windows"
+    bundle_dest = f"{{app}}\\releases\\v{version}\\{versioned_dir.name}"
+    exe_name = versioned_exe.name
+    app_id = "{{" + APP_ID + "}"
+    icon_line = f'SetupIconFile="{_iss_escape(str(icon_file))}"' if icon_file and icon_file.exists() else ""
+    content = f'''#define MyAppName "{_iss_escape(APP_NAME)}"
+#define MyAppVersion "{_iss_escape(version)}"
+#define MyAppPublisher "{_iss_escape(APP_PUBLISHER)}"
+#define MyAppExeName "{_iss_escape(exe_name)}"
+
+[Setup]
+AppId={app_id}
+AppName={{#MyAppName}}
+AppVersion={{#MyAppVersion}}
+AppPublisher={{#MyAppPublisher}}
+DefaultDirName={{autopf}}\\{{#MyAppName}}
+DefaultGroupName={{#MyAppName}}
+DisableProgramGroupPage=no
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+OutputDir="{_iss_escape(str(release_dir))}"
+OutputBaseFilename={_iss_escape(output_base)}
+Compression=lzma2
+SolidCompression=yes
+WizardStyle=modern
+UninstallDisplayIcon={{app}}\\current\\{{#MyAppExeName}}
+{icon_line}
+
+[Files]
+Source: "{_iss_escape(str(versioned_dir))}\\*"; DestDir: "{bundle_dest}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[Icons]
+Name: "{{group}}\\{{#MyAppName}}"; Filename: "{{app}}\\current\\{{#MyAppExeName}}"; WorkingDir: "{{app}}\\current"
+Name: "{{group}}\\卸载 {{#MyAppName}}"; Filename: "{{uninstallexe}}"
+
+[Run]
+Filename: "{{cmd}}"; Parameters: "/C if exist ""{{app}}\\current"" rmdir ""{{app}}\\current"" & mklink /J ""{{app}}\\current"" ""{bundle_dest}"""; Flags: runhidden
+Filename: "{{app}}\\current\\{{#MyAppExeName}}"; Description: "启动 {{#MyAppName}}"; Flags: nowait postinstall skipifsilent unchecked
+
+[UninstallRun]
+Filename: "{{cmd}}"; Parameters: "/C if exist ""{{app}}\\current"" rmdir ""{{app}}\\current"""; Flags: runhidden
+
+[UninstallDelete]
+Type: filesandordirs; Name: "{{app}}\\releases"
+Type: dirifempty; Name: "{{app}}"
+'''
+    # UTF-8 BOM keeps older Inno Setup builds from misreading CJK text.
+    script_path.write_text(content, encoding="utf-8-sig")
+    return script_path
+
+
+def _build_windows_installer(
+    *,
+    release_dir: Path,
+    version: str,
+    versioned_dir: Path,
+    versioned_exe: Path,
+    icon_file: Path | None,
+) -> tuple[Path | None, str]:
+    """Build the optional Windows installer via Inno Setup.
+
+    Returns ``(installer_path, sha256_hex)``. When Inno Setup is not installed,
+    returns ``(None, "")`` and leaves the existing zip-based distribution intact.
+    """
+    if not IS_WINDOWS:
+        return None, ""
+    script_path = _write_inno_setup_script(
+        release_dir=release_dir,
+        version=version,
+        versioned_dir=versioned_dir,
+        versioned_exe=versioned_exe,
+        icon_file=icon_file,
+    )
+    compiler = _find_inno_setup_compiler()
+    if compiler is None:
+        print(
+            "[installer] WARNING: Inno Setup compiler not found; "
+            f"installer script written: {script_path}",
+            file=sys.stderr,
+        )
+        return None, ""
+    subprocess.run([str(compiler), str(script_path)], cwd=release_dir, check=True)
+    installer_path = release_dir / f"installer_v{version}_windows.exe"
+    if not installer_path.is_file():
+        raise FileNotFoundError(f"Inno Setup did not create expected installer: {installer_path}")
+    digest = sha256(installer_path)
+    (release_dir / f"{installer_path.name}.sha256").write_text(
+        f"{digest}  {installer_path.name}\n", encoding="utf-8"
+    )
+    return installer_path, digest
 
 
 def build_release(version: str, project_root: Path, icon_path: Path | None = None) -> Path:
@@ -319,10 +464,27 @@ def build_release(version: str, project_root: Path, icon_path: Path | None = Non
     print(f"[release] app-only ({app_zip_path.stat().st_size // 1024 // 1024} MB): {app_zip_path.name}")
     print(f"[release] runtime_hash={runtime_hash}  manifest={manifest_path.name}")
 
-    # sha256.txt 保留原有 exe 摘要行（向后兼容），并追加完整 zip 摘要行。
-    (release_dir / "sha256.txt").write_text(
-        f"{digest}  {versioned_exe.name}\n{zip_digest}  {zip_name}\n", encoding="utf-8"
+    installer_path, installer_digest = _build_windows_installer(
+        release_dir=release_dir,
+        version=version,
+        versioned_dir=versioned_dir,
+        versioned_exe=versioned_exe,
+        icon_file=icon_file,
     )
+    if installer_path is not None:
+        print(
+            f"[release] windows installer ({installer_path.stat().st_size // 1024 // 1024} MB): "
+            f"{installer_path.name}"
+        )
+
+    # sha256.txt 保留原有 exe 摘要行（向后兼容），并追加完整 zip 摘要行。
+    sha_lines = [
+        f"{digest}  {versioned_exe.name}",
+        f"{zip_digest}  {zip_name}",
+    ]
+    if installer_path is not None:
+        sha_lines.append(f"{installer_digest}  {installer_path.name}")
+    (release_dir / "sha256.txt").write_text("\n".join(sha_lines) + "\n", encoding="utf-8")
 
     build_info = {
         "app_name": APP_NAME,
@@ -339,6 +501,8 @@ def build_release(version: str, project_root: Path, icon_path: Path | None = Non
         "sha256": digest,
         "zip": zip_name,
         "zip_sha256": zip_digest,
+        "installer": installer_path.name if installer_path is not None else "",
+        "installer_sha256": installer_digest,
     }
     (release_dir / "build_info.json").write_text(json.dumps(build_info, ensure_ascii=False, indent=2), encoding="utf-8")
 

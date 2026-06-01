@@ -19,13 +19,28 @@
 
 ## 快速开始
 
-### 方式一：免安装便携版（推荐）
+### 方式一：Windows 安装器（推荐）
+
+像普通 Windows 软件一样安装，可选择安装位置，安装后从开始菜单启动。
+
+**Windows（Win 10/11 64位）**
+
+1. 前往 [Releases 页面](https://github.com/deyuanyang92-dev/specimens-organise/releases) 下载最新版 `installer_vX.X.X_windows.exe`
+2. 双击安装器
+3. 选择安装范围和安装位置
+4. 从开始菜单启动“标本入库管理”
+
+安装器只创建开始菜单入口，不会在桌面创建快捷方式。
+
+---
+
+### 方式二：免安装便携版
 
 无需安装 Python，下载即用。
 
 **Windows（Win 10/11 64位）**
 
-1. 前往 [Releases 页面](https://github.com/deyuanyang92-dev/specimens-organise/releases) 下载最新版 `标本入库管理_vX.X.X_windows.zip`（或 `_v00X_windows.zip`）
+1. 前往 [Releases 页面](https://github.com/deyuanyang92-dev/specimens-organise/releases) 下载最新版 `setup_vX.X.X_windows.zip`
 2. 解压到任意目录
 3. 双击 `标本入库管理_vX.X.X.exe` 启动
 
@@ -43,7 +58,7 @@ chmod +x 标本入库管理_vX.X.X
 
 ---
 
-### 方式二：从源码运行（开发 / 高级用户）
+### 方式三：从源码运行（开发 / 高级用户）
 
 **前提：Python 3.10 或更高版本**
 
@@ -126,7 +141,7 @@ python run_app.py --workspace "D:\我的标本数据"
 
 - 工作区可整体移动/复制/备份，数据不丢失
 - 外部照片默认复制进工作区 `照片/`，原文件不变
-- 不要将 `build/`、`dist/`、`releases/` 目录当作工作区
+- 不要将桌面、用户主目录、盘符根、`build/`、`dist/`、`releases/` 目录当作工作区
 
 ---
 
@@ -171,7 +186,7 @@ sudo apt install fonts-noto-cjk
 # 运行测试
 python -m unittest discover -s tests
 
-# 构建 Windows EXE
+# 构建 Windows 便携包；Windows 且安装 Inno Setup 时会额外生成安装器
 python build_release.py --version 0.4.0
 
 # 一键构建（Windows，自动安装依赖）

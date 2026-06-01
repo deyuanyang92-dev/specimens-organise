@@ -27,6 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
@@ -223,6 +224,21 @@ def _open_cache() -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def _cache_connection():
+    """Context manager: open cache conn, yield it, always close (silently)."""
+    conn = None
+    try:
+        conn = _open_cache()
+        yield conn
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def _row_to_record(row: tuple) -> WoRMSRecord:
     """Convert a worms_taxa DB row (ordered by SELECT *) to WoRMSRecord."""
     # columns: aphia_id, status, valid_name, valid_aphia_id, phylum, class_name,
@@ -250,53 +266,36 @@ def lookup_cache(name: str) -> WoRMSRecord | None:
     name = name.strip()
     if not name:
         return None
-    # 规范化软件设计 2026-05 P1 审查修复:SQLite conn 在 try/finally 内关闭,
-    # 防止 execute/fetchone 抛异常时 conn 泄漏。
-    conn = None
     try:
-        conn = _open_cache()
-        cur = conn.execute(
-            "SELECT * FROM worms_taxa WHERE valid_name = ? COLLATE NOCASE LIMIT 1",
-            (name,),
-        )
-        row = cur.fetchone()
-        return _row_to_record(row) if row else None
+        with _cache_connection() as conn:
+            cur = conn.execute(
+                "SELECT * FROM worms_taxa WHERE valid_name = ? COLLATE NOCASE LIMIT 1",
+                (name,),
+            )
+            row = cur.fetchone()
+            return _row_to_record(row) if row else None
     except Exception:
         return None
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
 
 
 def write_to_cache(rec: WoRMSRecord) -> None:
     """Insert or replace *rec* in the local SQLite cache."""
-    # 规范化软件设计 2026-05 P1 审查修复:SQLite conn try/finally,防执行/提交异常泄漏。
-    conn = None
     try:
-        conn = _open_cache()
-        conn.execute(
-            """INSERT OR REPLACE INTO worms_taxa
-               (aphia_id, status, valid_name, valid_aphia_id,
-                phylum, class_name, ord, family, genus, authority, rank)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                rec.aphia_id, rec.status, rec.valid_name, rec.valid_aphia_id,
-                rec.phylum, rec.class_, rec.order, rec.family, rec.genus,
-                rec.authority, rec.rank,
-            ),
-        )
-        conn.commit()
+        with _cache_connection() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO worms_taxa
+                   (aphia_id, status, valid_name, valid_aphia_id,
+                    phylum, class_name, ord, family, genus, authority, rank)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    rec.aphia_id, rec.status, rec.valid_name, rec.valid_aphia_id,
+                    rec.phylum, rec.class_, rec.order, rec.family, rec.genus,
+                    rec.authority, rec.rank,
+                ),
+            )
+            conn.commit()
     except Exception:
         pass
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
 
 
 def query_worms_with_cache(name: str) -> WoRMSRecord | None:
@@ -460,43 +459,25 @@ def import_dwca(
 
 def cache_stats() -> dict:
     """Return ``{"count": int, "last_import": str | None}`` from the local cache."""
-    # P1 审查修复:try/finally conn close。
-    conn = None
     try:
-        conn = _open_cache()
-        row = conn.execute("SELECT COUNT(*) FROM worms_taxa").fetchone()
-        count = row[0] if row else 0
-        row2 = conn.execute(
-            "SELECT MAX(cached_at) FROM worms_taxa"
-        ).fetchone()
-        last_import = row2[0] if row2 else None
-        return {"count": count, "last_import": last_import}
+        with _cache_connection() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM worms_taxa").fetchone()
+            count = row[0] if row else 0
+            row2 = conn.execute("SELECT MAX(cached_at) FROM worms_taxa").fetchone()
+            last_import = row2[0] if row2 else None
+            return {"count": count, "last_import": last_import}
     except Exception:
         return {"count": 0, "last_import": None}
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
 
 
 def clear_cache() -> None:
     """Delete all rows from the local WoRMS cache table."""
-    # P1 审查修复:try/finally conn close。
-    conn = None
     try:
-        conn = _open_cache()
-        conn.execute("DELETE FROM worms_taxa")
-        conn.commit()
+        with _cache_connection() as conn:
+            conn.execute("DELETE FROM worms_taxa")
+            conn.commit()
     except Exception:
         pass
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
 
 
 def export_cache_gz(output_path: str | Path) -> int:

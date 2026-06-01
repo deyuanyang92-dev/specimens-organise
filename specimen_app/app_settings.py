@@ -96,7 +96,7 @@ class AppSettings:
     # 升级中心 v0.8.0 (D3 / D11 / D12 / D18):自动升级状态机 + Sparkle 风跳过此版本 +
     # Claude Code 风 channel 切换。旧 check_updates_on_startup=True 会在 load_settings()
     # 里一次性迁到 auto_update_mode="notify"。
-    auto_update_mode: str = "off"
+    auto_update_mode: str = "notify"  # 旧：off；新安装默认自动检查+通知，旧用户 settings.json 已有值不受影响
     auto_update_interval_hours: int = 24
     auto_update_pending_version: str = ""
     auto_update_install_dir: str = ""
@@ -141,9 +141,16 @@ def load_settings() -> AppSettings:
             data = json.load(handle)
     except (OSError, json.JSONDecodeError):
         return AppSettings()
-    show_grid_filenames = data.get("show_grid_filenames", True)
-    if not isinstance(show_grid_filenames, bool):
-        show_grid_filenames = True
+
+    def _bool(key, default=False):
+        v = data.get(key, default)
+        return v if isinstance(v, bool) else default
+
+    def _str_choice(key, options, default):
+        v = str(data.get(key, default))
+        return v if v in options else default
+
+    show_grid_filenames = _bool("show_grid_filenames", True)
     photo_filename_fill_shortcut = data.get("photo_filename_fill_shortcut", DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT)
     if not isinstance(photo_filename_fill_shortcut, str) or not photo_filename_fill_shortcut.strip():
         photo_filename_fill_shortcut = DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT
@@ -152,15 +159,9 @@ def load_settings() -> AppSettings:
         splitter_sizes = raw_sizes
     else:
         splitter_sizes = []
-    photo_management_mode = str(data.get("photo_management_mode", "copy_with_absolute"))
-    if photo_management_mode not in PHOTO_MANAGEMENT_OPTIONS:
-        photo_management_mode = "copy_with_absolute"
-    check_updates_on_startup = data.get("check_updates_on_startup", False)
-    if not isinstance(check_updates_on_startup, bool):
-        check_updates_on_startup = False
-    carry_over_specimen_fields = data.get("carry_over_specimen_fields", True)
-    if not isinstance(carry_over_specimen_fields, bool):
-        carry_over_specimen_fields = True
+    photo_management_mode = _str_choice("photo_management_mode", PHOTO_MANAGEMENT_OPTIONS, "copy_with_absolute")
+    check_updates_on_startup = _bool("check_updates_on_startup", False)
+    carry_over_specimen_fields = _bool("carry_over_specimen_fields", True)
     raw_summary_columns = data.get("summary_visible_columns", [])
     if isinstance(raw_summary_columns, list):
         summary_visible_columns = [str(item) for item in raw_summary_columns if item]
@@ -178,18 +179,12 @@ def load_settings() -> AppSettings:
         image_viewer_path = ""
     # 趣味光标样式：旧 settings.json 无此键 -> 默认箭头；非法值也回退默认。
     from .cursors import CURSOR_STYLE_OPTIONS  # 局部 import：cursors 只依赖 PyQt，无循环
-    cursor_style = str(data.get("cursor_style", "default"))
-    if cursor_style not in CURSOR_STYLE_OPTIONS:
-        cursor_style = "default"
+    cursor_style = _str_choice("cursor_style", CURSOR_STYLE_OPTIONS, "default")
     # 应用图标变体：旧 settings.json 无此键 -> 默认变体；非法值也回退默认。
     from .icon import APP_ICON_VARIANTS, DEFAULT_APP_ICON_VARIANT
-    app_icon_variant = str(data.get("app_icon_variant", DEFAULT_APP_ICON_VARIANT))
-    if app_icon_variant not in APP_ICON_VARIANTS:
-        app_icon_variant = DEFAULT_APP_ICON_VARIANT
+    app_icon_variant = _str_choice("app_icon_variant", APP_ICON_VARIANTS, DEFAULT_APP_ICON_VARIANT)
     # 自动保存：旧 settings.json 无此键 -> 默认 True（保持原有"一直自动保存"行为）。
-    auto_save_enabled = data.get("auto_save_enabled", True)
-    if not isinstance(auto_save_enabled, bool):
-        auto_save_enabled = True
+    auto_save_enabled = _bool("auto_save_enabled", True)
     # 工具栏布局（规范化软件设计 2026-05 新增）：dict 失败 -> 空 dict，启动时回落默认。
     raw_layout = data.get("toolbar_layout", {})
     toolbar_layout: dict = {}
@@ -198,9 +193,7 @@ def load_settings() -> AppSettings:
             raw_list = raw_layout.get(key, [])
             if isinstance(raw_list, list):
                 toolbar_layout[key] = [str(x) for x in raw_list if isinstance(x, str)]
-    aux_toolbar_visible = data.get("aux_toolbar_visible", False)
-    if not isinstance(aux_toolbar_visible, bool):
-        aux_toolbar_visible = False
+    aux_toolbar_visible = _bool("aux_toolbar_visible", False)
     raw_shortcuts = data.get("custom_shortcuts", {})
     custom_shortcuts: dict = {}
     if isinstance(raw_shortcuts, dict):
@@ -208,9 +201,7 @@ def load_settings() -> AppSettings:
             if isinstance(k, str) and isinstance(v, str):
                 custom_shortcuts[k] = v
     # 内存档位:旧 settings.json 无此键 -> "auto";非法值也回落 "auto"。
-    memory_profile = str(data.get("memory_profile", "auto"))
-    if memory_profile not in MEMORY_PROFILE_OPTIONS:
-        memory_profile = "auto"
+    memory_profile = _str_choice("memory_profile", MEMORY_PROFILE_OPTIONS, "auto")
     # 入库人员管理 2026-05:旧 settings.json 无此键 -> 空 list。
     raw_members = data.get("team_members", [])
     team_members: list = []
@@ -240,13 +231,9 @@ def load_settings() -> AppSettings:
     raw_skipped = data.get("auto_update_skipped_versions", [])
     auto_update_skipped_versions = [str(v) for v in raw_skipped if isinstance(v, str)] \
         if isinstance(raw_skipped, list) else []
-    auto_update_channel = str(data.get("auto_update_channel", "stable"))
-    if auto_update_channel not in AUTO_UPDATE_CHANNEL_OPTIONS:
-        auto_update_channel = "stable"
+    auto_update_channel = _str_choice("auto_update_channel", AUTO_UPDATE_CHANNEL_OPTIONS, "stable")
     upgrade_last_distribution_dir = str(data.get("upgrade_last_distribution_dir", ""))
-    upgrade_skip_current_init = data.get("upgrade_skip_current_init", False)
-    if not isinstance(upgrade_skip_current_init, bool):
-        upgrade_skip_current_init = False
+    upgrade_skip_current_init = _bool("upgrade_skip_current_init", False)
     voucher_table_font_delta = data.get("voucher_table_font_delta", 0)
     if not isinstance(voucher_table_font_delta, int) or isinstance(voucher_table_font_delta, bool):
         voucher_table_font_delta = 0
@@ -255,12 +242,8 @@ def load_settings() -> AppSettings:
     last_selected_voucher = str(data.get("last_selected_voucher", ""))
     last_search_text = str(data.get("last_search_text", ""))
     last_voucher_filter_key = str(data.get("last_voucher_filter_key", "all")) or "all"
-    last_photo_view_mode = str(data.get("last_photo_view_mode", "single"))
-    if last_photo_view_mode not in ("single", "grid"):
-        last_photo_view_mode = "single"
-    pending_update_use_modal_prompt = data.get("pending_update_use_modal_prompt", False)
-    if not isinstance(pending_update_use_modal_prompt, bool):
-        pending_update_use_modal_prompt = False
+    last_photo_view_mode = _str_choice("last_photo_view_mode", ("single", "grid"), "single")
+    pending_update_use_modal_prompt = _bool("pending_update_use_modal_prompt", False)
     return AppSettings(
         last_workspace=str(data.get("last_workspace", "")),
         recent_workspaces=[str(item) for item in data.get("recent_workspaces", []) if item],

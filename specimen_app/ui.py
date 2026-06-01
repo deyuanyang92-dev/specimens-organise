@@ -62,6 +62,12 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QAbstractItemView
 
 from . import __version__
+from .theme import (
+    STATUS_OK, STATUS_OK_BG,
+    STATUS_ERR, STATUS_ERR_BG,
+    STATUS_NEUTRAL,
+    WARN_BG, WARN_TEXT, WARN_BORDER,
+)
 from .app_settings import (
     DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT,
     PHOTO_MANAGEMENT_OPTIONS,
@@ -105,6 +111,14 @@ from .models import (
     PHOTO_COUNT_COLUMN,
     SAVE_METHOD_OPTIONS,
     SPECIMEN_HEADERS,
+    SPECIMEN_ADMIN_ONLY_FIELDS,
+    SPECIMEN_HAS_PHYSICAL,
+    SPECIMEN_OVERRIDE_FIELD,
+    PHOTO_OVERRIDE_FIELD,
+    CLASS_OVERRIDE_FIELD,
+    SPECIMEN_STATUS_COLUMN,
+    PHOTO_STATUS_COLUMN,
+    CLASSIFICATION_STATUS_COLUMN,
     SUMMARY_COLUMNS,
     SUMMARY_COLUMN_SOURCE,
     SUMMARY_DEFAULT_VISIBLE_COLUMNS,
@@ -136,10 +150,47 @@ from .workspace import (
     is_unsafe_workspace_root,
 )
 
+# 状态列 → 管理员编辑时写入的目标字段
+# ⚠️ SPECIMEN_STATUS_COLUMN 映射到 SPECIMEN_HAS_PHYSICAL（"有实物"），而非 SPECIMEN_OVERRIDE_FIELD。
+# 原因：specimen_complete 只读"有实物"，SPECIMEN_OVERRIDE_FIELD 被 _make_status_flags 忽略
+#       （见 excel_store.py 保护注释）。"有实物"是 checkbox 字段：仅接受 "√" 或 ""（非 "×"）。
+_STATUS_COLUMN_TO_OVERRIDE_FIELD = {
+    SPECIMEN_STATUS_COLUMN: SPECIMEN_HAS_PHYSICAL,
+    PHOTO_STATUS_COLUMN: PHOTO_OVERRIDE_FIELD,
+    CLASSIFICATION_STATUS_COLUMN: CLASS_OVERRIDE_FIELD,
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _status_item(value: str) -> QTableWidgetItem:
+    """创建带颜色的状态列 cell（√绿 / ×红 / 其他灰），居中对齐。"""
+    item = QTableWidgetItem(value)
+    item.setTextAlignment(Qt.AlignCenter)
+    if value == "√":
+        item.setForeground(QColor(STATUS_OK))
+        item.setBackground(QColor(STATUS_OK_BG))
+    elif value == "×":
+        item.setForeground(QColor(STATUS_ERR))
+        item.setBackground(QColor(STATUS_ERR_BG))
+    else:
+        item.setForeground(QColor(STATUS_NEUTRAL))
+    return item
+
+
+def _wget(w) -> str:
+    """统一读取 QComboBox 或 QLineEdit 的当前文本。"""
+    return w.currentText() if isinstance(w, QComboBox) else w.text()
+
+
+def _wset(w, value: str) -> None:
+    """统一设置 QComboBox 或 QLineEdit 的当前文本。"""
+    if isinstance(w, QComboBox):
+        w.setCurrentText(value)
+    else:
+        w.setText(value)
+
 
 def grid_shape(count: int) -> tuple[int, int]:
     """根据照片数量计算最佳网格列数和行数。
@@ -1516,7 +1567,7 @@ class SpecimenWindow(QMainWindow):
         # 状态栏永久横幅
         try:
             ro_label = QLabel("🔒 只读副本 — 禁所有写入操作")
-            ro_label.setStyleSheet("color: #c14d4d; font-weight: bold; padding: 0 8px;")
+            ro_label.setStyleSheet(f"color: {STATUS_ERR}; font-weight: bold; padding: 0 8px;")
             self.statusBar().addPermanentWidget(ro_label)
         except Exception:
             pass
@@ -1620,9 +1671,10 @@ class SpecimenWindow(QMainWindow):
         if is_unsafe_workspace_root(path):
             QMessageBox.critical(
                 self, "目录范围过大",
-                f"不能把文件系统根目录、盘符根目录或用户主目录作为工作区：\n{path}\n\n"
+                f"不能把文件系统根目录、盘符根目录、用户主目录或桌面作为工作区：\n{path}\n\n"
                 "这类目录过大，软件的全工作区扫描（如图片索引）会遍历海量文件、可能拖垮电脑。\n"
-                "请选择实际保存数据和照片的子目录。",
+                "桌面也不能作为工作区，否则会把数据文件、日志和更新文件散在桌面上。\n"
+                "请选择实际保存数据和照片的专用子目录。",
             )
             return None
         if has_workspace_data(path):
@@ -1804,6 +1856,7 @@ class SpecimenWindow(QMainWindow):
     # ---- UI building ----
 
     def _build_ui(self) -> None:
+        _s = load_settings()  # 单次读取，_build_ui 内无 save_settings，安全复用
         # Toolbars: main + aux（规范化软件设计 2026-05 起，从单条工具栏拆为两条 + 可拖拽 + 可自定义）。
         # - 主工具栏（main_toolbar）默认可见，放高频按钮，按 file/edit/view/tools 四组用 separator 分隔。
         # - 辅助工具栏（aux_toolbar）默认隐藏，放低频按钮，视图菜单或自定义对话框打开。
@@ -1848,7 +1901,7 @@ class SpecimenWindow(QMainWindow):
         self._main_toolbar.addAction(history_action)
 
         # 应用辅栏可见性（settings 持久化，默认隐藏）。
-        self._aux_toolbar.setVisible(bool(load_settings().aux_toolbar_visible))
+        self._aux_toolbar.setVisible(bool(_s.aux_toolbar_visible))
 
         # Workspace bar
         ws_bar = QHBoxLayout()
@@ -1883,8 +1936,8 @@ class SpecimenWindow(QMainWindow):
         )
         self._preset_warning_banner.setWordWrap(True)
         self._preset_warning_banner.setStyleSheet(
-            "background-color: #fff3cd; color: #856404; padding: 6px 12px;"
-            "border-bottom: 1px solid #ffc107;"
+            f"background-color: {WARN_BG}; color: {WARN_TEXT}; padding: 6px 12px;"
+            f"border-bottom: 1px solid {WARN_BORDER};"
         )
         self._preset_warning_banner.hide()
         central_layout.addWidget(self._preset_warning_banner)
@@ -1894,15 +1947,18 @@ class SpecimenWindow(QMainWindow):
         self._update_banner = QFrame()
         self._update_banner.setObjectName("_update_banner")
         self._update_banner.setStyleSheet(
-            "QFrame#_update_banner { background-color: #fff3cd; color: #856404; "
-            "border-bottom: 1px solid #ffc107; }"
+            f"QFrame#_update_banner {{ background-color: {WARN_BG}; color: {WARN_TEXT}; "
+            f"border-bottom: 1px solid {WARN_BORDER}; }}"
         )
         _ub_layout = QHBoxLayout(self._update_banner)
         _ub_layout.setContentsMargins(12, 6, 12, 6)
         _ub_text = QLabel("发现新版")
         _ub_text.setObjectName("_update_banner_text")
-        _ub_text.setStyleSheet("color: #856404;")
+        _ub_text.setStyleSheet(f"color: {WARN_TEXT};")
         _ub_layout.addWidget(_ub_text, stretch=1)
+        _ub_detail = QPushButton("查看详情")
+        _ub_detail.clicked.connect(self._upgrade_banner_detail)
+        _ub_layout.addWidget(_ub_detail)
         _ub_install = QPushButton("立即升级")
         _ub_install.clicked.connect(self._upgrade_banner_install)
         _ub_layout.addWidget(_ub_install)
@@ -1912,8 +1968,21 @@ class SpecimenWindow(QMainWindow):
         _ub_skip = QPushButton("跳过此版")
         _ub_skip.clicked.connect(self._upgrade_banner_skip)
         _ub_layout.addWidget(_ub_skip)
+        self._update_banner_label = _ub_text  # 缓存避免重复 findChild 调用
         self._update_banner.hide()
         central_layout.addWidget(self._update_banner)
+
+        # VS Code 风格状态栏持久更新徽标（点"稍后"后 banner 消失但此徽标保留）
+        self._update_status_btn = QPushButton("[新版]")
+        self._update_status_btn.setFlat(True)
+        self._update_status_btn.setStyleSheet(
+            f"QPushButton {{ color: {WARN_TEXT}; font-size: 11px; border: none; padding: 0 6px; }}"
+            f"QPushButton:hover {{ text-decoration: underline; color: {WARN_BORDER}; }}"
+        )
+        self._update_status_btn.setToolTip("有可用更新，点击查看")
+        self._update_status_btn.clicked.connect(self._on_update_status_clicked)
+        self._update_status_btn.hide()
+        self.statusBar().addPermanentWidget(self._update_status_btn)
 
         # Stacked: graphics view (single) + grid frame (grid)
         self._photo_stack_container = QWidget()
@@ -2219,10 +2288,16 @@ class SpecimenWindow(QMainWindow):
         sf_layout.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         sf_layout.setVerticalSpacing(6)
         for field in SPECIMEN_HEADERS:
+            if field in SPECIMEN_ADMIN_ONLY_FIELDS:
+                continue  # 旧：无此跳过；管理员专用覆盖字段不在右侧栏显示
             if field == "保存方式":
                 widget = QComboBox()
                 widget.addItems(SAVE_METHOD_OPTIONS)
                 widget.setEditable(True)
+                widget.currentTextChanged.connect(lambda text, f=field: self.schedule_save("specimen", f))
+            elif field == SPECIMEN_HAS_PHYSICAL:
+                widget = QComboBox()
+                widget.addItems(["", "√", "×"])
                 widget.currentTextChanged.connect(lambda text, f=field: self.schedule_save("specimen", f))
             else:
                 widget = QLineEdit()
@@ -2348,7 +2423,7 @@ class SpecimenWindow(QMainWindow):
         self.setCentralWidget(self.main_splitter)
 
         # Restore saved splitter sizes
-        saved = load_settings()
+        saved = _s
         if saved.splitter_sizes and len(saved.splitter_sizes) >= 2:
             try:
                 self.main_splitter.setSizes([int(x) for x in saved.splitter_sizes[0]])
@@ -2499,7 +2574,7 @@ class SpecimenWindow(QMainWindow):
         view_menu.addAction("操作历史", self.open_version_manager)
         # 辅助工具栏可见性切换（规范化软件设计 2026-05 新增）：状态持久化到 settings.aux_toolbar_visible
         self._aux_toolbar_action = QAction("辅助工具栏", self, checkable=True)
-        self._aux_toolbar_action.setChecked(load_settings().aux_toolbar_visible)
+        self._aux_toolbar_action.setChecked(_s.aux_toolbar_visible)
         self._aux_toolbar_action.toggled.connect(self._on_aux_toolbar_toggled)
         view_menu.addAction(self._aux_toolbar_action)
         # 自定义工具栏 / 自定义快捷键入口（D / E）
@@ -2549,7 +2624,7 @@ class SpecimenWindow(QMainWindow):
         self._current_recorder_combo.member_changed.connect(self._on_current_recorder_changed)
         # 加载团队库 + 预选 settings.current_recorder
         try:
-            current = load_settings().current_recorder
+            current = _s.current_recorder
             self._current_recorder_combo.refresh(preselect=current)
         except Exception:
             self._current_recorder_combo.refresh()
@@ -3070,10 +3145,7 @@ class SpecimenWindow(QMainWindow):
         """打开系列管理对话框（非模态、单实例）。"""
         if self.store is None:
             return
-        dlg = getattr(self, "_series_mgr_dialog", None)
-        if dlg is not None and dlg.isVisible():
-            dlg.raise_()
-            dlg.activateWindow()
+        if self._focus_existing_dialog("_series_mgr_dialog"):
             return
         dlg = AccessionSeriesDialog(self.store, self)
         dlg.setAttribute(Qt.WA_DeleteOnClose)
@@ -3176,6 +3248,26 @@ class SpecimenWindow(QMainWindow):
         log_path = self.store.data_dir / ALLOC_LOG_FILE
         self.statusBar().showMessage(f"任务已结束，记录保存至：{log_path}", 8000)
 
+    def _focus_existing_dialog(self, attr: str) -> bool:
+        """非模态单实例对话框：若已可见则聚焦并返回 True，否则返回 False。"""
+        dlg = getattr(self, attr, None)
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            return True
+        return False
+
+    def _set_entry_actions_enabled(self, enabled: bool) -> None:
+        """统一启用/禁用新增编号相关按钮和菜单项。"""
+        tip = "" if enabled else "请先开始录入任务"
+        self._new_voucher_btn.setEnabled(enabled)
+        self._new_voucher_btn.setToolTip(tip)
+        if hasattr(self, "_batch_new_btn"):
+            self._batch_new_btn.setEnabled(enabled)
+            self._batch_new_btn.setToolTip(tip)
+        if hasattr(self, "_batch_new_specimens_action"):
+            self._batch_new_specimens_action.setEnabled(enabled)
+
     def _update_task_indicator(self) -> None:
         if not hasattr(self, "_task_label"):
             return
@@ -3197,30 +3289,18 @@ class SpecimenWindow(QMainWindow):
             self._task_label.setText(
                 f"● {person} · {status} · 认领 {claimed} · 入库 {ingested}"
             )
-            self._task_label.setStyleSheet("color: #1a7a1a; font-weight: bold;")
-            self._task_indicator.setStyleSheet("#task_indicator { background: #d4edda; border-radius: 3px; }")
+            self._task_label.setStyleSheet(f"color: {STATUS_OK}; font-weight: bold;")
+            self._task_indicator.setStyleSheet(f"#task_indicator {{ background: {STATUS_OK_BG}; border-radius: 3px; }}")
             self._task_start_btn.setVisible(False)
             self._task_end_btn.setVisible(True)
-            self._new_voucher_btn.setEnabled(True)
-            self._new_voucher_btn.setToolTip("")
-            if hasattr(self, "_batch_new_btn"):
-                self._batch_new_btn.setEnabled(True)
-                self._batch_new_btn.setToolTip("")
-            if hasattr(self, "_batch_new_specimens_action"):
-                self._batch_new_specimens_action.setEnabled(True)
+            self._set_entry_actions_enabled(True)
         else:
             self._task_label.setText("未开始任务")
             self._task_label.setStyleSheet("color: #888;")
             self._task_indicator.setStyleSheet("")
             self._task_start_btn.setVisible(True)
             self._task_end_btn.setVisible(False)
-            self._new_voucher_btn.setEnabled(False)
-            self._new_voucher_btn.setToolTip("请先开始录入任务")
-            if hasattr(self, "_batch_new_btn"):
-                self._batch_new_btn.setEnabled(False)
-                self._batch_new_btn.setToolTip("请先开始录入任务")
-            if hasattr(self, "_batch_new_specimens_action"):
-                self._batch_new_specimens_action.setEnabled(False)
+            self._set_entry_actions_enabled(False)
 
     def _open_batch_generate(self) -> None:
         if self.store is None:
@@ -3282,10 +3362,7 @@ class SpecimenWindow(QMainWindow):
             return
         # 旧：exec_() 模态，阻塞主窗口。
         # 新：show() 非模态、单实例，已开着则聚焦。
-        dlg = getattr(self, "_reset_dialog", None)
-        if dlg is not None and dlg.isVisible():
-            dlg.raise_()
-            dlg.activateWindow()
+        if self._focus_existing_dialog("_reset_dialog"):
             return
         dlg = ResetFromVoucherDialog(self.store, self)
         dlg.setAttribute(Qt.WA_DeleteOnClose)
@@ -3299,10 +3376,7 @@ class SpecimenWindow(QMainWindow):
             return
         # 旧：exec_() 模态，阻塞主窗口。
         # 新：show() 非模态、单实例，已开着则聚焦。
-        dlg = getattr(self, "_admin_delete_dialog", None)
-        if dlg is not None and dlg.isVisible():
-            dlg.raise_()
-            dlg.activateWindow()
+        if self._focus_existing_dialog("_admin_delete_dialog"):
             return
         dlg = AdminDeleteRangeDialog(self.store, self)
         dlg.setAttribute(Qt.WA_DeleteOnClose)
@@ -3396,10 +3470,7 @@ class SpecimenWindow(QMainWindow):
             return
         # 旧：exec_() 模态。
         # 新：show() 非模态、单实例（只读审计日志）。
-        dlg = getattr(self, "_audit_log_dialog", None)
-        if dlg is not None and dlg.isVisible():
-            dlg.raise_()
-            dlg.activateWindow()
+        if self._focus_existing_dialog("_audit_log_dialog"):
             return
         dlg = VoucherAuditLogDialog(self.store, self)
         dlg.setAttribute(Qt.WA_DeleteOnClose)
@@ -3415,10 +3486,7 @@ class SpecimenWindow(QMainWindow):
         from .manual_voucher_dialog import ManualVoucherDialog
         # 旧：exec_() 模态。
         # 新：show() 非模态、单实例。
-        dlg = getattr(self, "_manual_voucher_dialog", None)
-        if dlg is not None and dlg.isVisible():
-            dlg.raise_()
-            dlg.activateWindow()
+        if self._focus_existing_dialog("_manual_voucher_dialog"):
             return
         dlg = ManualVoucherDialog(self.store, self)
         dlg.setAttribute(Qt.WA_DeleteOnClose)
@@ -3531,10 +3599,7 @@ class SpecimenWindow(QMainWindow):
         """工具菜单 → 入库人员记录（非模态、单实例）。"""
         if self.store is None:
             return
-        dlg = getattr(self, "_workload_dialog", None)
-        if dlg is not None and dlg.isVisible():
-            dlg.raise_()
-            dlg.activateWindow()
+        if self._focus_existing_dialog("_workload_dialog"):
             return
         from .persons_dialog import PersonsManagerDialog
         dlg = PersonsManagerDialog(self, workspace=self.workspace_root,
@@ -3668,9 +3733,9 @@ class SpecimenWindow(QMainWindow):
             pc = self._all_photo_counts.get(v, 0)
             claimed = "已认领" if pc > 0 else "未认领"
             self.voucher_table.setItem(i, 0, QTableWidgetItem(v))
-            self.voucher_table.setItem(i, 1, QTableWidgetItem(label[0]))
-            self.voucher_table.setItem(i, 2, QTableWidgetItem(label[1]))
-            self.voucher_table.setItem(i, 3, QTableWidgetItem(label[2]))
+            self.voucher_table.setItem(i, 1, _status_item(label[0]))
+            self.voucher_table.setItem(i, 2, _status_item(label[1]))
+            self.voucher_table.setItem(i, 3, _status_item(label[2]))
             self.voucher_table.setItem(i, 4, QTableWidgetItem(claimed))
             self.voucher_table.setItem(i, 5, QTableWidgetItem(str(pc)))
             # 关联照片列：显示逗号分隔的照片文件名（可通过复选框隐藏）
@@ -3919,10 +3984,7 @@ class SpecimenWindow(QMainWindow):
 
     def _open_persons_manager(self) -> None:
         """工具菜单 / 状态栏 → 人员管理（非模态、单实例）。"""
-        dlg = getattr(self, "_persons_mgr_dialog", None)
-        if dlg is not None and dlg.isVisible():
-            dlg.raise_()
-            dlg.activateWindow()
+        if self._focus_existing_dialog("_persons_mgr_dialog"):
             return
         from .persons_dialog import PersonsManagerDialog
         dlg = PersonsManagerDialog(self, workspace=self.workspace_root, store=self.store)
@@ -3983,7 +4045,7 @@ class SpecimenWindow(QMainWindow):
             for field in CARRY_OVER_SPECIMEN_FIELDS:
                 w = self.specimen_widgets.get(field)
                 if w is not None:
-                    val = w.currentText() if isinstance(w, QComboBox) else w.text()
+                    val = _wget(w)
                     if val.strip():
                         _pinned[field] = val.strip()
         self._loading = True
@@ -3997,15 +4059,7 @@ class SpecimenWindow(QMainWindow):
             widget.blockSignals(True)
             # 字段固定：当前编辑器中已修改的 CARRY_OVER 字段值保持不变
             val = _pinned.get(field) if _pinned else None
-            if val is not None:
-                if isinstance(widget, QComboBox):
-                    widget.setCurrentText(val)
-                else:
-                    widget.setText(val)
-            elif isinstance(widget, QComboBox):
-                widget.setCurrentText(str(specimen.get(field, "")))
-            else:
-                widget.setText(str(specimen.get(field, "")))
+            _wset(widget, val if val is not None else str(specimen.get(field, "")))
             widget.blockSignals(False)
         for field, widget in self.class_widgets.items():
             widget.blockSignals(True)
@@ -4161,7 +4215,7 @@ class SpecimenWindow(QMainWindow):
                 updates = {}
                 for field in fields:
                     widget = self.specimen_widgets[field]
-                    updates[field] = widget.currentText() if isinstance(widget, QComboBox) else widget.text()
+                    updates[field] = _wget(widget)
                 changed = self.store.set_fields("specimen", voucher, updates)
                 if changed:
                     specimen = self.store.get_specimen(voucher) or {}
@@ -4170,11 +4224,7 @@ class SpecimenWindow(QMainWindow):
                         for auto_field in ("采集日期", "采集地缩写*", "保存方式"):
                             widget = self.specimen_widgets[auto_field]
                             widget.blockSignals(True)
-                            value = str(specimen.get(auto_field, ""))
-                            if isinstance(widget, QComboBox):
-                                widget.setCurrentText(value)
-                            else:
-                                widget.setText(value)
+                            _wset(widget, str(specimen.get(auto_field, "")))
                             widget.blockSignals(False)
                     finally:
                         self._loading = False
@@ -4193,11 +4243,7 @@ class SpecimenWindow(QMainWindow):
                 for field in fields:
                     widget = widgets[field]
                     widget.blockSignals(True)
-                    stored = str(row.get(field, ""))
-                    if isinstance(widget, QComboBox):
-                        widget.setCurrentText(stored)
-                    else:
-                        widget.setText(stored)
+                    _wset(widget, str(row.get(field, "")))
                     widget.blockSignals(False)
             except Exception:
                 pass
@@ -4214,7 +4260,7 @@ class SpecimenWindow(QMainWindow):
         try:
             if category == "specimen":
                 widget = self.specimen_widgets[field]
-                value = widget.currentText() if isinstance(widget, QComboBox) else widget.text()
+                value = _wget(widget)
                 changed = self.store.set_fields("specimen", voucher, {field: value})
                 if changed:
                     specimen = self.store.get_specimen(voucher) or {}
@@ -4223,11 +4269,7 @@ class SpecimenWindow(QMainWindow):
                     for auto_field in ("采集日期", "采集地缩写*", "保存方式"):
                         w = self.specimen_widgets[auto_field]
                         w.blockSignals(True)
-                        value = str(specimen.get(auto_field, ""))
-                        if isinstance(w, QComboBox):
-                            w.setCurrentText(value)
-                        else:
-                            w.setText(value)
+                        _wset(w, str(specimen.get(auto_field, "")))
                         w.blockSignals(False)
                     self._loading = False
             elif category == "classification":
@@ -4261,11 +4303,7 @@ class SpecimenWindow(QMainWindow):
                     row = self.store.get_specimen(voucher) or {}
                     widget = self.specimen_widgets[field]
                     widget.blockSignals(True)
-                    stored = str(row.get(field, ""))
-                    if isinstance(widget, QComboBox):
-                        widget.setCurrentText(stored)
-                    else:
-                        widget.setText(stored)
+                    _wset(widget, str(row.get(field, "")))
                     widget.blockSignals(False)
                 elif category == "classification":
                     row = self.store.get_classification(voucher) or {}
@@ -5831,7 +5869,7 @@ class SpecimenWindow(QMainWindow):
         if exc:
             self._current_qpixmap = None
             self._placeholder_label.setText(f"无法预览照片\n{exc}")
-            self._placeholder_label.setStyleSheet("color: #8b2f2f; font-size: 12px;")
+            self._placeholder_label.setStyleSheet(f"color: {STATUS_ERR}; font-size: 12px;")
             self._placeholder_label.show()
             self.statusBar().showMessage("照片预览加载失败")
             return
@@ -6141,12 +6179,8 @@ class SpecimenWindow(QMainWindow):
                 widget = self.specimen_widgets.get(field)
                 if widget is None:
                     continue
-                value = str(specimen.get(field, "") or "")
                 widget.blockSignals(True)
-                if isinstance(widget, QComboBox):
-                    widget.setCurrentText(value)
-                else:
-                    widget.setText(value)
+                _wset(widget, str(specimen.get(field, "") or ""))
                 widget.blockSignals(False)
         finally:
             self._loading = False
@@ -6806,9 +6840,10 @@ class SpecimenWindow(QMainWindow):
         if is_unsafe_workspace_root(target_path):
             QMessageBox.critical(
                 self, "目录范围过大",
-                f"不能把文件系统根目录、盘符根目录或用户主目录作为工作区：\n{target_path}\n\n"
+                f"不能把文件系统根目录、盘符根目录、用户主目录或桌面作为工作区：\n{target_path}\n\n"
                 "这类目录过大，软件的全工作区扫描（如图片索引）会遍历海量文件、可能拖垮电脑。\n"
-                "请选择实际保存数据和照片的子目录。",
+                "桌面也不能作为工作区，否则会把数据文件、日志和更新文件散在桌面上。\n"
+                "请选择实际保存数据和照片的专用子目录。",
             )
             return
         create_workspace_files = False
@@ -7035,10 +7070,7 @@ class SpecimenWindow(QMainWindow):
 
     def open_version_manager(self) -> None:
         """打开版本管理 / 操作历史（非模态、单实例）。"""
-        dlg = getattr(self, "_version_mgr_dialog", None)
-        if dlg is not None and dlg.isVisible():
-            dlg.raise_()
-            dlg.activateWindow()
+        if self._focus_existing_dialog("_version_mgr_dialog"):
             return
         dlg = VersionManagerDialog(self)
         dlg.setAttribute(Qt.WA_DeleteOnClose)
@@ -7121,7 +7153,7 @@ class SpecimenWindow(QMainWindow):
             return
         self._update_banner_release = None  # 清掉旧 release 引用避免误触
         self._pending_update_ready_for_banner = pending
-        label = banner.findChild(QLabel, "_update_banner_text")
+        label = getattr(self, "_update_banner_label", None)
         if label is not None:
             label.setText(
                 f"✅ v{pending.version} 已下载就绪 · 点击「立即安装」即刻重启升级"
@@ -7141,12 +7173,23 @@ class SpecimenWindow(QMainWindow):
             )
             return
         self._update_banner_release = release
-        label = banner.findChild(QLabel, "_update_banner_text")
+        label = getattr(self, "_update_banner_label", None)
         if label is not None:
+            # 发布说明第一行截断预览（VS Code 风格：让用户知道更新了什么）
+            notes_preview = ""
+            notes = getattr(release, "notes", "") or ""
+            if notes.strip():
+                first_line = notes.strip().split("\n")[0][:100]
+                notes_preview = f"  ·  {first_line}"
             label.setText(
-                f"🔔 发现新版 v{release.version}（当前 v{__version__}）"
+                f"[新版] 发现新版 v{release.version}（当前 v{__version__}）{notes_preview}"
             )
         banner.show()
+        # 同步更新状态栏持久徽标（点"稍后"后 banner 消失但徽标保留）
+        btn = getattr(self, "_update_status_btn", None)
+        if btn is not None:
+            btn.setText(f"[新版] v{release.version} 可更新")
+            btn.show()
 
     def _start_background_download_for_pending(self, release) -> None:
         """download/install 模式:启动后台下载,写 pending,下次启动安装。"""
@@ -7196,6 +7239,10 @@ class SpecimenWindow(QMainWindow):
             if banner is not None:
                 banner.hide()
             self._pending_update_ready_for_banner = None
+            # 安装触发后隐藏状态栏徽标
+            btn = getattr(self, "_update_status_btn", None)
+            if btn is not None:
+                btn.hide()
             self._launch_pending_swap_with_confirm(pending_ready)
             return
         self._oneclick_upgrade_now(source="banner")
@@ -7373,6 +7420,24 @@ class SpecimenWindow(QMainWindow):
         if box.clickedButton() is btn_now:
             self._launch_pending_swap(pending)
 
+    def _upgrade_banner_detail(self) -> None:
+        """查看详情：打开版本管理器，展示完整发布说明和升级选项。"""
+        dlg = VersionManagerDialog(self)
+        # 跳到「软件版本」Tab（index 1 = 软件版本）
+        tab_widget = dlg.findChild(QTabWidget)
+        if tab_widget is not None and tab_widget.count() > 1:
+            tab_widget.setCurrentIndex(1)
+        dlg.exec_()
+
+    def _on_update_status_clicked(self) -> None:
+        """点状态栏更新徽标 → 重新弹出 banner（或打开版本管理器）。"""
+        release = getattr(self, "_update_banner_release", None)
+        if release is not None:
+            self._show_update_banner(release)
+        else:
+            dlg = VersionManagerDialog(self)
+            dlg.exec_()
+
     def _upgrade_banner_later(self) -> None:
         banner = getattr(self, "_update_banner", None)
         if banner is not None:
@@ -7408,6 +7473,10 @@ class SpecimenWindow(QMainWindow):
                 save_settings(settings)
         if banner is not None:
             banner.hide()
+        # 跳过此版时隐藏状态栏徽标
+        btn = getattr(self, "_update_status_btn", None)
+        if btn is not None:
+            btn.hide()
 
     # ---- D3+D11 启动入口:apply pending + sentinel 健康检查 ----
 
@@ -8603,6 +8672,8 @@ class IngestSummaryDialog(QDialog):
         self._search_text = ""
         # 导入的入库编号列表筛选：None=未启用；非 None=只显示集合内编号。
         self._voucher_list_filter: set[str] | None = None
+        self._admin_mode: bool = False
+        self._admin_name: str = ""
 
         self.filtered_vouchers: list[str] = list(self.all_vouchers)
         self.current_page = 0
@@ -8640,6 +8711,15 @@ class IngestSummaryDialog(QDialog):
         stats.addStretch()
         layout.addLayout(stats)
 
+        # 管理员模式警示 banner（默认隐藏）
+        self._admin_banner = QLabel()
+        self._admin_banner.setStyleSheet(
+            f"background:{STATUS_ERR};color:white;padding:4px 10px;"
+            "border-radius:3px;font-weight:bold;"
+        )
+        self._admin_banner.setVisible(False)
+        layout.addWidget(self._admin_banner)
+
         # 旧布局：搜索框/范围/导入/页码/上下页/列设置全挤一行。现拆两行更清爽：
         # 第 1 行 = 搜索区，第 2 行 = 分页 + 列设置。控件、信号全部不变。
         search_row = QHBoxLayout()
@@ -8671,6 +8751,12 @@ class IngestSummaryDialog(QDialog):
         nav.addStretch()
         # 「列设置」：开关右侧列选择面板（默认隐藏，可关闭）。
         self._make_btn("列设置", self._toggle_column_panel, nav)
+        nav.addSpacing(16)
+        # 管理员编辑模式切换按钮
+        self._admin_mode_btn = QPushButton("🔒 管理员编辑")
+        self._admin_mode_btn.setToolTip("点击解锁管理员编辑模式（需要密码和操作员姓名）")
+        self._admin_mode_btn.clicked.connect(self._toggle_admin_mode)
+        nav.addWidget(self._admin_mode_btn)
         layout.addLayout(nav)
 
         # 汇总宽表：SUMMARY_COLUMNS 全字段，占满窗口。
@@ -8699,6 +8785,8 @@ class IngestSummaryDialog(QDialog):
             lambda pos: self._voucher_column_menu(pos, from_header=False)
         )
         self._apply_visible_columns()
+        # 管理员模式下单格编辑回写信号
+        self.voucher_table.itemChanged.connect(self._on_admin_cell_changed)
 
         # 表格 + 右侧列选择面板（面板默认隐藏，「列设置」按钮开关）。
         table_row = QHBoxLayout()
@@ -8742,10 +8830,11 @@ class IngestSummaryDialog(QDialog):
         return str(value)
 
     def _make_cell(self, col: str, record: dict) -> QTableWidgetItem:
-        """构造一个汇总宽表单元格；宽表已改全只读，照片数列用数值排序。
+        """构造一个汇总宽表单元格；非管理员模式全只读，管理员模式下 specimen/classification 列可编辑。
 
         旧逻辑：按 SUMMARY_COLUMN_SOURCE 的 category 决定单元格是否带 ItemIsEditable；
         现在宽表整体只读（编辑改到主窗口），所有单元格统一去掉 ItemIsEditable。
+        管理员模式：category != "readonly" 的列加回 ItemIsEditable。
         """
         value = record.get(col, "")
         item = QTableWidgetItem()
@@ -8759,7 +8848,11 @@ class IngestSummaryDialog(QDialog):
             item.setText(self._summary_cell_text(value))
             if isinstance(value, list) and value:
                 item.setToolTip("\n".join(str(v) for v in value))
-        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        category, _ = SUMMARY_COLUMN_SOURCE.get(col, ("readonly", col))
+        if self._admin_mode and category != "readonly":
+            item.setFlags(item.flags() | Qt.ItemIsEditable)
+        else:
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
         return item
 
     def _load_page(self, page: int) -> None:
@@ -8768,15 +8861,17 @@ class IngestSummaryDialog(QDialog):
         end = start + self.PAGE_SIZE
         page_vouchers = self.filtered_vouchers[start:end]
 
-        # 填表期间关排序，避免排序错乱。（旧代码另置 _loading 抑制 itemChanged 回写，
-        # 宽表已改只读、无 itemChanged 连接，_loading 不再需要。）
+        # 填表期间关排序 + 屏蔽信号，避免 itemChanged 触发回写（旧代码用 _loading flag，
+        # 现改用 blockSignals 更可靠；_loading 已废弃）。
         self.voucher_table.setSortingEnabled(False)
+        self.voucher_table.blockSignals(True)
         self.voucher_table.setRowCount(0)
         self.voucher_table.setRowCount(len(page_vouchers))
         for i, voucher in enumerate(page_vouchers):
             record = self._record_by_voucher.get(voucher, {})
             for col_idx, col in enumerate(SUMMARY_COLUMNS):
                 self.voucher_table.setItem(i, col_idx, self._make_cell(col, record))
+        self.voucher_table.blockSignals(False)
         self.voucher_table.setSortingEnabled(True)
 
         self.voucher_table.resizeColumnsToContents()
@@ -8839,6 +8934,152 @@ class IngestSummaryDialog(QDialog):
         self._summary_records = self.store.read_inventory_summary_via_cache()  # plan D2
         self._record_by_voucher = {r["入库编号*"]: r for r in self._summary_records}
 
+    def _toggle_admin_mode(self) -> None:
+        """切换管理员编辑模式：解锁需密码+姓名；锁定时刷新主窗口。"""
+        if self._admin_mode:
+            self._admin_mode = False
+            self._admin_name = ""
+            self._apply_admin_mode_ui()
+            self.app.refresh_list()
+        else:
+            dlg = _AdminUnlockDialog(self)
+            if dlg.exec_() == QDialog.Accepted:
+                self._admin_mode = True
+                self._admin_name = dlg.admin_name
+                self._apply_admin_mode_ui()
+                self._load_page(self.current_page)  # 重绘单元格（加 ItemIsEditable）
+
+    def _apply_admin_mode_ui(self) -> None:
+        """根据 _admin_mode 更新 UI 状态：按钮样式、banner、编辑触发器。"""
+        if self._admin_mode:
+            self._admin_mode_btn.setText(f"🔓 管理员：{self._admin_name}")
+            self._admin_mode_btn.setStyleSheet(f"background:{STATUS_ERR};color:white;font-weight:bold;")
+            self._admin_banner.setText(
+                f"⚠ 管理员编辑模式已启用 — 操作员：{self._admin_name}  |  "
+                "双击单元格可直接修改，修改将写入修改记录。点击右侧按钮退出。"
+            )
+            self._admin_banner.setVisible(True)
+            self.voucher_table.setEditTriggers(
+                QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed
+            )
+        else:
+            self._admin_mode_btn.setText("🔒 管理员编辑")
+            self._admin_mode_btn.setStyleSheet("")
+            self._admin_banner.setVisible(False)
+            self.voucher_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            self._load_page(self.current_page)  # 重绘单元格（去 ItemIsEditable）
+
+    def _on_admin_cell_changed(self, item: "QTableWidgetItem") -> None:
+        """管理员模式单格编辑提交回写：写入 Excel + 修改记录（含操作员姓名）。"""
+        if not self._admin_mode:
+            return
+        col_idx = item.column()
+        if col_idx < 0 or col_idx >= len(SUMMARY_COLUMNS):
+            return
+        col = SUMMARY_COLUMNS[col_idx]
+
+        # ⚠️ 状态列路由必须在 readonly 检查之前：
+        # SUMMARY_COLUMN_SOURCE 把状态列标为 "readonly"（供普通用户只读），
+        # 但管理员模式下状态列是可编辑的，需要提前路由到目标字段写入。
+        # 不能用 SUMMARY_COLUMN_SOURCE 的 category/excel_field，因为它们是 readonly。
+        if col in _STATUS_COLUMN_TO_OVERRIDE_FIELD:
+            voucher_item = self.voucher_table.item(item.row(), 0)
+            if voucher_item is None:
+                return
+            voucher = voucher_item.text()
+            if not voucher:
+                return
+            target_field = _STATUS_COLUMN_TO_OVERRIDE_FIELD[col]
+            raw_value = item.text()
+            # "有实物"是 checkbox 字段，仅接受 "√" 或 ""（管理员输入 "×" → 清空）
+            write_value = raw_value if target_field != SPECIMEN_HAS_PHYSICAL else ("√" if raw_value == "√" else "")
+            self.store.set_fields(
+                "specimen", voucher,
+                {target_field: write_value},
+                action_type="admin_manual_edit",
+                admin_name=self._admin_name,
+            )
+            self._mark_summary_dirty(voucher)
+            self.app.refresh_list()
+            return
+
+        category, excel_field = SUMMARY_COLUMN_SOURCE.get(col, ("readonly", col))
+        if category == "readonly":
+            return
+        voucher_item = self.voucher_table.item(item.row(), 0)
+        if voucher_item is None:
+            return
+        voucher = voucher_item.text()
+        if not voucher:
+            return
+        self.store.set_fields(
+            category, voucher,
+            {excel_field: item.text()},
+            action_type="admin_manual_edit",
+            admin_name=self._admin_name,
+        )
+        self._mark_summary_dirty(voucher)
+        self.app.refresh_list()
+
+    def _mark_summary_dirty(self, voucher: str) -> None:
+        """更新内存汇总记录，使下次翻页/筛选不必全量重读。"""
+        # 简单方案：让 summary cache 失效，下次 _reload_summary 会重算
+        self.store._mark_inventory_summary_cache_invalid()
+
+    def _open_admin_batch_edit(self, col_name: str, selected_vouchers: list) -> None:
+        """管理员批量编辑对话框：支持选中行 / 编号范围 / 粘贴列表三种选择方式。"""
+        if not self._admin_mode:
+            return
+        dlg = _AdminBatchEditDialog(
+            self, col_name, selected_vouchers,
+            list(self.all_vouchers), self._admin_name,
+        )
+        if dlg.exec_() == QDialog.Accepted:
+            target_vouchers = dlg.resolved_vouchers
+            new_value = dlg.new_value
+            category, excel_field = SUMMARY_COLUMN_SOURCE.get(col_name, ("readonly", col_name))
+            for voucher in target_vouchers:
+                if col_name in _STATUS_COLUMN_TO_OVERRIDE_FIELD:
+                    self.store.set_fields(
+                        "specimen", voucher,
+                        {_STATUS_COLUMN_TO_OVERRIDE_FIELD[col_name]: new_value},
+                        action_type="admin_manual_edit",
+                        admin_name=self._admin_name,
+                    )
+                elif category in ("specimen", "classification"):
+                    self.store.set_fields(
+                        category, voucher,
+                        {excel_field: new_value},
+                        action_type="admin_manual_edit",
+                        admin_name=self._admin_name,
+                    )
+            self.store._mark_inventory_summary_cache_invalid()
+            self._reload_summary()
+            self._apply_filters()
+            self.app.refresh_list()
+            self.status_label.setText(f"批量修改完成：{len(target_vouchers)} 条")
+
+    def _admin_set_status_override(self, value: str, override_field: str) -> None:
+        """管理员手动设置所选入库编号的状态覆盖字段（需密码验证）。
+
+        value: "" = 清除覆盖（恢复自动计算）/ "√" / "×"
+        override_field: SPECIMEN_OVERRIDE_FIELD / PHOTO_OVERRIDE_FIELD / CLASS_OVERRIDE_FIELD
+        """
+        if not self._admin_mode:
+            return
+        vouchers = self._selected_vouchers()
+        if not vouchers:
+            return
+        for voucher in vouchers:
+            self.store.set_fields(
+                "specimen", voucher, {override_field: value},
+                action_type="admin_manual_edit", admin_name=self._admin_name,
+            )
+        self._reload_summary()
+        self._apply_filters()
+        # 通知主窗口刷新左侧状态列（_all_flags 重算）
+        self.app.refresh_list()
+
     def _refresh(self) -> None:
         """重新从 store 拉取最新数据并重算筛选/分页/统计。
 
@@ -8854,7 +9095,14 @@ class IngestSummaryDialog(QDialog):
     # ---- Voucher double-click -> jump to main window ----
 
     def _on_voucher_double_clicked(self, row: int, col: int) -> None:
-        """双击行 -> 主窗口选中该入库编号并聚焦主窗口编辑器（汇总窗口保持打开）。"""
+        """双击行 -> 主窗口选中该入库编号并聚焦主窗口编辑器（汇总窗口保持打开）。
+        管理员模式下双击可编辑列时不跳转（由内联编辑处理）。
+        """
+        if self._admin_mode and 0 <= col < len(SUMMARY_COLUMNS):
+            col_name = SUMMARY_COLUMNS[col]
+            cat, _ = SUMMARY_COLUMN_SOURCE.get(col_name, ("readonly", col_name))
+            if cat != "readonly":
+                return  # 管理员模式 + 可编辑列：让双击触发内联编辑，不跳主窗口
         item = self.voucher_table.item(row, 0)  # 入库编号* 始终第 0 列
         if item is None:
             return
@@ -9079,6 +9327,19 @@ class IngestSummaryDialog(QDialog):
                     lambda sv=sel_vouchers: self._open_worms_match_for_vouchers(sv),
                 )
                 menu.addSeparator()
+                # 管理员模式：右键任意可写列时，显示批量编辑菜单
+                if 0 <= col_idx < len(SUMMARY_COLUMNS):
+                    col_name = SUMMARY_COLUMNS[col_idx]
+                    cat, _ = SUMMARY_COLUMN_SOURCE.get(col_name, ("readonly", col_name))
+                    if self._admin_mode and cat != "readonly":
+                        act = menu.addAction(
+                            f"[管理员] 批量设置「{col_name}」… ({len(sel_vouchers)}条)"
+                        )
+                        act.triggered.connect(
+                            lambda _, cn=col_name, sv=list(sel_vouchers):
+                                self._open_admin_batch_edit(cn, sv)
+                        )
+                        menu.addSeparator()
         if 0 <= col_idx < len(SUMMARY_COLUMNS):
             col = SUMMARY_COLUMNS[col_idx]
             menu.addAction(f"按「{col}」筛选…", lambda: self._open_column_filter(col))
@@ -9730,8 +9991,7 @@ class BatchSpecimenFieldsDialog(QDialog):
         for field, (checkbox, editor) in self._rows.items():
             if not checkbox.isChecked():
                 continue
-            value = editor.currentText() if isinstance(editor, QComboBox) else editor.text()
-            updates[field] = value.strip()
+            updates[field] = _wget(editor).strip()
         return updates
 
 
@@ -9957,6 +10217,189 @@ class SettingsDialog(QDialog):
         from .app_settings import MEMORY_PROFILE_OPTIONS
         key = self.memory_profile_combo.currentData()
         return key if isinstance(key, str) and key in MEMORY_PROFILE_OPTIONS else "auto"
+
+
+# ---------------------------------------------------------------------------
+# 入库汇总管理员辅助对话框
+# ---------------------------------------------------------------------------
+
+class _AdminUnlockDialog(QDialog):
+    """管理员解锁对话框：密码 + 操作员姓名（两者均为必填）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("管理员解锁")
+        self.setFixedWidth(340)
+        self.admin_name = ""
+        layout = QFormLayout(self)
+        layout.setLabelAlignment(Qt.AlignRight)
+        self._pwd = QLineEdit()
+        self._pwd.setEchoMode(QLineEdit.Password)
+        self._pwd.setPlaceholderText("请输入管理员密码")
+        self._name = QLineEdit()
+        self._name.setPlaceholderText("请输入操作员姓名（用于审计记录）")
+        layout.addRow("管理员密码：", self._pwd)
+        layout.addRow("操作员姓名：", self._name)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        layout.addRow(btns)
+        self._pwd.setFocus()
+
+    def _on_accept(self) -> None:
+        pwd = self._pwd.text().strip()
+        name = self._name.text().strip()
+        if pwd != ADMIN_PASSWORD:
+            QMessageBox.warning(self, "密码错误", "密码不正确，操作已取消。")
+            return
+        if not name:
+            QMessageBox.warning(self, "姓名必填", "请填写操作员姓名，用于审计记录。")
+            return
+        self.admin_name = name
+        self.accept()
+
+
+class _AdminBatchEditDialog(QDialog):
+    """管理员批量编辑对话框：选中行 / 编号范围 / 粘贴列表 三 Tab 选择目标编号，统一设置新值。"""
+
+    STATUS_COLS = {SPECIMEN_STATUS_COLUMN, PHOTO_STATUS_COLUMN, CLASSIFICATION_STATUS_COLUMN}
+
+    def __init__(self, parent, col_name: str, selected_vouchers: list,
+                 all_vouchers: list, admin_name: str):
+        super().__init__(parent)
+        self.setWindowTitle(f"管理员批量设置「{col_name}」")
+        self.resize(500, 400)
+        self.col_name = col_name
+        self._selected = list(selected_vouchers)
+        self._all_vouchers = set(all_vouchers)
+        self.admin_name = admin_name
+        self.resolved_vouchers: list[str] = []
+        self.new_value: str = ""
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            f"列：<b>{self.col_name}</b>　操作员：{self.admin_name}"
+        ))
+
+        # 三 Tab 选择来源
+        tabs = QTabWidget()
+        # Tab 1：选中行
+        t1 = QWidget()
+        t1l = QVBoxLayout(t1)
+        self._selected_list = QListWidget()
+        self._selected_list.addItems(self._selected)
+        t1l.addWidget(QLabel(f"已选中 {len(self._selected)} 条入库编号："))
+        t1l.addWidget(self._selected_list)
+        tabs.addTab(t1, f"选中行（{len(self._selected)}）")
+
+        # Tab 2：编号范围
+        t2 = QWidget()
+        t2l = QFormLayout(t2)
+        self._range_edit = QLineEdit()
+        self._range_edit.setPlaceholderText("例：YZZ000001 - YZZ000050")
+        self._range_preview = QLabel("—")
+        self._range_edit.textChanged.connect(self._update_range_preview)
+        t2l.addRow("范围：", self._range_edit)
+        t2l.addRow("匹配：", self._range_preview)
+        tabs.addTab(t2, "编号范围")
+
+        # Tab 3：粘贴列表
+        t3 = QWidget()
+        t3l = QVBoxLayout(t3)
+        self._paste_edit = QPlainTextEdit()
+        self._paste_edit.setPlaceholderText("每行一个编号，或逗号分隔")
+        self._paste_preview = QLabel("—")
+        self._paste_edit.textChanged.connect(self._update_paste_preview)
+        t3l.addWidget(QLabel("粘贴入库编号列表："))
+        t3l.addWidget(self._paste_edit)
+        t3l.addWidget(self._paste_preview)
+        tabs.addTab(t3, "粘贴列表")
+
+        self._tabs = tabs
+        layout.addWidget(tabs)
+
+        # 新值输入
+        layout.addWidget(QLabel("新值："))
+        if self.col_name in self.STATUS_COLS:
+            self._value_widget = QComboBox()
+            self._value_widget.addItems(["", "√", "×"])
+        else:
+            self._value_widget = QLineEdit()
+            self._value_widget.setPlaceholderText("输入新值（留空则清除该字段）")
+        layout.addWidget(self._value_widget)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("确认修改")
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _parse_range(self) -> list[str]:
+        text = self._range_edit.text().strip()
+        if " - " in text:
+            parts = [p.strip() for p in text.split(" - ", 1)]
+        elif "-" in text:
+            # 避免把编号前缀里的连字符当分隔符：从末尾数字段前分割
+            import re
+            m = re.match(r"^(.+?)(\d+)\s*-\s*(.+?)(\d+)$", text)
+            if m:
+                parts = [m.group(1) + m.group(2), m.group(3) + m.group(4)]
+            else:
+                return []
+        else:
+            return []
+        if len(parts) != 2:
+            return []
+        from .parsing import parse_voucher_serial, format_voucher
+        try:
+            start = parse_voucher_serial(parts[0])
+            end = parse_voucher_serial(parts[1])
+            if start is None or end is None or start > end:
+                return []
+            # format_voucher 只接受 int，内部使用 YZZ 格式；其他系列编号由用户手动输入列表
+            return [v for v in (format_voucher(i) for i in range(start, end + 1))
+                    if v in self._all_vouchers]
+        except Exception:
+            return []
+
+    def _parse_paste(self) -> list[str]:
+        text = self._paste_edit.toPlainText()
+        import re
+        tokens = re.split(r"[\n,，\s]+", text)
+        return [t.strip() for t in tokens if t.strip() and t.strip() in self._all_vouchers]
+
+    def _update_range_preview(self) -> None:
+        result = self._parse_range()
+        self._range_preview.setText(f"匹配 {len(result)} 条" if result else "无匹配（检查格式）")
+
+    def _update_paste_preview(self) -> None:
+        result = self._parse_paste()
+        self._paste_preview.setText(f"识别 {len(result)} 条有效编号")
+
+    def _on_accept(self) -> None:
+        tab = self._tabs.currentIndex()
+        if tab == 0:
+            vouchers = list(self._selected)
+        elif tab == 1:
+            vouchers = self._parse_range()
+        else:
+            vouchers = self._parse_paste()
+        if not vouchers:
+            QMessageBox.warning(self, "无目标", "未找到有效入库编号，请检查输入。")
+            return
+        value = _wget(self._value_widget)
+        reply = QMessageBox.question(
+            self, "确认批量修改",
+            f"将把 {len(vouchers)} 条记录的「{self.col_name}」设为：「{value if value else '（空）'}」\n操作员：{self.admin_name}\n\n确认？",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.resolved_vouchers = vouchers
+        self.new_value = value
+        self.accept()
 
 
 # ---------------------------------------------------------------------------
@@ -10850,8 +11293,8 @@ class BatchGenerateDialog(QDialog):
         )
         warn.setWordWrap(True)
         warn.setStyleSheet(
-            "background:#fff3cd; color:#856404;"
-            "border:1px solid #ffc107; border-radius:4px; padding:8px;"
+            f"background:{WARN_BG}; color:{WARN_TEXT};"
+            f"border:1px solid {WARN_BORDER}; border-radius:4px; padding:8px;"
         )
         layout.addRow(warn)
 
@@ -11176,7 +11619,7 @@ class BatchNewSpecimensDialog(QDialog):
             self._range_preview.setText(
                 f"将新增最多 {n} 条　（{s_text} … {e_text}，已存在编号自动跳过）"
             )
-            self._range_preview.setStyleSheet("color:#1a7a1a; font-size:11px;")
+            self._range_preview.setStyleSheet(f"color:{STATUS_OK}; font-size:11px;")
             self._ok_btn.setText(f"确认新增 {n} 条")
             self._ok_btn.setEnabled(True)
 
@@ -11212,7 +11655,7 @@ class ResetFromVoucherDialog(QDialog):
             "该编号及之后的所有内容将被清除，下一个新编号从此处连续。"
         )
         info.setWordWrap(True)
-        info.setStyleSheet("background:#fff3cd; color:#856404; border-radius:4px; padding:10px;")
+        info.setStyleSheet(f"background:{WARN_BG}; color:{WARN_TEXT}; border-radius:4px; padding:10px;")
         layout.addWidget(info)
 
         form = QFormLayout()
@@ -11366,7 +11809,7 @@ class CancelBatchReservationDialog(QDialog):
             "右键选中灰条行后使用「取消占位」。"
         )
         info.setWordWrap(True)
-        info.setStyleSheet("color:#155724; background:#d4edda; border-radius:4px; padding:8px;")
+        info.setStyleSheet(f"color:{STATUS_OK}; background:{STATUS_OK_BG}; border-radius:4px; padding:8px;")
         layout.addWidget(info)
 
         self._table = QTableWidget(0, 4)
@@ -11380,7 +11823,7 @@ class CancelBatchReservationDialog(QDialog):
 
         self._detail_lbl = QLabel("")
         self._detail_lbl.setWordWrap(True)
-        self._detail_lbl.setStyleSheet("color:#856404;")
+        self._detail_lbl.setStyleSheet(f"color:{WARN_TEXT};")
         layout.addWidget(self._detail_lbl)
 
         btns = QDialogButtonBox()
@@ -11501,7 +11944,7 @@ class AdminDeleteRangeDialog(QDialog):
             "删除后编号仍可复用（非永久废除）。操作需管理员密码。"
         )
         info.setWordWrap(True)
-        info.setStyleSheet("color:#155724; background:#d4edda; border-radius:4px; padding:8px;")
+        info.setStyleSheet(f"color:{STATUS_OK}; background:{STATUS_OK_BG}; border-radius:4px; padding:8px;")
         layout.addWidget(info)
 
         form = QFormLayout()
@@ -11515,7 +11958,7 @@ class AdminDeleteRangeDialog(QDialog):
 
         self._preview_lbl = QLabel("")
         self._preview_lbl.setWordWrap(True)
-        self._preview_lbl.setStyleSheet("color:#856404;")
+        self._preview_lbl.setStyleSheet(f"color:{WARN_TEXT};")
         layout.addWidget(self._preview_lbl)
 
         btns = QDialogButtonBox()
