@@ -150,9 +150,12 @@ from .workspace import (
     is_unsafe_workspace_root,
 )
 
-# 状态列 → 对应覆盖字段（管理员编辑模式使用）
+# 状态列 → 管理员编辑时写入的目标字段
+# ⚠️ SPECIMEN_STATUS_COLUMN 映射到 SPECIMEN_HAS_PHYSICAL（"有实物"），而非 SPECIMEN_OVERRIDE_FIELD。
+# 原因：specimen_complete 只读"有实物"，SPECIMEN_OVERRIDE_FIELD 被 _make_status_flags 忽略
+#       （见 excel_store.py 保护注释）。"有实物"是 checkbox 字段：仅接受 "√" 或 ""（非 "×"）。
 _STATUS_COLUMN_TO_OVERRIDE_FIELD = {
-    SPECIMEN_STATUS_COLUMN: SPECIMEN_OVERRIDE_FIELD,
+    SPECIMEN_STATUS_COLUMN: SPECIMEN_HAS_PHYSICAL,
     PHOTO_STATUS_COLUMN: PHOTO_OVERRIDE_FIELD,
     CLASSIFICATION_STATUS_COLUMN: CLASS_OVERRIDE_FIELD,
 }
@@ -8974,6 +8977,32 @@ class IngestSummaryDialog(QDialog):
         if col_idx < 0 or col_idx >= len(SUMMARY_COLUMNS):
             return
         col = SUMMARY_COLUMNS[col_idx]
+
+        # ⚠️ 状态列路由必须在 readonly 检查之前：
+        # SUMMARY_COLUMN_SOURCE 把状态列标为 "readonly"（供普通用户只读），
+        # 但管理员模式下状态列是可编辑的，需要提前路由到目标字段写入。
+        # 不能用 SUMMARY_COLUMN_SOURCE 的 category/excel_field，因为它们是 readonly。
+        if col in _STATUS_COLUMN_TO_OVERRIDE_FIELD:
+            voucher_item = self.voucher_table.item(item.row(), 0)
+            if voucher_item is None:
+                return
+            voucher = voucher_item.text()
+            if not voucher:
+                return
+            target_field = _STATUS_COLUMN_TO_OVERRIDE_FIELD[col]
+            raw_value = item.text()
+            # "有实物"是 checkbox 字段，仅接受 "√" 或 ""（管理员输入 "×" → 清空）
+            write_value = raw_value if target_field != SPECIMEN_HAS_PHYSICAL else ("√" if raw_value == "√" else "")
+            self.store.set_fields(
+                "specimen", voucher,
+                {target_field: write_value},
+                action_type="admin_manual_edit",
+                admin_name=self._admin_name,
+            )
+            self._mark_summary_dirty(voucher)
+            self.app.refresh_list()
+            return
+
         category, excel_field = SUMMARY_COLUMN_SOURCE.get(col, ("readonly", col))
         if category == "readonly":
             return
@@ -8983,22 +9012,12 @@ class IngestSummaryDialog(QDialog):
         voucher = voucher_item.text()
         if not voucher:
             return
-        value = item.text()
-        if col in _STATUS_COLUMN_TO_OVERRIDE_FIELD:
-            # 状态列写覆盖字段
-            self.store.set_fields(
-                "specimen", voucher,
-                {_STATUS_COLUMN_TO_OVERRIDE_FIELD[col]: value},
-                action_type="admin_manual_edit",
-                admin_name=self._admin_name,
-            )
-        else:
-            self.store.set_fields(
-                category, voucher,
-                {excel_field: value},
-                action_type="admin_manual_edit",
-                admin_name=self._admin_name,
-            )
+        self.store.set_fields(
+            category, voucher,
+            {excel_field: item.text()},
+            action_type="admin_manual_edit",
+            admin_name=self._admin_name,
+        )
         self._mark_summary_dirty(voucher)
         self.app.refresh_list()
 
