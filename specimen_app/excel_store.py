@@ -3194,9 +3194,42 @@ class ExcelStore:
         # 旧：_migrate_rename_locality_column() 自动重写 xlsx，违反向后兼容原则。
         # 现：通过 COLUMN_ALIASES 在读取时内存归一（_read_plain_rows / _stream_columns），
         # 不改写任何 Excel 文件。_migrate_rename_locality_column 方法保留但不再调用。
+        # ⚠️ 必须保留：旧工作区"有实物"列迁移。
+        # commit 203c8d6 把 specimen_complete 改为检查 SPECIMEN_HAS_PHYSICAL，
+        # 但只升级了 config 版本号，没有向旧 Excel 追加列，导致旧标本全部显示 ×。
+        # 此迁移用列存在性检查（不依赖版本号）确保幂等、向后兼容。
+        self._migrate_add_has_physical_column()
         if _version_tuple(current) < _version_tuple(CURRENT_DATA_SCHEMA_VERSION):
             self.config["data_schema_version"] = CURRENT_DATA_SCHEMA_VERSION
             self._save_config()
+
+    def _migrate_add_has_physical_column(self) -> None:
+        """v1.1.3 迁移：旧工作区 Excel 无'有实物'列时自动补全。
+
+        ⚠️ 保护注释：此方法在 _upgrade_workspace_schema 中调用，且必须保留。
+        若移除此调用，旧工作区（在 commit 203c8d6 之前创建的）打开后
+        所有标本将显示 × —— 因为 SPECIMEN_HAS_PHYSICAL 列根本不存在于 Excel。
+
+        迁移逻辑（向后兼容）：
+        - "有实物"列已存在 → 幂等跳过（不重复执行）
+        - 列不存在 → 按旧"必填字段是否全填"逻辑推断初始值：
+            SPECIMEN_REQUIRED 字段全部有值 → "√"（有实物），否则 ""
+        参见：commit 203c8d6, commit 99f42f5, commit a35cd5b（回归修复）。
+        """
+        spec_path = self.data_dir / CATEGORY_FILES["specimen"]
+        if not spec_path.exists():
+            return
+        rows = self.read_rows("specimen")
+        if not rows:
+            return
+        # 幂等检查：任意行含"有实物"键说明已迁移，跳过
+        if any(SPECIMEN_HAS_PHYSICAL in row for row in rows):
+            return
+        # 旧逻辑：入库编号* + 管内编号* + 采集地缩写* 全部非空 → 认为有实物
+        for row in rows:
+            all_required = all(self._value(row, f) for f in SPECIMEN_REQUIRED)
+            row[SPECIMEN_HAS_PHYSICAL] = "√" if all_required else ""
+        self._write_rows("specimen", rows)
 
     def _migrate_rename_locality_column(self) -> None:
         """v1.1.2 → v1.1.3: 重命名标本信息列 '采集地点缩写*' → '采集地缩写*'。"""
