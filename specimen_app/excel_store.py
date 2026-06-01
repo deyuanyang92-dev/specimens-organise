@@ -583,7 +583,10 @@ class ExcelStore:
         - ``tube_numbers``: dict[voucher -> str]
         - ``photo_filenames``: dict[voucher -> list[str]]
         """
-        # 只读必要列：标本列由"有实物"字段决定，照片/分类覆盖字段供手动覆盖。
+        # 只读必要列。⚠️ 修改此集合须谨慎：
+        #   SPECIMEN_HAS_PHYSICAL 必须在此（否则 specimen_complete 永远 False）。
+        #   SPECIMEN_OVERRIDE_FIELD 刻意不在此（见 _make_status_flags 保护注释）。
+        #   PHOTO_OVERRIDE_FIELD / CLASS_OVERRIDE_FIELD 必须在此（admin 覆盖照片/分类状态）。
         spec_cols = {
             "入库编号*", "管内编号*",
             SPECIMEN_HAS_PHYSICAL,
@@ -733,7 +736,8 @@ class ExcelStore:
                 elif col == PHOTO_DESC_COLUMN:
                     record[col] = photo_descs.get(voucher, [])
                 elif col == SPECIMEN_STATUS_COLUMN:
-                    # 标本列：直接由"有实物"字段决定（旧：检查管内编号*/采集地缩写*等字段完整性）
+                    # 标本列：直接由"有实物"字段决定（旧：检查管内编号*/采集地缩写*等字段完整性）。
+                    # ⚠️ 与 _make_status_flags 保持一致：不走 SPECIMEN_OVERRIDE_FIELD（见保护注释）。
                     record[col] = "√" if self._value(row, SPECIMEN_HAS_PHYSICAL) == "√" else "×"
                 elif col == PHOTO_STATUS_COLUMN:
                     record[col] = "√" if self._resolve_status(
@@ -769,11 +773,13 @@ class ExcelStore:
     def _make_status_flags(self, specimen_row, class_row, has_photo_bool: bool) -> StatusFlags:
         """集中构造 StatusFlags，避免三处调用各自重复同一逻辑。"""
         return StatusFlags(
-            # 标本列：管理员覆盖优先；无覆盖时由"有实物"字段决定（旧：检查管内编号*/采集地缩写*等字段完整性）
-            specimen_complete=self._resolve_status(
-                self._value(specimen_row, SPECIMEN_OVERRIDE_FIELD),
-                self._value(specimen_row, SPECIMEN_HAS_PHYSICAL) == "√",
-            ),
+            # 标本列：直接由"有实物"字段决定（旧：检查管内编号*/采集地缩写*等字段完整性）。
+            # ⚠️ 禁止改成 _resolve_status(SPECIMEN_OVERRIDE_FIELD, ...)：
+            #    旧数据中 "标本状态覆盖" 可能存有遗留 "×"（早期 bug 写入），
+            #    若走 override 检查会使 "有实物"=√ 的标本全部显示 ×（已知回归）。
+            #    admin 覆盖"标本"列时直接修改 "有实物" 字段，不需要 override 字段。
+            #    参见 v0.10.30 commit 99f42f5 "数据完整性修复"。
+            specimen_complete=self._value(specimen_row, SPECIMEN_HAS_PHYSICAL) == "√",
             has_photo=self._resolve_status(
                 self._value(specimen_row, PHOTO_OVERRIDE_FIELD),
                 has_photo_bool,
@@ -797,6 +803,8 @@ class ExcelStore:
         specimen = self.get_specimen(voucher) or {}
         classification = self.get_classification(voucher) or {}
         photos = self.get_photos(voucher)
+        # specimen 是完整行（含所有列）；_make_status_flags 中 specimen_complete
+        # 只读 SPECIMEN_HAS_PHYSICAL，不读 SPECIMEN_OVERRIDE_FIELD（见保护注释）。
         return self._make_status_flags(specimen, classification, bool(photos))
 
     def all_status_flags(self) -> dict[str, StatusFlags]:
