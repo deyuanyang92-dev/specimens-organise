@@ -4,6 +4,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import queue
 import time as _time
 from concurrent.futures import ThreadPoolExecutor
@@ -1341,6 +1342,11 @@ class SpecimenWindow(QMainWindow):
 
         self._save_timers: dict[str, QTimer] = {}
         self._pending_save_fields: dict[str, set[str]] = {}
+        # P0-1（2026-10-02）：已交给后台 StoreWorkerThread、但尚未开始执行的字段保存，
+        # key = f"{voucher}:{category}" → {字段: 值}。同组再次编辑时合并进去，不再排新任务。
+        # 主线程与工作线程都会碰它，必须加锁。
+        self._queued_field_saves: dict[str, dict[str, str]] = {}
+        self._queued_field_saves_lock = threading.Lock()
         # 自动保存开关：True=输入停 0.5s 自动写；False=只在点「保存」按钮时写。工具栏可勾选切换。
         self.auto_save_enabled = load_settings().auto_save_enabled
         self._list_refresh_timer = QTimer(self)
@@ -1762,11 +1768,8 @@ class SpecimenWindow(QMainWindow):
         _stop_worker(getattr(self, "_startup_update_worker", None), wait_ms=2000, label="update_check")
         # Stop photo import thread if one is running
         _stop_worker(getattr(self, "_import_thread", None), wait_ms=2000, label="photo_import")
-        # Tier A: 停后台 store 写线程（等待当前操作完成，最多 5s）
-        sw = getattr(self, "_store_worker", None)
-        if sw is not None and sw.isRunning():
-            sw.request_stop()
-            sw.wait(5000)
+        # 旧：这里就 request_stop + wait(5000) 停 store 写线程 —— 但 _flush_pending_saves 在更下面才调，
+        #     字段保存后台化后会把任务排进已停的队列 → 丢数据。现移到 flush 之后（见下）。
         # C1: 接管所有注册到 WindowManager 的 dialog 的 worker（如 DbManagerDialog 的 worms worker）
         if self.manager is not None:
             try:
@@ -1809,6 +1812,16 @@ class SpecimenWindow(QMainWindow):
             self._flush_pending_saves()
         except Exception as exc:
             print(f"[closeEvent] 刷写待保存数据失败：{exc}", file=sys.stderr)
+        # P0-1：先排空后台写队列，再停线程、再关 store。超时（SMB/NAS 挂死）才强杀，且打日志。
+        sw = getattr(self, "_store_worker", None)
+        if sw is not None and sw.isRunning():
+            if not self._drain_store_worker(timeout_ms=120000):
+                print("[closeEvent] 后台写线程 120s 未排空，可能有未落盘的修改", file=sys.stderr)
+            sw.request_stop()
+            if not sw.wait(10000) and sw.isRunning():
+                print("[closeEvent] 后台写线程未能正常退出，强制终止", file=sys.stderr)
+                sw.terminate()
+                sw.wait(500)
         store = getattr(self, "store", None)
         if store is not None:
             try:
@@ -4040,6 +4053,14 @@ class SpecimenWindow(QMainWindow):
             self._status_dashboard.setText(text)
 
     def select_voucher(self, voucher: str, defer_preview: bool = False) -> None:
+        # P0-1 修复：旧逻辑切换编号不 flush，500ms 防抖未到就点下一个编号 → _save_pending_group
+        # 发现 voucher != current_voucher 直接 return 0 → 那次编辑静默丢失。
+        # 现在切换前先把上一个编号的待保存字段提交（此时控件里还是旧编号的值）。
+        if self.current_voucher and voucher != self.current_voucher:
+            try:
+                self._flush_pending_saves()
+            except Exception as exc:
+                print(f"[select_voucher] 切换前刷写待保存字段失败：{exc}", file=sys.stderr)
         self._save_current_photo_view_state()
         # 字段固定：切换编号前保存当前 CARRY_OVER 字段值，加载后恢复
         _pinned: dict[str, str] = {}
@@ -4168,7 +4189,9 @@ class SpecimenWindow(QMainWindow):
         if not fields or voucher != self.current_voucher:
             return 0
         if category in ("specimen", "classification"):
-            self._save_text_fields(category, fields, voucher)
+            # 旧：self._save_text_fields(category, fields, voucher)  —— 在 GUI 线程同步重写整本 xlsx
+            # （1500 条标本实测 0.65–0.8 s/次，打字即卡）。新：交给 StoreWorkerThread，见下方。
+            self._save_text_fields_async(category, fields, voucher)
         elif category == "photo":
             # plan D3：把同一张照片同 500ms 内的多字段合并为单次 set_photo_fields_batch，
             # action-log 只增 1 条，undo 一步还原所有字段；语义与 specimen/classification 一致。
@@ -4178,6 +4201,123 @@ class SpecimenWindow(QMainWindow):
             for field in sorted(fields):
                 self.save_field(category, field, voucher)
         return len(fields)
+
+    # ------------------------------------------------------------------
+    # P0-1（2026-10-02）：specimen / classification 字段保存后台化
+    # ------------------------------------------------------------------
+    def _collect_text_updates(self, category: str, fields: set[str]) -> dict[str, str]:
+        """在 GUI 线程读控件值（控件只能在 GUI 线程碰）。"""
+        widgets = self.specimen_widgets if category == "specimen" else self.class_widgets
+        updates: dict[str, str] = {}
+        for field in fields:
+            widget = widgets.get(field)
+            if widget is None:
+                continue
+            updates[field] = _wget(widget)
+        return updates
+
+    def _save_text_fields_async(self, category: str, fields: set[str], voucher: str) -> None:
+        """把一组字段改动交给后台 StoreWorkerThread 落盘；worker 不可用时回退同步写。
+
+        不丢数据的三道保证：
+          1. 控件值在这里（GUI 线程）就读出来，之后用户再怎么改控件都不影响已提交的值；
+          2. 同一 voucher:category 若已有排队未执行的任务 → 合并字段，worker 执行时取最新合集；
+          3. worker 已 request_stop / 未运行 → 直接走旧的同步 _save_text_fields，绝不排进死队列。
+        """
+        updates = self._collect_text_updates(category, fields)
+        if not updates:
+            return
+        worker = getattr(self, "_store_worker", None)
+        store = self.store
+        if worker is None or store is None or not worker.isRunning() or not worker.accepting():
+            self._save_text_fields(category, fields, voucher)
+            return
+        key = f"{voucher}:{category}"
+        with self._queued_field_saves_lock:
+            queued = self._queued_field_saves.get(key)
+            if queued is not None:
+                queued.update(updates)
+                return
+            self._queued_field_saves[key] = dict(updates)
+        # store 在入队时绑定：切换工作区时排队中的任务仍写旧工作区（切换前已排空，这是兜底）
+        accepted = worker.enqueue(
+            f"save_fields:{category}:{voucher}", self._run_queued_field_save, store, key, category, voucher
+        )
+        if not accepted:
+            with self._queued_field_saves_lock:
+                self._queued_field_saves.pop(key, None)
+            self._save_text_fields(category, fields, voucher)
+
+    def _run_queued_field_save(self, store, key: str, category: str, voucher: str) -> tuple[str, str, bool]:
+        """【工作线程】取出该组最新字段合集并写盘。只碰 store，不碰任何控件。"""
+        with self._queued_field_saves_lock:
+            updates = self._queued_field_saves.pop(key, None)
+        if not updates:
+            return (category, voucher, False)
+        changed = store.set_fields(category, voucher, updates)
+        return (category, voucher, bool(changed))
+
+    def _on_field_save_done(self, category: str, voucher: str, changed: bool, elapsed_ms: float) -> None:
+        """【GUI 线程】后台保存完成：回填派生字段（采集日期/采集地缩写/保存方式）+ 刷新列表行。"""
+        if voucher != self.current_voucher:
+            try:
+                self.patch_voucher_row(voucher, "updated")
+            except Exception:
+                pass
+            return
+        if changed and category == "specimen":
+            specimen = self.store.get_specimen(voucher) or {}
+            pending_now = self._pending_save_fields.get(f"{voucher}:specimen", set())
+            self._loading = True
+            try:
+                for auto_field in ("采集日期", "采集地缩写*", "保存方式"):
+                    if auto_field in pending_now:
+                        continue  # 用户在写盘期间又手改了该字段，不覆盖
+                    widget = self.specimen_widgets[auto_field]
+                    widget.blockSignals(True)
+                    _wset(widget, str(specimen.get(auto_field, "")))
+                    widget.blockSignals(False)
+            finally:
+                self._loading = False
+        self.patch_voucher_row(voucher, "updated")
+
+    def _on_field_save_error(self, category: str, voucher: str, error_msg: str) -> None:
+        """【GUI 线程】后台保存失败：控件回滚到 store 当前值（仅当前编号）+ 弹错。"""
+        if voucher == self.current_voucher:
+            try:
+                row = (
+                    self.store.get_specimen(voucher)
+                    if category == "specimen"
+                    else self.store.get_classification(voucher)
+                ) or {}
+                widgets = self.specimen_widgets if category == "specimen" else self.class_widgets
+                self._loading = True
+                try:
+                    for field, widget in widgets.items():
+                        widget.blockSignals(True)
+                        _wset(widget, str(row.get(field, "")))
+                        widget.blockSignals(False)
+                finally:
+                    self._loading = False
+            except Exception:
+                pass
+        QMessageBox.critical(self, "保存失败", error_msg)
+
+    def _drain_store_worker(self, timeout_ms: int = 120000) -> bool:
+        """等后台写线程把排队的保存全部写完（保持事件循环转动，状态栏可见）。False = 超时。"""
+        worker = getattr(self, "_store_worker", None)
+        if worker is None or not worker.isRunning() or worker.is_idle():
+            return True
+        try:
+            self.statusBar().showMessage("正在写入未保存的修改，请稍候…", 0)
+        except Exception:
+            pass
+        deadline = _time.monotonic() + max(0, timeout_ms) / 1000.0
+        while not worker.wait_idle(100):
+            QApplication.processEvents()
+            if _time.monotonic() > deadline:
+                return False
+        return True
 
     def _save_photo_fields_batched(self, fields: set[str], voucher: str) -> None:
         """plan D3：合并同一张照片的多字段保存。"""
@@ -5105,6 +5245,10 @@ class SpecimenWindow(QMainWindow):
 
     def _on_store_op_done(self, op_id: str, result: object, elapsed_ms: float) -> None:
         """后台操作完成：根据操作类型更新 UI。"""
+        if op_id.startswith("save_fields:"):
+            category, voucher, changed = result  # type: ignore[misc]
+            self._on_field_save_done(str(category), str(voucher), bool(changed), elapsed_ms)
+            return
         if op_id in ("create_specimen", "create_specimen_custom"):
             voucher = result  # type: ignore[assignment]
             if self._active_task:
@@ -5143,6 +5287,10 @@ class SpecimenWindow(QMainWindow):
 
     def _on_store_op_error(self, op_id: str, error_msg: str) -> None:
         """后台操作失败：弹错误提示。"""
+        if op_id.startswith("save_fields:"):
+            _, category, voucher = op_id.split(":", 2)
+            self._on_field_save_error(category, voucher, error_msg)
+            return
         op_label = {
             "create_specimen": "新增入库编号",
             "create_specimen_custom": "新增入库编号",
@@ -6122,7 +6270,8 @@ class SpecimenWindow(QMainWindow):
             return
         saved = self._flush_pending_saves(category)
         names = {"specimen": "标本信息", "photo": "照片信息", "classification": "分类信息"}
-        self.statusBar().showMessage(f"{names.get(category, category)}已保存 ({saved} 项)", 2000)
+        # 旧：f"...已保存 ({saved} 项)"。现在字段保存在后台线程落盘，文案改为"已提交"更准确。
+        self.statusBar().showMessage(f"{names.get(category, category)}已提交保存 ({saved} 项，后台写入中)", 2000)
 
     def _save_all_panels(self) -> None:
         """Save all pending changes across all panels."""
@@ -6901,6 +7050,18 @@ class SpecimenWindow(QMainWindow):
             return False
         # 未绑定窗口此前没有 store、也未注册过工作区，跳过 unregister/close。
         if self.store is not None:
+            # P0-1 修复：旧逻辑切换工作区不 flush 待保存字段也不等后台写线程 → 丢最后几百毫秒的编辑。
+            try:
+                self._flush_pending_saves()
+            except Exception as exc:
+                print(f"[switch_workspace] 刷写待保存字段失败：{exc}", file=sys.stderr)
+            if not self._drain_store_worker(timeout_ms=120000):
+                QMessageBox.warning(self, "切换工作区", "后台写入超时，可能有修改尚未落盘；已中止切换。")
+                try:
+                    new_store.close()
+                except Exception:
+                    pass
+                return False
             if self.manager is not None:
                 self.manager.unregister(self)
             self.store.close()
