@@ -494,6 +494,11 @@ class CoreTests(unittest.TestCase):
             def _save_text_fields(self, category: str, fields: set[str], voucher: str) -> None:
                 self.calls.append((category, fields, voucher))
 
+            # P0-1（2026-10-02）：真实窗口的 _save_pending_group 改走后台队列 _save_text_fields_async；
+            # 本测试只验证"同组字段合并成一次调用"，所以把异步入口直接转到同步记录。
+            def _save_text_fields_async(self, category: str, fields: set[str], voucher: str) -> None:
+                self._save_text_fields(category, fields, voucher)
+
         window = FakeWindow()
 
         saved = SpecimenWindow._flush_pending_saves(window, "specimen")
