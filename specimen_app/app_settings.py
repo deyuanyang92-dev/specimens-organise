@@ -73,6 +73,7 @@ class AppSettings:
     image_viewer_path: str = ""  # 自定义图片查看器程序路径；空=用系统默认程序打开原图
     cursor_style: str = "default"  # 趣味光标样式 key（见 cursors.CURSOR_STYLE_OPTIONS）；default=系统箭头
     app_icon_variant: str = "specimen_blue"  # 应用图标变体 key（见 icon.APP_ICON_VARIANTS）
+    image_search_match_mode: str = "fuzzy"  # 图片检索匹配模式：fuzzy=模糊（默认，按相关度排序）/ exact=精准
     auto_save_enabled: bool = True  # 录入是否自动保存（输入停 0.5s 自动写）；关时靠手动「保存」按钮
     # 规范化软件设计 2026-05 新增：工具栏布局 / 辅助工具栏可见性 / 快捷键自定义
     # toolbar_layout: 主/辅栏的 action_id 顺序列表；空 dict / 缺 key 时回落到 TOOLBAR_DEFAULT_LAYOUT。
@@ -244,6 +245,7 @@ def load_settings() -> AppSettings:
     last_voucher_filter_key = str(data.get("last_voucher_filter_key", "all")) or "all"
     last_photo_view_mode = _str_choice("last_photo_view_mode", ("single", "grid"), "single")
     pending_update_use_modal_prompt = _bool("pending_update_use_modal_prompt", False)
+    image_search_match_mode = _str_choice("image_search_match_mode", ("fuzzy", "exact"), "fuzzy")
     return AppSettings(
         last_workspace=str(data.get("last_workspace", "")),
         recent_workspaces=[str(item) for item in data.get("recent_workspaces", []) if item],
@@ -260,6 +262,7 @@ def load_settings() -> AppSettings:
         carry_over_specimen_fields=carry_over_specimen_fields,
         summary_visible_columns=summary_visible_columns,
         ui_font_size=ui_font_size,
+        image_search_match_mode=image_search_match_mode,
         image_viewer_path=image_viewer_path,
         cursor_style=cursor_style,
         app_icon_variant=app_icon_variant,
@@ -310,6 +313,7 @@ def save_settings(settings: AppSettings) -> None:
         "ui_font_size": settings.ui_font_size,
         "image_viewer_path": settings.image_viewer_path,
         "cursor_style": settings.cursor_style,
+        "image_search_match_mode": settings.image_search_match_mode,
         "app_icon_variant": settings.app_icon_variant,
         "auto_save_enabled": settings.auto_save_enabled,
         "toolbar_layout": settings.toolbar_layout,

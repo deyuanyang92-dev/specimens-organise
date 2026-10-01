@@ -91,6 +91,8 @@ from .image_cache import ThumbnailCache
 from .image_search import (
     ImageSearchIndex,
     ImageSearchResult,
+    MATCH_MODE_FUZZY,
+    normalize_match_mode,
     append_images_to_index,
     clear_image_index,
     default_image_query,
@@ -7849,6 +7851,11 @@ IMAGE_TYPE_CHOICES = [
     ("JPG", "jpg"),
     ("TIF+JPG", "tif_jpg"),
 ]
+# 2026-10-01 用户要求：图片检索可切换精准 / 模糊匹配（见 image_match.py 分层说明）
+IMAGE_MATCH_MODE_CHOICES = [
+    ("模糊", "fuzzy"),
+    ("精准", "exact"),
+]
 
 
 class IndexBuildWorker(QThread):
@@ -7913,6 +7920,7 @@ class ImageSearchWorker(QThread):
         search_roots: list[str] | None,
         image_type: str,
         search_index: ImageSearchIndex | None = None,
+        match_mode: str = MATCH_MODE_FUZZY,
         force_rebuild: bool = False,
         limit: int = 50,
         path_to_vouchers: dict[str, list[str]] | None = None,
@@ -7930,6 +7938,7 @@ class ImageSearchWorker(QThread):
         self.search_roots = search_roots
         self.image_type = image_type
         self.search_index = search_index
+        self.match_mode = match_mode
         self.force_rebuild = force_rebuild
         self.limit = limit
         self.path_to_vouchers = path_to_vouchers
@@ -7949,6 +7958,7 @@ class ImageSearchWorker(QThread):
                 limit=self.limit,
                 should_stop=self.isInterruptionRequested,
                 search_index=self.search_index,
+                match_mode=self.match_mode,
                 force_rebuild=self.force_rebuild,
                 path_to_vouchers=self.path_to_vouchers,
                 canonical_photo_paths=self.canonical_photo_paths,
@@ -8063,6 +8073,21 @@ class ImageSearchDialog(QDialog):
             self.type_combo.addItem(label, key)
         self.type_combo.currentIndexChanged.connect(self.schedule_refresh)
         path_row.addWidget(self.type_combo)
+        # 2026-10-01 用户要求：可设置精准匹配 / 模糊匹配，选择持久化到 settings.json
+        path_row.addWidget(QLabel("匹配"))
+        self.match_mode_combo = QComboBox()
+        for label, key in IMAGE_MATCH_MODE_CHOICES:
+            self.match_mode_combo.addItem(label, key)
+        self.match_mode_combo.setToolTip(
+            "模糊：按相关度排序；完全命中不到时才逐段放宽（原行为）\n"
+            "精准：只显示从文件名开头起逐段命中输入编号的图片（OWC 可命中 OWC001，不命中 OWCX）"
+        )
+        saved_mode = normalize_match_mode(getattr(load_settings(), "image_search_match_mode", "fuzzy"))
+        saved_mode_index = self.match_mode_combo.findData(saved_mode)
+        if saved_mode_index >= 0:
+            self.match_mode_combo.setCurrentIndex(saved_mode_index)
+        self.match_mode_combo.currentIndexChanged.connect(self._on_match_mode_changed)
+        path_row.addWidget(self.match_mode_combo)
         path_row.addWidget(self._make_button("添加目录", self._add_search_dir))
         path_row.addWidget(self._make_button("恢复默认", self._reset_search_paths))
         path_row.addWidget(self._make_button("清除索引", self._clear_index_cache))
@@ -8199,6 +8224,37 @@ class ImageSearchDialog(QDialog):
         key = self.type_combo.currentData()
         return str(key or "tif")
 
+    def _selected_match_mode(self) -> str:
+        combo = getattr(self, "match_mode_combo", None)
+        if combo is None:
+            return MATCH_MODE_FUZZY
+        return normalize_match_mode(combo.currentData())
+
+    def _on_match_mode_changed(self, _index: int = 0) -> None:
+        mode = self._selected_match_mode()
+        try:
+            settings = load_settings()
+            if getattr(settings, "image_search_match_mode", "") != mode:
+                settings.image_search_match_mode = mode
+                save_settings(settings)
+        except Exception:
+            pass  # 持久化失败不影响本次检索
+        self.schedule_refresh()
+
+    def _match_label_text(self, result: ImageSearchResult) -> str:
+        """卡片「核心编号」行。
+
+        旧：直接显示 matched_keywords（退化后只剩 gdlz-lzc，用户看不出输入的是什么）。
+        新：真命中显示框内输入原文；只有渐进退化（partial）才注明实际匹配到的前缀。
+        """
+        keywords = "、".join(result.matched_keywords[:3]) if result.matched_keywords else ""
+        if not keywords:
+            return "核心编号：无"
+        if getattr(result, "match_kind", "") == "partial":
+            typed = self.query_edit.text().strip()
+            return f"核心编号：{typed}（仅匹配 {keywords}）"
+        return f"核心编号：{keywords}"
+
     def _on_limit_changed(self, value: int) -> None:
         self.result_limit = value
         self.schedule_refresh()
@@ -8253,6 +8309,7 @@ class ImageSearchDialog(QDialog):
             search_roots=search_roots,
             image_type=self._selected_image_type(),
             search_index=None,
+            match_mode=self._selected_match_mode(),
             force_rebuild=force_rebuild,
             limit=self.result_limit,
             path_to_vouchers=self._path_to_vouchers,
@@ -8372,7 +8429,8 @@ class ImageSearchDialog(QDialog):
         # tooltip 显示完整相对路径 + 绝对路径，避免截断后看不全。
         path_label.setToolTip(f"相对路径：{result.relative_path}\n绝对路径：{result.path}")
         card_layout.addWidget(path_label)
-        match_text = "核心编号：" + "、".join(result.matched_keywords[:3]) if result.matched_keywords else "核心编号：无"
+        # 旧：match_text = "核心编号：" + "、".join(result.matched_keywords[:3]) ...（退化后只显示 gdlz-lzc）
+        match_text = self._match_label_text(result)
         match_label = QLabel(match_text)
         match_label.setStyleSheet("color: #3f4b57;")
         card_layout.addWidget(match_label)
@@ -8456,7 +8514,7 @@ class ImageSearchDialog(QDialog):
             return
         result = self.results[index]
         linked = "、".join(result.linked_vouchers) if result.linked_vouchers else "无"
-        keywords = "、".join(result.matched_keywords) if result.matched_keywords else "无"
+        keywords = self._match_label_text(result).replace("核心编号：", "", 1)
         detail = (
             f"文件名：{result.file_name}\n\n"
             f"相对路径：{result.relative_path}\n\n"
