@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +36,7 @@ from .image_index import (  # noqa: F401  (re-exported for backward compatibilit
     IMAGE_INDEX_CACHE_DIR_NAME,
     IMAGE_INDEX_SCHEMA_VERSION,
     IMAGE_INDEX_SQLITE_FILE_NAME,
+    LAST_SCAN_SAFETY_MARGIN_SECONDS,
     IMAGE_TYPE_SUFFIXES,
     JPG_IMAGE_SUFFIXES,
     SUPPORTED_IMAGE_SUFFIXES,
@@ -87,6 +90,56 @@ _IMAGE_INDEX_LOCK = threading.RLock()
 _SEARCH_INDEX_CACHE: OrderedDict[tuple[tuple[str, ...], int], "ImageSearchIndex"] = OrderedDict()
 _SEARCH_INDEX_CACHE_LIMIT = 3
 _SEARCH_INDEX_LOCK = threading.RLock()
+# 2026-10-02 作用域状态记忆：{key: (exists, last_scan)}。主线程的 image_index_exists /
+# get_image_index_last_scan_timestamp 只看这里，不开数据库文件；reconcile / append / clear 更新它。
+_SCOPE_STATE: dict[tuple[tuple[str, ...], int], tuple[bool, float | None]] = {}
+_SCOPE_STATE_LOCK = threading.RLock()
+
+
+def _path_key(path: Path | str) -> str:
+    """纯字符串路径键（normcase+abspath）：不 resolve，网络盘上零往返。"""
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _scope_state(workspace: Path, roots: list[Path], depth: int) -> tuple[bool, float | None]:
+    key = image_index_key(roots, depth)
+    with _SCOPE_STATE_LOCK:
+        if key in _SCOPE_STATE:
+            return _SCOPE_STATE[key]
+    store = ImageIndexStore(workspace)
+    last_scan = store.get_scope_last_scan_timestamp(roots, depth)
+    state = (last_scan is not None or store.has_scope(roots, depth), last_scan)
+    with _SCOPE_STATE_LOCK:
+        _SCOPE_STATE[key] = state
+    return state
+
+
+def _set_scope_state(roots: list[Path], depth: int, exists: bool, last_scan: float | None) -> None:
+    with _SCOPE_STATE_LOCK:
+        _SCOPE_STATE[image_index_key(roots, depth)] = (exists, last_scan)
+
+
+def scope_needs_reconcile(root: Path | str, extra_roots: list[Path | str] | None = None, max_depth: int = 0, max_age_seconds: float = 600.0) -> bool:
+    """Everything 式：根目录 mtime 没变且上次扫描在 max_age 内 → 不扫。只 stat 根目录（≤ 几次往返）。"""
+    workspace = Path(os.path.abspath(str(root)))
+    roots = image_search_roots(workspace, extra_roots)
+    if not roots:
+        return False
+    depth = image_search_depth(workspace, extra_roots, roots, max_depth)
+    exists, last_scan = _scope_state(workspace, roots, depth)
+    if not exists or last_scan is None:
+        return True
+    if time.time() - last_scan > max_age_seconds:
+        return True
+    # last_scan 存的是「扫描开始 − 安全边距」；判根目录是否变过要和扫描开始时刻比，否则刚扫完 2 s 内必判变
+    started = last_scan + LAST_SCAN_SAFETY_MARGIN_SECONDS
+    for r in roots:
+        try:
+            if Path(r).stat().st_mtime > started:
+                return True
+        except OSError:
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -275,14 +328,16 @@ def image_index_exists(
     extra_roots: list[Path | str] | None = None,
     max_depth: int = 0,
 ) -> bool:
-    workspace = Path(root).resolve()
+    workspace = Path(os.path.abspath(str(root)))
     roots = image_search_roots(workspace, extra_roots)
     effective_depth = image_search_depth(workspace, extra_roots, roots, max_depth)
     key = image_index_key(roots, effective_depth)
     with _IMAGE_INDEX_LOCK:
         if key in _IMAGE_INDEX_CACHE:
             return True
-    return ImageIndexStore(workspace).has_scope(roots, effective_depth)
+    if not roots:
+        return False
+    return _scope_state(workspace, roots, effective_depth)[0]
 
 
 def get_image_index_last_scan_timestamp(
@@ -291,12 +346,12 @@ def get_image_index_last_scan_timestamp(
     max_depth: int = 0,
 ) -> float | None:
     """plan v0.10.4 I3：UI 层读取上次完成 reconcile 的时间，决定是否短路。纯只读。"""
-    workspace = Path(root).resolve()
+    workspace = Path(os.path.abspath(str(root)))
     roots = image_search_roots(workspace, extra_roots)
     effective_depth = image_search_depth(workspace, extra_roots, roots, max_depth)
     if not roots:
         return None
-    return ImageIndexStore(workspace).get_scope_last_scan_timestamp(roots, effective_depth)
+    return _scope_state(workspace, roots, effective_depth)[1]
 
 
 def reconcile_image_index(
@@ -308,7 +363,7 @@ def reconcile_image_index(
     force_full_scan: bool = False,
 ) -> ImageIndexUpdate:
     """检查一个作用域的外部新增/删除/重命名（默认自动增量：有 last_scan 就按目录 mtime 门控）。"""
-    workspace = Path(root).resolve()
+    workspace = Path(os.path.abspath(str(root)))
     roots = image_search_roots(workspace, extra_roots)
     effective_depth = image_search_depth(workspace, extra_roots, roots, max_depth)
     if not roots:
@@ -323,6 +378,8 @@ def reconcile_image_index(
         should_stop,
         incremental_since_unix=effective_incremental_since,
     )
+    if not update.cancelled:
+        _set_scope_state(roots, effective_depth, True, store.get_scope_last_scan_timestamp(roots, effective_depth))
     if update.modified:
         key = image_index_key(roots, effective_depth)
         with _IMAGE_INDEX_LOCK:
@@ -338,7 +395,7 @@ def append_images_to_index(
     extra_roots: list[Path | str] | None = None,
     max_depth: int = 0,
 ) -> int:
-    workspace = Path(root).resolve()
+    workspace = Path(os.path.abspath(str(root)))
     roots = image_search_roots(workspace, extra_roots)
     effective_depth = image_search_depth(workspace, extra_roots, roots, max_depth)
     key = image_index_key(roots, effective_depth)
@@ -381,7 +438,7 @@ def _image_index_disk_path(cache_root: Path | str, key: tuple[tuple[str, ...], i
     """Location of pre-SQLite JSON caches, retained only for explicit cleanup."""
     payload = json.dumps({"roots": key[0], "max_depth": key[1]}, ensure_ascii=False, sort_keys=True)
     digest = hashlib.sha1(payload.encode("utf-8", errors="surrogatepass")).hexdigest()
-    return Path(cache_root).resolve() / "数据" / IMAGE_INDEX_CACHE_DIR_NAME / f"{digest}.json"
+    return Path(os.path.abspath(str(cache_root))) / "数据" / IMAGE_INDEX_CACHE_DIR_NAME / f"{digest}.json"
 
 
 def clear_image_index(
@@ -393,12 +450,15 @@ def clear_image_index(
         _IMAGE_INDEX_CACHE.clear()
     with _SEARCH_INDEX_LOCK:
         _SEARCH_INDEX_CACHE.clear()
+    with _SCOPE_STATE_LOCK:
+        _SCOPE_STATE.clear()
     if root is None:
         return
-    workspace = Path(root).resolve()
+    workspace = Path(os.path.abspath(str(root)))
     roots = image_search_roots(workspace, extra_roots)
     effective_depth = image_search_depth(workspace, extra_roots, roots, max_depth)
     ImageIndexStore(workspace).clear_scope(roots, effective_depth)
+    _set_scope_state(roots, effective_depth, False, None)
     old_path = _image_index_disk_path(workspace, image_index_key(roots, effective_depth))
     try:
         old_path.unlink(missing_ok=True)
@@ -428,7 +488,7 @@ def image_search_results(
     canonical_photo_paths: dict[str, str] | None = None,
     match_mode: str = MATCH_MODE_FUZZY,
 ) -> list[ImageSearchResult]:
-    workspace = Path(root).resolve()
+    workspace = Path(os.path.abspath(str(root)))
     query = query.strip()
     if not query:
         return []
@@ -446,10 +506,11 @@ def image_search_results(
     candidate_limit = max(limit * 3, limit + 20)
     if index is None:
         store = ImageIndexStore(workspace)
-        if force_rebuild or not store.has_scope(all_roots, effective_depth):
+        if force_rebuild or not _scope_state(workspace, all_roots, effective_depth)[0]:
             update = store.reconcile_scope(all_roots, effective_depth, should_stop)
             if update.cancelled:
                 return []
+            _set_scope_state(all_roots, effective_depth, True, store.get_scope_last_scan_timestamp(all_roots, effective_depth))
         # 旧：store.search_entries（tokens 表 JOIN + 渐进退化，取回 limit*3 条后才按后缀过滤，
         #     大量 JPG 会把 TIF 挤出候选）。现：SQL 按"首段子串 + 后缀"预筛，再统一打分。
         candidates = store.iter_candidates(all_roots, candidate_needle(query), allowed_suffixes, effective_depth)
@@ -461,12 +522,14 @@ def image_search_results(
     if not ranked:
         return []
 
-    linked = {str(path.resolve()) for path in linked_paths}
-    canonical_by_path = {
-        str(Path(path).resolve()): str(Path(canonical).resolve())
-        for path, canonical in (canonical_photo_paths or {}).items()
+    # 2026-10-02：装配阶段不再 resolve()（旧：每条候选 resolve+exists ×150，网络盘上几秒）。
+    # 路径键 = normcase(abspath)，纯字符串；exists() 只对真正返回的结果做。
+    linked = {_path_key(path) for path in linked_paths}
+    canonical_by_path: dict[str, Path] = {
+        _path_key(path): Path(canonical) for path, canonical in (canonical_photo_paths or {}).items()
     }
-    matched_path_keys = {str(item.entry.path.resolve()) for item in ranked if item.entry.path.exists()}
+    vouchers_norm = {_path_key(k): v for k, v in (path_to_vouchers or {}).items()}
+    matched_path_keys = {_path_key(item.entry.path) for item in ranked}
     seen_canonical: set[str] = set()
     results: list[ImageSearchResult] = []
     for item in ranked:
@@ -474,23 +537,25 @@ def image_search_results(
             break
         entry = item.entry
         path = entry.path
-        if not path.exists():
-            continue
-        path_key = str(path.resolve())
-        canonical_key = canonical_by_path.get(path_key, path_key)
+        path_key = _path_key(path)
+        canonical_path = canonical_by_path.get(path_key)
+        canonical_key = _path_key(canonical_path) if canonical_path is not None else path_key
         if path_key != canonical_key and canonical_key in matched_path_keys:
-            continue
+            continue  # 原图与归档副本同时命中：只显示归档副本那一条
         if canonical_key in seen_canonical:
             continue
+        if not path.exists():
+            continue
         seen_canonical.add(canonical_key)
-        display_path = Path(canonical_key) if path_key != canonical_key and Path(canonical_key).exists() else path
+        display_path = path
+        if canonical_path is not None and canonical_key != path_key and canonical_path.exists():
+            display_path = canonical_path
         relative = relative_display(display_path, workspace)
         is_linked = canonical_key in linked or path_key in linked
         # 原代码：linked_vouchers 仅在 is_linked 为 True 时才查询，导致关联到
         # 其他标本的照片不显示入库编号。修复：无条件查询 path_to_vouchers，
         # 让用户看到所有关联到的入库编号（不仅是当前标本的）。
-        vouchers = path_to_vouchers or {}
-        linked_vouchers = (vouchers.get(canonical_key) or vouchers.get(path_key) or []) or None
+        linked_vouchers = (vouchers_norm.get(canonical_key) or vouchers_norm.get(path_key) or []) or None
         results.append(
             ImageSearchResult(
                 path=display_path,
@@ -580,8 +645,9 @@ def default_image_query(specimen: Row | None) -> str:
 
 
 def relative_display(path: Path | str, root: Path | str) -> str:
-    file_path = Path(path).resolve()
-    workspace = Path(root).resolve()
+    # 旧：两次 resolve()（网络盘往返）。现：abspath 纯字符串。
+    file_path = Path(os.path.abspath(str(path)))
+    workspace = Path(os.path.abspath(str(root)))
     try:
         return "./" + file_path.relative_to(workspace).as_posix()
     except ValueError:

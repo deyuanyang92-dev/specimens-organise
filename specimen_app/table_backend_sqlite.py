@@ -17,6 +17,7 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
+from .local_cache import read_only_sqlite_uri
 from .table_backend import Row, split_table_key
 
 SCHEMA_VERSION = 1
@@ -46,7 +47,7 @@ class SqliteBackend:
         if self._read_only:
             # 只读副本：mode=ro 打开，不改 journal_mode、不建 meta、关库不 checkpoint —— 零副作用
             self._conn = sqlite3.connect(
-                f"file:{self.db_path.as_posix()}?mode=ro", uri=True, timeout=10, check_same_thread=False, isolation_level=None
+                read_only_sqlite_uri(self.db_path), uri=True, timeout=10, check_same_thread=False, isolation_level=None
             )
             self._conn.execute("PRAGMA busy_timeout=10000")
             return

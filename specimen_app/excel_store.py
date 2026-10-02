@@ -110,6 +110,7 @@ from .models import (
 from .models import CHANGE_DETAIL_KEY, CHANGE_SUMMARY_KEY, MANAGED_TABLE_HEADERS, MANAGED_TABLE_KEYS, SQLITE_DATA_FILE, SQLITE_DATA_SCHEMA_VERSION, XLSX_DATA_SCHEMA_VERSION  # noqa: E402,F401
 from .workspace_convert import ConversionReport, convert_workspace  # noqa: E402
 from .excel_mirror import ExportResult, dirty_keys, expand_to_whole_files, export as _export_mirror  # noqa: E402
+from . import workspace_tables as _workspace_tables  # noqa: E402  2026-10-02 跨工作区读取（有 sqlite 读 sqlite）
 
 # 新工作区默认后端。第 2 段收尾（Task 11）切到 "sqlite"；在那之前保持 "xlsx" 让每个提交的全量测试都绿。
 DEFAULT_NEW_WORKSPACE_BACKEND = "xlsx"
@@ -530,6 +531,42 @@ class ExcelStore:
         for file_name, reason in result.failed.items():
             print(f"[excel_store] Excel 镜像 {file_name} 未能写入：{reason}", file=sys.stderr)
         return result
+
+    def downgrade_to_xlsx_workspace(self) -> Path | None:
+        """设计 2.3「导出 Excel 并降级工作区」：让旧版软件能重新打开。
+
+        全量生成 Excel → 逐表读回与库比对 → 关库 → 标本数据.sqlite 改名 .bak-<时间>（不删）→
+        配置版本回 1.1.3、去掉 storage_backend → 切回 XlsxBackend。任何一步失败都不降级（抛 RuntimeError）。
+        xlsx 模式下返回 None。
+        """
+        if self._storage_backend_name != "sqlite":
+            return None
+        if self._read_only:
+            raise RuntimeError("只读副本不能降级工作区")
+        result = self.export_excel_mirror(all_tables=True)
+        if result.failed:
+            detail = "；".join(f"{name}: {reason}" for name, reason in result.failed.items())
+            raise RuntimeError(f"导出 Excel 失败，未降级：{detail}")
+        xlsx = self._make_xlsx_backend()
+        for key in MANAGED_TABLE_KEYS:
+            if xlsx.read_rows(key, MANAGED_TABLE_HEADERS[key]) != self._backend.read_rows(key, MANAGED_TABLE_HEADERS[key]):
+                raise RuntimeError(f"{key} 导出的 Excel 与数据库内容不一致，未降级")
+        self._backend.close()
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = self.sqlite_path.with_name(f"{SQLITE_DATA_FILE}.bak-{stamp}")
+        os.replace(self.sqlite_path, backup)
+        for stale in (Path(str(self.sqlite_path) + "-wal"), Path(str(self.sqlite_path) + "-shm")):
+            try:
+                stale.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._backend = xlsx
+        self._storage_backend_name = "xlsx"
+        self.config.pop("storage_backend", None)
+        self.config["data_schema_version"] = XLSX_DATA_SCHEMA_VERSION
+        self._save_config()
+        self._reset_backend_caches()
+        return backup
 
     def _table_key_for(self, path: Path) -> str | None:
         """数据目录内的表文件 → 后端 key（文件名）；别的工作区 / 快照 / 子目录里的文件 → None（直接读 xlsx）。
@@ -974,6 +1011,12 @@ class ExcelStore:
         """
         key = self._table_key_for(path)
         if key is None:
+            if _workspace_tables.sqlite_file_for(path) is not None:
+                for row in _workspace_tables.read_table(path, column_aliases=COLUMN_ALIASES)[1]:
+                    picked = {k: v for k, v in row.items() if k in wanted_columns}
+                    if picked:
+                        yield picked
+                return
             yield from XlsxBackend(
                 Path(path).parent, fit_row=self._fit_headers, to_string=self._string, column_aliases=COLUMN_ALIASES
             ).stream_columns(Path(path).name, wanted_columns)
@@ -4997,7 +5040,8 @@ class ExcelStore:
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def _read_external_rows(self, path: Path, required_headers: list[str]) -> list[Row]:
-        if not path.exists():
+        # 旧：if not path.exists(): return []（SQLite 模式的源工作区没有 xlsx 也要能读）
+        if not path.exists() and _workspace_tables.sqlite_file_for(path) is None:
             return []
         return [self._fit_headers(row, required_headers) for row in self._read_plain_rows(path, required_headers)]
 
@@ -5006,6 +5050,8 @@ class ExcelStore:
         key = self._table_key_for(path)
         if key is not None:
             return self._backend.headers(key)
+        if _workspace_tables.sqlite_file_for(path) is not None:
+            return _workspace_tables.read_table(path)[0]
         return xlsx_headers(path, self._string)
 
     def _read_plain_rows(self, path: Path, fallback_headers: list[str] | None = None) -> list[Row]:
@@ -5013,7 +5059,9 @@ class ExcelStore:
         key = self._table_key_for(path)
         if key is not None:
             return self._backend.read_rows(key, fallback_headers)
-        # 外部路径（导入别的工作区、快照目录）仍直接读 xlsx 文件
+        # 外部路径（导入别的工作区、快照目录）：对方是 SQLite 模式（可能没生成镜像）→ 读它的库；否则直接读 xlsx
+        if _workspace_tables.sqlite_file_for(path) is not None:
+            return _workspace_tables.read_table(path, fallback_headers, COLUMN_ALIASES)[1]
         return xlsx_read_rows(path, self._string, COLUMN_ALIASES, fallback_headers)
 
     def _read_sheet_rows(self, path: Path, sheet_name: str, fallback_headers: list[str]) -> list[Row]:
@@ -5133,7 +5181,7 @@ _SERIALIZED_MUTATORS = (
     "downgrade_schema_version", "batch_reserve_vouchers", "log_alloc_event", "cancel_batch_reservation",
     "reset_next_serial", "rollback_to_voucher", "cancel_placeholder_vouchers", "void_vouchers", "set_active_series",
     "add_series", "remove_series", "update_series_counter", "upgrade_to_multi_user_protocol", "undo_last", "redo_last",
-    "import_workspace",
+    "import_workspace", "downgrade_to_xlsx_workspace",
 )
 # create_data_snapshot / export_excel_mirror 不在此列：它们用 _mirror_lock（见 __init__ 注释）。
 for _name in _SERIALIZED_MUTATORS:
