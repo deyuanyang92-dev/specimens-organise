@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Protocol
 
@@ -182,8 +183,9 @@ class XlsxBackend:
         return self.data_dir / split_table_key(key)[0]
 
     def _atomic_save(self, wb: Any, path: Path) -> None:
-        # 旧：tmp = path.with_suffix(f".{os.getpid()}.tmp"); wb.save(tmp); 校验; tmp.replace(path)
-        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        # 旧：tmp = path.with_suffix(f".{os.getpid()}.tmp")——两个线程同时写同一本（后台字段保存 + 主线程照片保存）
+        #     会共用一个 tmp 名，互相覆盖 → WorkbookWriteVerificationFailed。现：tmp 名带线程 id。
+        tmp = path.with_suffix(f".{os.getpid()}-{threading.get_ident()}.tmp")
         try:
             wb.save(tmp)
             if self._verify_file is not None:

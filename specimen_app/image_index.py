@@ -344,6 +344,26 @@ class ImageIndexStore:
 
     # -- 连接 / 结构 ---------------------------------------------------------
 
+    def _connect_read_only(self) -> sqlite3.Connection:
+        """只读查询专用（UI 线程会调 has_scope / last_scan）：mode=ro，不建库、不建表、不迁移。
+
+        2026-10-02 用户升级 0.10.32 后"一打开就未响应"：旧 tokens 表可达数百 MB，_connect 里的
+        v1→v2 迁移（DROP tokens）在 GUI 线程上要几秒。迁移改为只在 reconcile（工作线程）里做。
+        """
+        if not self.path.exists():
+            raise FileNotFoundError(self.path)
+        conn = sqlite3.connect(f"file:{self.path.as_posix()}?mode=ro", uri=True, timeout=10)
+        conn.create_function("py_lower", 1, _py_lower, deterministic=True)
+        return conn
+
+    @contextmanager
+    def _read_connection(self):
+        conn = self._connect_read_only()
+        try:
+            yield conn
+        finally:
+            conn.close()
+
     def _connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self.path), timeout=10)
@@ -441,9 +461,9 @@ class ImageIndexStore:
             return False
         scope_key = self.scope_key(roots, max_depth)
         try:
-            with self._connection() as conn:
+            with self._read_connection() as conn:
                 return conn.execute("SELECT 1 FROM scopes WHERE scope_key = ?", (scope_key,)).fetchone() is not None
-        except sqlite3.Error:
+        except (sqlite3.Error, OSError):
             return False
 
     def get_scope_last_scan_timestamp(self, roots: list[Path | str], max_depth: int = 0) -> float | None:
@@ -452,9 +472,9 @@ class ImageIndexStore:
             return None
         scope_key = self.scope_key(roots, max_depth)
         try:
-            with self._connection() as conn:
+            with self._read_connection() as conn:
                 row = conn.execute("SELECT last_scan FROM scopes WHERE scope_key = ?", (scope_key,)).fetchone()
-        except sqlite3.Error:
+        except (sqlite3.Error, OSError):
             return None
         if row is None:
             return None
@@ -622,11 +642,11 @@ class ImageIndexStore:
             return []
         scope_key = self.scope_key(roots, max_depth)
         try:
-            with self._connection() as conn:
+            with self._read_connection() as conn:
                 rows = conn.execute(
                     "SELECT path, file_name, stem, suffix FROM entries WHERE scope_key = ?", (scope_key,)
                 ).fetchall()
-        except sqlite3.Error:
+        except (sqlite3.Error, OSError):
             return []
         return [self._row_entry(row) for row in rows]
 
@@ -651,8 +671,8 @@ class ImageIndexStore:
             sql += " AND suffix IN (" + ",".join("?" for _ in allowed) + ")"
             params.extend(allowed)
         try:
-            conn = self._connect()
-        except sqlite3.Error:
+            conn = self._connect_read_only()
+        except (sqlite3.Error, OSError):
             return
         try:
             cursor = conn.execute(sql, params)

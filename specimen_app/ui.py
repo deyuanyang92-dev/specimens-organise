@@ -10814,6 +10814,15 @@ def run_app(workspace_root: Path | str | None) -> None:
         except Exception:
             pass
     app = QApplication.instance() or QApplication(sys.argv)
+    # 2026-10-02 GUI 卡死探针：主线程停摆 >2 s 就把调用栈写进崩溃日志目录（gui_stall_*.log），下次再卡能直接定位
+    try:
+        from .ui_watchdog import GuiStallWatchdog
+
+        _gui_watchdog = GuiStallWatchdog(threshold_seconds=2.0, parent=app)
+        _gui_watchdog.start()
+        app.aboutToQuit.connect(_gui_watchdog.stop)
+    except Exception as _wd_exc:  # noqa: BLE001
+        print(f"[watchdog] 未能启动 GUI 卡死探针：{_wd_exc}", file=sys.stderr)
     # 记录系统默认字号,并应用用户保存的全局字体大小(窗口创建前完成,新窗口即继承)。
     global _default_app_font_point
     _default_app_font_point = app.font().pointSize()
