@@ -20,6 +20,7 @@ ACTION_LOG_FILE = "操作记录.xlsx"
 TRANSACTION_JOURNAL_FILE = "transaction.jsonl"  # plan C1：跨文件事务恢复 journal
 DATA_VERSION_LOG_FILE = "数据版本记录.xlsx"
 ALLOC_LOG_FILE = "编号分发记录.xlsx"
+SQLITE_DATA_FILE = "标本数据.sqlite"  # 2026-10-02：SQLite 真相源（第 2 段）；存在即新模式
 WORKSPACE_CONFIG_FILE = "工作区配置.json"
 DATA_VERSION_DIR = "数据版本"
 CURRENT_DATA_SCHEMA_VERSION = "1.1.3"
@@ -362,3 +363,21 @@ class AggregatePreview:
 
 
 Row = dict[str, Any]
+
+
+# 2026-10-02 路线 1：表后端 key。修改记录.xlsx 两张 sheet 用 "文件名::sheet名"。
+# MANAGED_TABLE_KEYS = 受 SqliteBackend 管理的表；操作记录.xlsx（兜底）、入库人员.xlsx、冲突报告不受管。
+from .table_backend import SHEET_SEP as _SHEET_SEP  # noqa: E402  (table_backend 只依赖 stdlib，无循环)
+
+CHANGE_DETAIL_KEY = f"{CHANGE_LOG_FILE}{_SHEET_SEP}修改明细"
+CHANGE_SUMMARY_KEY = f"{CHANGE_LOG_FILE}{_SHEET_SEP}修改汇总"
+MANAGED_TABLE_KEYS: tuple[str, ...] = (
+    SPECIMEN_FILE,
+    PHOTO_FILE,
+    CLASSIFICATION_FILE,
+    INDEX_FILE,
+    CHANGE_DETAIL_KEY,
+    CHANGE_SUMMARY_KEY,
+    ALLOC_LOG_FILE,
+    DATA_VERSION_LOG_FILE,
+)

@@ -105,9 +105,8 @@ from .models import (
     StatusFlags,
 )
 
-# 2026-10-02 路线 1：修改记录.xlsx 两张 sheet 在表后端里的 key（"文件名::sheet名"）
-CHANGE_DETAIL_KEY = f"{CHANGE_LOG_FILE}{SHEET_SEP}修改明细"
-CHANGE_SUMMARY_KEY = f"{CHANGE_LOG_FILE}{SHEET_SEP}修改汇总"
+# 2026-10-02：CHANGE_DETAIL_KEY / CHANGE_SUMMARY_KEY / MANAGED_TABLE_KEYS / SQLITE_DATA_FILE 定义在 models.py
+from .models import CHANGE_DETAIL_KEY, CHANGE_SUMMARY_KEY, MANAGED_TABLE_KEYS, SQLITE_DATA_FILE  # noqa: E402,F401
 
 # plan A4 常量：snapshot 完整性
 SNAPSHOT_MANIFEST_FILENAME = "snapshot_manifest.json"
