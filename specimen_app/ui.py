@@ -8456,7 +8456,8 @@ class ImageSearchDialog(QDialog):
         else:
             self.status_label.setText(f"正在后台建立图片索引，并检索 {query}...")
 
-        linked_paths = [self.app.store.resolve_photo_path(row) for row in self.app.current_photos]
+        # 旧：resolve_photo_path(row)（每张 is_dir+resolve+exists，网络盘上主线程卡）。现：纯字符串候选，键在检索侧归一。
+        linked_paths = [p for row in self.app.current_photos for p in self.app.store.photo_path_candidates(row)]
         specimen = self.app.store.get_specimen(self.app.current_voucher) or {}
         classification = self.app.store.get_classification(self.app.current_voucher) or {}
         self._search_token += 1

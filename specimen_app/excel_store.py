@@ -1184,41 +1184,115 @@ class ExcelStore:
         # fallback：索引未建（缓存被驱逐 + 重读流程间隙），降级线性
         return [row for row in rows if self._value(row, "入库编号*") == voucher]
 
-    def get_all_photo_voucher_map(self) -> dict[str, list[str]]:
-        """Return mapping from resolved photo path to list of voucher numbers.
+    # ------------------------------------------------------------------
+    # 2026-10-02 照片路径的"纯字符串"候选（不碰文件系统）
+    # 旧 get_all_photo_voucher_map / get_photo_search_alias_map 对每张照片 resolve_photo_path（is_dir + 2 次
+    # resolve + 逐候选 exists）再 resolve ×2 —— 1306 张照片在网络盘上每次打开检索窗口都是分钟级的网络往返。
+    # 检索窗口只需要"同一张照片的所有写法"来标记已关联 / 折叠原图与归档副本，不需要知道哪条真实存在：
+    # image_search_results 用 normcase+abspath 做键，这里给出同样规则的候选即可。
+    # ------------------------------------------------------------------
+    def _join_relative_nofs(self, root: Path, relative: str) -> Path:
+        """_resolve_relative 的无文件系统版本：同样的 ./ 处理与越界检查，但用 abspath 字符串运算。"""
+        text = str(relative or "").strip()
+        if text.startswith("./"):
+            text = text[2:]
+        base = os.path.abspath(str(root))
+        raw = Path(text)
+        joined = os.path.abspath(text) if raw.is_absolute() else os.path.abspath(os.path.join(base, text))
+        try:
+            Path(joined).relative_to(base)
+        except ValueError:
+            return Path(base) / "__invalid_photo_path__" / raw.name
+        return Path(joined)
 
-        Used by the image search dialog to show which voucher(s) an
-        already-linked photo belongs to.
-        """
+    def photo_path_candidates(self, photo_row: Row) -> list[Path]:
+        """与 resolve_photo_path 相同的候选顺序（相对路径 → 来源工作区 → 绝对路径 → 原始路径 → 根/文件名），
+        纯字符串，不 resolve / exists / is_dir。"""
+        candidates: list[Path] = []
+        relative = self._value(photo_row, "相对路径")
+        if relative:
+            candidates.append(self._join_relative_nofs(self.root, relative))
+        source_root = self._value(photo_row, "来源工作区根路径")
+        if relative and source_root:
+            candidates.append(self._join_relative_nofs(Path(source_root), relative))
+        absolute = self._value(photo_row, "绝对路径")
+        if absolute:
+            candidates.append(Path(os.path.abspath(os.path.expanduser(absolute))))
+        original = self._value(photo_row, "原始路径")
+        if original:
+            candidates.append(Path(os.path.abspath(os.path.expanduser(original))))
+        if not candidates:
+            candidates.append(self.root / self._value(photo_row, "文件名"))
+        seen: set[str] = set()
+        unique: list[Path] = []
+        for path in candidates:
+            key = os.path.normcase(str(path))
+            if key not in seen:
+                seen.add(key)
+                unique.append(path)
+        return unique
+
+    # 旧（v0.10.36 及之前，§7 保留）：每行 resolve_photo_path + resolve ×2 —— 1306 行 = 15 672 次文件系统往返
+    # def get_all_photo_voucher_map(self) -> dict[str, list[str]]:
+    #     """Return mapping from resolved photo path to list of voucher numbers.
+    #
+    #     Used by the image search dialog to show which voucher(s) an
+    #     already-linked photo belongs to.
+    #     """
+    #     result: dict[str, list[str]] = {}
+    #     for row in self.read_rows("photo"):
+    #         voucher = self._value(row, "入库编号*")
+    #         if not voucher:
+    #             continue
+    #         resolved = str(self.resolve_photo_path(row))
+    #         result.setdefault(resolved, []).append(voucher)
+    #     return result
+    #
+    # def get_photo_search_alias_map(self) -> dict[str, str]:
+    #     """Map archived/original search paths to the canonical stored photo path.
+    #
+    #     Copy-mode photo rows retain the source path in ``原始路径``. When both
+    #     source and archived copy are within the search scope, this mapping lets
+    #     the UI show one linked photo without hashing every search result.
+    #     """
+    #     aliases: dict[str, str] = {}
+    #     for row in self.read_rows("photo"):
+    #         try:
+    #             canonical = str(self.resolve_photo_path(row).resolve())
+    #         except OSError:
+    #             continue
+    #         aliases[canonical] = canonical
+    #         original = self._value(row, "原始路径")
+    #         if original:
+    #             try:
+    #                 aliases[str(Path(original).resolve())] = canonical
+    #             except OSError:
+    #                 pass
+    #     return aliases
+
+    def get_all_photo_voucher_map(self) -> dict[str, list[str]]:
+        """照片路径（含所有别名写法）→ 入库编号列表。供检索窗口标记"已关联到哪些编号"。纯字符串，不碰文件系统。"""
         result: dict[str, list[str]] = {}
         for row in self.read_rows("photo"):
             voucher = self._value(row, "入库编号*")
             if not voucher:
                 continue
-            resolved = str(self.resolve_photo_path(row))
-            result.setdefault(resolved, []).append(voucher)
+            for candidate in self.photo_path_candidates(row):
+                bucket = result.setdefault(str(candidate), [])
+                if voucher not in bucket:
+                    bucket.append(voucher)
         return result
 
     def get_photo_search_alias_map(self) -> dict[str, str]:
-        """Map archived/original search paths to the canonical stored photo path.
-
-        Copy-mode photo rows retain the source path in ``原始路径``. When both
-        source and archived copy are within the search scope, this mapping lets
-        the UI show one linked photo without hashing every search result.
-        """
+        """别名路径（原始路径等）→ 规范路径（首选候选，通常是归档副本）。纯字符串，不碰文件系统。"""
         aliases: dict[str, str] = {}
         for row in self.read_rows("photo"):
-            try:
-                canonical = str(self.resolve_photo_path(row).resolve())
-            except OSError:
+            candidates = self.photo_path_candidates(row)
+            if not candidates:
                 continue
-            aliases[canonical] = canonical
-            original = self._value(row, "原始路径")
-            if original:
-                try:
-                    aliases[str(Path(original).resolve())] = canonical
-                except OSError:
-                    pass
+            canonical = str(candidates[0])
+            for candidate in candidates:
+                aliases.setdefault(str(candidate), canonical)
         return aliases
 
     def create_specimen(self, initial_fields: dict | None = None) -> str:
