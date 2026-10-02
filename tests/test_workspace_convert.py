@@ -107,6 +107,29 @@ class ModeSelectionTests(unittest.TestCase):
             with self.assertRaises(ImportConflictError):
                 ExcelStore(self.tmp)
 
+    def test_new_xlsx_workspace_keeps_schema_1_1_3_so_older_versions_can_open_it(self):
+        store = ExcelStore(self.tmp, backend="xlsx")
+        try:
+            self.assertEqual(store.config.get("data_schema_version"), "1.1.3")
+            self.assertNotIn("storage_backend", store.config)
+        finally:
+            store.close()
+
+    def test_existing_xlsx_workspace_is_not_bumped_to_1_2_0_on_reopen(self):
+        store = ExcelStore(self.tmp, backend="xlsx")
+        store.close()
+        cfg = self.data / WORKSPACE_CONFIG_FILE
+        data = json.loads(cfg.read_text("utf-8"))
+        data["data_schema_version"] = "1.1.3"
+        cfg.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
+        store = ExcelStore(self.tmp)  # 自动模式：只有 xlsx → xlsx
+        try:
+            self.assertEqual(store.storage_backend_name, "xlsx")
+            self.assertEqual(store.config.get("data_schema_version"), "1.1.3")
+        finally:
+            store.close()
+        self.assertEqual(json.loads(cfg.read_text("utf-8")).get("data_schema_version"), "1.1.3")
+
     def test_undo_redo_work_in_sqlite_mode(self):
         store = ExcelStore(self.tmp, backend="sqlite")
         try:

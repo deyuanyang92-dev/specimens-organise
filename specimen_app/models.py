@@ -25,6 +25,7 @@ WORKSPACE_CONFIG_FILE = "工作区配置.json"
 DATA_VERSION_DIR = "数据版本"
 CURRENT_DATA_SCHEMA_VERSION = "1.2.0"  # 旧：1.1.3。1.2.0 = SQLite 真相源工作区（2026-10-02）；旧版软件遇到它会提示升级
 SQLITE_DATA_SCHEMA_VERSION = "1.2.0"
+XLSX_DATA_SCHEMA_VERSION = "1.1.3"  # 新建的 xlsx 工作区仍打这个号：旧版软件照常能开；只有 sqlite 工作区才升 1.2.0
 
 SPECIMEN_HEADERS = [
     "入库编号*",

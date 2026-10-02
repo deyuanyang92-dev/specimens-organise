@@ -107,7 +107,7 @@ from .models import (
 )
 
 # 2026-10-02：CHANGE_DETAIL_KEY / CHANGE_SUMMARY_KEY / MANAGED_TABLE_KEYS / SQLITE_DATA_FILE 定义在 models.py
-from .models import CHANGE_DETAIL_KEY, CHANGE_SUMMARY_KEY, MANAGED_TABLE_HEADERS, MANAGED_TABLE_KEYS, SQLITE_DATA_FILE, SQLITE_DATA_SCHEMA_VERSION  # noqa: E402,F401
+from .models import CHANGE_DETAIL_KEY, CHANGE_SUMMARY_KEY, MANAGED_TABLE_HEADERS, MANAGED_TABLE_KEYS, SQLITE_DATA_FILE, SQLITE_DATA_SCHEMA_VERSION, XLSX_DATA_SCHEMA_VERSION  # noqa: E402,F401
 from .workspace_convert import ConversionReport, convert_workspace  # noqa: E402
 from .excel_mirror import ExportResult, dirty_keys, expand_to_whole_files, export as _export_mirror  # noqa: E402
 
@@ -124,6 +124,55 @@ from .app_settings import PHOTO_MANAGEMENT_OPTIONS
 from .accession_series import AccessionSeries, format_series_number, series_prefix_of
 from .parsing import derive_specimen_fields_from_tube_number, format_voucher, parse_voucher_serial
 from .startup_diag import mark as _startup_mark
+
+
+# 2026-10-02 工作区锁自愈规则（用户多次反馈"非常容易锁定"）：
+#   本机持有：PID 已不存在 → 立即 stale；心跳超 LOCK_STALE_SAME_HOST_SECONDS → stale。
+#   外机持有：心跳超 LOCK_STALE_FOREIGN_SECONDS → stale（对方写前心跳自检 180 s 就会拦住它写，600 s 足够安全）；
+#            外机 PID 在本机"不存在"是常态，不作依据。
+# 旧：本机 600 s；外机永不自动 stale（docstring 与 assert_heartbeat_thread_is_alive 的注释"过 10 分钟其他主机会
+#     把锁视为 stale 抢走"自相矛盾）→ 卡死被杀后 10 分钟内重开必弹"被占用"，换账号/换机后永远要手动强制解锁。
+LOCK_STALE_SAME_HOST_SECONDS = 180
+LOCK_STALE_FOREIGN_SECONDS = 600
+
+
+def pid_is_running(pid: int) -> bool:
+    """同一内核下的 PID 判活。Windows 走 OpenProcess（os.kill 在 Windows 上不可靠）；POSIX 走 kill(pid, 0)。
+    拿不准（权限不足）一律当作"活着"，宁可让用户手动解锁，不可误清活锁。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if handle:
+                still_active = ctypes.c_ulong()
+                alive = True
+                try:
+                    if kernel32.GetExitCodeProcess(handle, ctypes.byref(still_active)):
+                        alive = still_active.value == 259  # STILL_ACTIVE
+                finally:
+                    kernel32.CloseHandle(handle)
+                return alive
+            return kernel32.GetLastError() == 5  # ERROR_ACCESS_DENIED：存在但无权限 → 当作活
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
 
 
 def load_or_create_persistent_host_id() -> str:
@@ -172,7 +221,7 @@ DEFAULT_CONFIG = {
     "prefix": "YZZ",
     "next_serial": 1,
     "undo_depth": 200,
-    "data_schema_version": CURRENT_DATA_SCHEMA_VERSION,
+    "data_schema_version": XLSX_DATA_SCHEMA_VERSION,  # 旧：CURRENT（现 1.2.0）；xlsx 工作区必须保持 1.1.3 让旧版能开
     # 多系列入库编号支持（旧工作区缺失这两个键时用此默认值，行为与升级前完全一致）
     "active_series_name": "YZZ",
     "accession_series": [],
@@ -219,6 +268,12 @@ class ExcelStore:
         # Tier A 后台写线程保护：RLock（可重入）确保主线程读和后台线程写不发生 race。
         # 同一线程内的嵌套调用（如 _append_row_incremental 回退时调 read_rows）仍可安全获取。
         self._rw_lock = threading.RLock()
+        # 2026-10-02：所有改数据的公开方法串行（见文件末尾 _SERIALIZED_MUTATORS）。读不拿这把锁，永不等写。
+        self._mutation_lock = threading.RLock()
+        # 快照 / Excel 镜像用单独的锁：事务快照跑在 helper 线程里（NAS 软超时设计），外层方法持 _mutation_lock 等它，
+        # 若快照也要 _mutation_lock 就死锁（2026-10-02 test_m4_guards 实测）。sqlite 文件用 backup API 拷，
+        # 与写者并发也一致；xlsx 文件写入本来就是原子替换。
+        self._mirror_lock = threading.RLock()
         # 2026-10-02 路线 1「换底不换壳」：表格读写原语收口到 TableBackend；第 1 段恒为 XlsxBackend，
         # 第 2 段按工作区选 SqliteBackend。业务逻辑（撤销/指纹/派生/锁/快照/事务）不动。
         self._backend = self._make_xlsx_backend()
@@ -338,7 +393,17 @@ class ExcelStore:
         except Exception:
             pass
         text = str(self.root)
-        return text.startswith("\\\\") or text.startswith("//")
+        if text.startswith("\\\\") or text.startswith("//"):
+            return True
+        if sys.platform.startswith("win") and len(text) >= 2 and text[1] == ":":
+            try:
+                import ctypes
+
+                drive_type = ctypes.windll.kernel32.GetDriveTypeW(text[:3])  # type: ignore[attr-defined]
+                return drive_type == 4  # DRIVE_REMOTE：映射的网络盘（如 M:）
+            except Exception:
+                return False
+        return False
 
     def _select_backend(self) -> None:
         """设计第 1 节「模式识别」。读取 self._backend_choice（构造参数）与磁盘状态决定后端。
@@ -458,24 +523,38 @@ class ExcelStore:
         if not keys:
             return ExportResult()
         keys = expand_to_whole_files(keys, MANAGED_TABLE_KEYS)
-        result = _export_mirror(
-            self._backend, self._make_xlsx_backend(), keys, lambda key: list(MANAGED_TABLE_HEADERS[key])
-        )
+        with self._mirror_lock:
+            result = _export_mirror(
+                self._backend, self._make_xlsx_backend(), keys, lambda key: list(MANAGED_TABLE_HEADERS[key])
+            )
         for file_name, reason in result.failed.items():
             print(f"[excel_store] Excel 镜像 {file_name} 未能写入：{reason}", file=sys.stderr)
         return result
 
     def _table_key_for(self, path: Path) -> str | None:
-        """数据目录内的表文件 → 后端 key（文件名）；别的工作区 / 快照 / 子目录里的文件 → None（直接读 xlsx）。"""
-        try:
-            rel = Path(path).resolve().relative_to(self.data_dir.resolve())
-        except (ValueError, OSError):
-            return None
-        if len(rel.parts) != 1:
-            return None
-        if self._storage_backend_name == "sqlite" and rel.name not in _MANAGED_FILE_NAMES:
+        """数据目录内的表文件 → 后端 key（文件名）；别的工作区 / 快照 / 子目录里的文件 → None（直接读 xlsx）。
+
+        旧：每次 Path.resolve() 两次——网络盘上 resolve 要打开目录做一次往返，而本方法每次表访问都调
+        （启动期 30+ 次，慢盘剖析里占 0.5 s）。现：数据目录内的常规路径纯字符串比较，不碰磁盘；
+        只有不在数据目录下（且不在其子目录下）的外部路径才 resolve 一次。
+        """
+        candidate = Path(path)
+        data_dir = self.data_dir
+        if candidate.parent == data_dir:
+            name = candidate.name
+        elif data_dir in candidate.parents:
+            return None  # 数据版本/ 等子目录里的文件：不是受管表
+        else:
+            try:
+                rel = candidate.resolve().relative_to(data_dir.resolve())
+            except (ValueError, OSError):
+                return None
+            if len(rel.parts) != 1:
+                return None
+            name = rel.name
+        if self._storage_backend_name == "sqlite" and name not in _MANAGED_FILE_NAMES:
             return None  # 操作记录.xlsx 兜底 / 入库人员.xlsx 等不受管文件：仍直接读写 xlsx
-        return rel.name
+        return name
 
     def close(self, export_excel: bool = True) -> None:
         """释放工作区锁文件。退出应用前应调用，避免遗留过期锁。
@@ -557,12 +636,18 @@ class ExcelStore:
             fd = os.open(self.lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             if not self._lock_is_stale():
-                content = ""
-                try:
-                    content = self.lock_file.read_text(encoding="utf-8")
-                except OSError:
-                    pass
-                raise WorkspaceLockedError(f"工作区已被占用：{content}")
+                holder = self.describe_lock_holder()
+                where = "本机" if holder["same_host"] else f"另一台电脑（{holder['hostname']}）"
+                age = holder["heartbeat_age_seconds"]
+                age_text = f"{age} 秒前" if age >= 0 else "未知"
+                # 旧：把整个 lock JSON 原样塞进消息。现：说人话——谁、哪台机、多久前还活着、多久会自动解锁。
+                limit = LOCK_STALE_SAME_HOST_SECONDS if holder["same_host"] else LOCK_STALE_FOREIGN_SECONDS
+                raise WorkspaceLockedError(
+                    f"工作区已被占用：{where} 的标本入库管理（PID {holder['pid']}）正在使用，"
+                    f"最近一次心跳在 {age_text}。\n"
+                    f"若那个程序已经退出或被结束，锁会在心跳停止 {limit // 60} 分钟后自动解除，"
+                    f"也可以立即点「强制解锁」。"
+                )
             try:
                 self.lock_file.unlink()
             except OSError:
@@ -605,21 +690,19 @@ class ExcelStore:
 
         if lock_host_id:
             # 新格式锁
+            heartbeat_age = self._lock_heartbeat_age_seconds(info)
             if lock_host_id != self._persistent_host_id:
-                # 外机持有：永不自动清；acquire_lock 会把 hostname 透回错误信息
-                return False
+                # 外机持有：旧逻辑永不自动清。现：心跳超 LOCK_STALE_FOREIGN_SECONDS 才 stale；PID 不作依据。
+                return heartbeat_age is not None and heartbeat_age > LOCK_STALE_FOREIGN_SECONDS
             # 本机
             lock_instance_id = str(info.get("instance_id", "")).strip()
             if pid == os.getpid() and lock_instance_id == self._instance_id:
                 return True  # 同进程同实例残留：自己清自己
-            heartbeat_at = str(info.get("heartbeat_at", "")).strip()
-            if heartbeat_at:
-                try:
-                    last_heartbeat = datetime.fromisoformat(heartbeat_at)
-                    if (datetime.now() - last_heartbeat).total_seconds() > 600:
-                        return True
-                except (ValueError, TypeError):
-                    pass
+            if not pid_is_running(pid):
+                return True  # 同一内核：进程已死（被任务管理器结束 / 崩溃）→ 立即自愈
+            # 旧：600 s。现：180 s（心跳 60 s 一次）
+            if heartbeat_age is not None and heartbeat_age > LOCK_STALE_SAME_HOST_SECONDS:
+                return True
             return False
 
         # 旧格式锁（无 host_id）：仅 ProcessLookupError 可信
@@ -642,6 +725,38 @@ class ExcelStore:
             # WSL 跨内核下 PermissionError 不可信，所以不 stale，把决定权交人工。
             return False
         return False
+
+    @staticmethod
+    def _lock_heartbeat_age_seconds(info: dict) -> float | None:
+        raw = str(info.get("heartbeat_at", "") or info.get("time", "")).strip()
+        if not raw:
+            return None
+        try:
+            return (datetime.now() - datetime.fromisoformat(raw)).total_seconds()
+        except (ValueError, TypeError):
+            return None
+
+    def describe_lock_holder(self) -> dict:
+        """给「工作区被占用」对话框用：谁、哪台机、PID、心跳多久没更新、按规则是否已算失效。"""
+        info: dict = {}
+        try:
+            info = json.loads(self.lock_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+            info = {}
+        try:
+            pid = int(info.get("pid", 0))
+        except (TypeError, ValueError):
+            pid = 0
+        host_id = str(info.get("host_id", "")).strip()
+        age = self._lock_heartbeat_age_seconds(info)
+        return {
+            "hostname": str(info.get("hostname", "") or "?"),
+            "pid": pid,
+            "same_host": bool(host_id) and host_id == self._persistent_host_id,
+            "started_at": str(info.get("started_at", "") or info.get("time", "")),
+            "heartbeat_age_seconds": -1 if age is None else int(age),
+            "stale": self._lock_is_stale() if self.lock_file.exists() else True,
+        }
 
     def write_lock_heartbeat_now(self) -> None:
         """plan B1：直接重写 lock file 把 ``heartbeat_at`` 字段刷新到当前时间。
@@ -2331,6 +2446,10 @@ class ExcelStore:
         )
 
     def create_data_snapshot(self, operation_type: str = "手动快照", summary: str = "") -> Path:
+        with self._mirror_lock:
+            return self._create_data_snapshot_unlocked(operation_type, summary)
+
+    def _create_data_snapshot_unlocked(self, operation_type: str, summary: str) -> Path:
         version_id = datetime.now().strftime("v%Y%m%d_%H%M%S")
         snapshot_dir = self.data_dir / DATA_VERSION_DIR / version_id
         suffix = 1
@@ -2351,7 +2470,10 @@ class ExcelStore:
             # 旧：只拷 .xlsx/.json。现：加 .sqlite（真相源）；-wal/-shm/.converting 临时文件不拷
             if path.is_file() and path.suffix.lower() in {".xlsx", ".json", ".sqlite"}:
                 target = snapshot_dir / path.name
-                shutil.copy2(path, target)
+                if path.suffix.lower() == ".sqlite" and path == self.sqlite_path and self._storage_backend_name == "sqlite":
+                    self._backend.backup_to(target)  # 在线备份：与并发写入也一致，不需要停写
+                else:
+                    shutil.copy2(path, target)
                 snapshot_files[path.name] = {
                     "sha256": self._file_sha256(target),
                     "size": target.stat().st_size,
@@ -3365,9 +3487,11 @@ class ExcelStore:
         # 都是浅拷贝 → DEFAULT_CONFIG["accession_series"]（list）等可变值会被多个实例共享，
         # 一个实例 add_series 后，下次 ExcelStore() 启动看到的"默认"已被污染。
         # 改用 deepcopy 杜绝跨实例 mutable 共享。
+        data_on_disk: dict[str, Any] | None = None
         if path.exists():
             with path.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
+            data_on_disk = copy.deepcopy(data)
             merged = copy.deepcopy(DEFAULT_CONFIG)
             merged.update(data)
         else:
@@ -3377,9 +3501,13 @@ class ExcelStore:
         if not merged.get("workspace_id"):
             merged["workspace_id"] = str(uuid.uuid4())
         if not merged.get("data_schema_version"):
-            merged["data_schema_version"] = CURRENT_DATA_SCHEMA_VERSION
+            # 旧：CURRENT_DATA_SCHEMA_VERSION（现为 1.2.0）→ 新建的 xlsx 工作区也被打成 1.2.0，旧版软件拒开。
+            # 现：新工作区先打 xlsx 版本号；_select_backend 选 sqlite 时才升到 1.2.0。
+            merged["data_schema_version"] = XLSX_DATA_SCHEMA_VERSION
         self.config = merged
-        self._save_config()
+        # 旧：每次打开都原子重写配置 JSON。现：内容没变就不写（网络盘上省一次写 + replace）。
+        if not path.exists() or merged != data_on_disk:
+            self._save_config()
         return merged
 
     def _assert_supported_data_schema(self) -> None:
@@ -3414,8 +3542,11 @@ class ExcelStore:
         # 但只升级了 config 版本号，没有向旧 Excel 追加列，导致旧标本全部显示 ×。
         # 此迁移用列存在性检查（不依赖版本号）确保幂等、向后兼容。
         self._migrate_add_has_physical_column()
-        if _version_tuple(current) < _version_tuple(CURRENT_DATA_SCHEMA_VERSION):
-            self.config["data_schema_version"] = CURRENT_DATA_SCHEMA_VERSION
+        # 旧：一律升到 CURRENT（1.2.0）→ 每个 xlsx 工作区一打开就被打成 1.2.0，旧版软件全部拒开（发布前测试拦下）。
+        # 现：xlsx 工作区的目标是 XLSX_DATA_SCHEMA_VERSION（1.1.3），只有 sqlite 工作区才是 1.2.0。
+        target = SQLITE_DATA_SCHEMA_VERSION if self._storage_backend_name == "sqlite" else XLSX_DATA_SCHEMA_VERSION
+        if _version_tuple(current) < _version_tuple(target):
+            self.config["data_schema_version"] = target
             self._save_config()
 
     def _migrate_add_has_physical_column(self) -> None:
@@ -3545,7 +3676,9 @@ class ExcelStore:
         elif not path.exists():
             self._write_plain_rows(path, headers, [])
             return
-        rows = self._read_plain_rows(path)
+        # 旧：rows = self._read_plain_rows(path) 先整表解析，再 _headers(path) —— 7 本表每次启动白读
+        #     （672 编号 / 1306 照片的工作区在网络盘上就是"一打开就未响应"的大头）。
+        # 现：只读表头；真缺列时才整表读一次补列。
         existing_headers = self._headers(path)
         # 向后兼容：若新列名的旧别名已存在于文件中，则不视为缺失（避免双列并存）
         alias_reverse = {new: old for old, new in COLUMN_ALIASES.items()}
@@ -3555,6 +3688,7 @@ class ExcelStore:
             and alias_reverse.get(h, h) not in existing_headers
         ]
         if missing:
+            rows = self._read_plain_rows(path)
             self._write_plain_rows(path, existing_headers + missing, rows)
 
     def _ensure_change_log(self) -> None:
@@ -4491,8 +4625,10 @@ class ExcelStore:
             self._mark_inventory_summary_cache_invalid()
 
     def _write_rows(self, category: str, rows: list[Row]) -> None:
+        # 旧：整个磁盘写都在 _rw_lock 里 → GUI 线程的 read_rows（切换编号必调）要等后台线程写完 xlsx
+        #     （NAS 上可达数秒）→ "未响应"。现：写盘在锁外（写者之间由 _mutation_lock 串行），锁只保护缓存。
+        self._write_plain_rows(self.data_dir / CATEGORY_FILES[category], CATEGORY_HEADERS[category], rows)
         with self._rw_lock:
-            self._write_plain_rows(self.data_dir / CATEGORY_FILES[category], CATEGORY_HEADERS[category], rows)
             self._invalidate_cache(CATEGORY_FILES[category])
             # plan D2: 主表三类（specimen / classification / photo）任一写入都让汇总缓存失效
             if category in ("specimen", "classification", "photo"):
@@ -4969,3 +5105,40 @@ def _version_tuple(value: str) -> tuple[int, int, int]:
     while len(parts) < 3:
         parts.append(0)
     return tuple(parts[:3])
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-02 写者串行：主线程（照片保存、批量操作）与后台 StoreWorkerThread（字段保存、新建、撤销）
+# 同时改数据时，修改记录 / 编号索引 的"读-改-写"会互相覆盖丢行，xlsx tmp 文件也会撞名。
+# 用 RLock 把所有公开的改数据方法包起来（可重入：create_specimen 内部再调 set_fields 不死锁）。
+# 读方法不受影响——GUI 线程永远不会因为一次慢写盘而卡住。
+# ---------------------------------------------------------------------------
+def _serialized(method):
+    import functools
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._mutation_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
+_SERIALIZED_MUTATORS = (
+    "create_specimen", "create_specimens_batch", "create_specimens_batch_range", "create_specimen_with_voucher",
+    "delete_specimen", "delete_specimens_batch", "clear_photos", "clear_specimen", "clear_classification",
+    "clear_all_associations", "set_fields", "add_photo", "add_photos", "dedupe_photo_links", "import_from_file",
+    "delete_photo", "set_photo_fields_batch", "set_photo_description", "set_photo_filename", "replace_photo",
+    "move_photos", "restore_data_snapshot", "set_undo_depth", "ensure_index",
+    "downgrade_schema_version", "batch_reserve_vouchers", "log_alloc_event", "cancel_batch_reservation",
+    "reset_next_serial", "rollback_to_voucher", "cancel_placeholder_vouchers", "void_vouchers", "set_active_series",
+    "add_series", "remove_series", "update_series_counter", "upgrade_to_multi_user_protocol", "undo_last", "redo_last",
+    "import_workspace",
+)
+# create_data_snapshot / export_excel_mirror 不在此列：它们用 _mirror_lock（见 __init__ 注释）。
+for _name in _SERIALIZED_MUTATORS:
+    _method = getattr(ExcelStore, _name, None)
+    if _method is not None and not getattr(_method, "_serialized", False):
+        _wrapped = _serialized(_method)
+        _wrapped._serialized = True  # type: ignore[attr-defined]
+        setattr(ExcelStore, _name, _wrapped)

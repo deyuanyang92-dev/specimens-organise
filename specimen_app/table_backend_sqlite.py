@@ -266,6 +266,20 @@ class SqliteBackend:
     def mark_exported(self, key: str, version: int) -> None:
         self.meta_set(f"exported:{key}", int(version))
 
+    def backup_to(self, target: Path | str) -> None:
+        """SQLite 在线备份到 target（快照用）：对并发写入一致，不需要停写。"""
+        target = Path(target)
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+        dest = sqlite3.connect(str(target))
+        try:
+            with self._lock:
+                self._conn.backup(dest)
+        finally:
+            dest.close()
+
     def journal_mode(self) -> str:
         with self._lock:
             return str(self._conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()

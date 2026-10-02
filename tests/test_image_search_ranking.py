@@ -236,17 +236,21 @@ class ImageIndexV2Tests(unittest.TestCase):
             conn.commit()
         finally:
             conn.close()
-        # 新文件在磁盘上但索引里没有：如果迁移触发了重扫，它就会出现——断言它不出现
+        # 新文件在磁盘上但索引里没有：只读查询不重扫（它不出现），也不迁移（tokens 还在，见 GUI 线程安全测试）
         (self.photo_dir / "GDLZ-LZC-OWC002-1.tif").write_bytes(b"x")
         reopened = ImageIndexStore(self.tmp)
         self.assertTrue(reopened.has_scope([self.photo_dir], 0))
         names = sorted(entry.file_name for entry in reopened.entries([self.photo_dir], 0))
         self.assertEqual(names, ["GDLZ-LZC-OWC001-1.tif"])
+        # 2026-10-02 起：迁移只在 reconcile（工作线程）里做——entries 原样保留（不会因迁移丢数据），tokens 被 DROP
+        update = reopened.reconcile_scope([self.photo_dir], 0)
+        self.assertEqual(update.added, 1)
         conn = sqlite3.connect(store.path)
         try:
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertNotIn("tokens", tables)
             self.assertIn("meta", tables)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0], 2)
         finally:
             conn.close()
 
@@ -287,6 +291,57 @@ class ImageIndexV2Tests(unittest.TestCase):
         store.reconcile_scope([self.photo_dir], 0)
         rows = list(store.iter_candidates([self.photo_dir], "gdlz", suffixes_for_image_type("tif"), 0))
         self.assertEqual([entry.file_name for entry in rows], ["GDLZ-LZC-OWC001-2.tif"])
+
+
+class ImageIndexGuiThreadSafetyTests(unittest.TestCase):
+    """只读查询（UI 线程会调）不得触发 v1→v2 迁移 / 建库 / DDL；迁移只在 reconcile（工作线程）里做。
+    用户 0.10.32 升级后"一打开就未响应"：旧 tokens 表可达数百 MB，DROP 它在 GUI 线程上要几秒。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.photo_dir = self.tmp / "照片"
+        self.photo_dir.mkdir()
+        (self.tmp / "数据").mkdir()
+        (self.photo_dir / "GDLZ-LZC-OWC001-1.tif").write_bytes(b"x")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_v1_db(self, store: ImageIndexStore) -> None:
+        store.reconcile_scope([self.photo_dir], 0)
+        conn = sqlite3.connect(store.path)
+        try:
+            conn.execute("DROP TABLE IF EXISTS meta")
+            conn.executescript("CREATE TABLE tokens (scope_key TEXT, token TEXT, path TEXT, PRIMARY KEY (scope_key, token, path));")
+            conn.execute("INSERT INTO tokens VALUES ('k', 'g', '/p')")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _tables(self, store: ImageIndexStore) -> set[str]:
+        conn = sqlite3.connect(store.path)
+        try:
+            return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            conn.close()
+
+    def test_read_queries_do_not_migrate_or_create(self):
+        store = ImageIndexStore(self.tmp)
+        self.assertFalse(store.has_scope([self.photo_dir], 0))
+        self.assertIsNone(store.get_scope_last_scan_timestamp([self.photo_dir], 0))
+        self.assertFalse(store.path.exists(), "只读查询不该建库文件")
+        self._make_v1_db(store)
+        reopened = ImageIndexStore(self.tmp)
+        self.assertTrue(reopened.has_scope([self.photo_dir], 0))
+        self.assertIsNotNone(reopened.get_scope_last_scan_timestamp([self.photo_dir], 0))
+        self.assertEqual(len(reopened.entries([self.photo_dir], 0)), 1)
+        self.assertIn("tokens", self._tables(reopened), "只读路径不得做迁移（DROP tokens 可能很慢）")
+
+    def test_reconcile_performs_migration(self):
+        store = ImageIndexStore(self.tmp)
+        self._make_v1_db(store)
+        ImageIndexStore(self.tmp).reconcile_scope([self.photo_dir], 0)
+        self.assertNotIn("tokens", self._tables(store))
 
 
 class SettingsMatchModeTests(unittest.TestCase):
