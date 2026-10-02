@@ -36,11 +36,20 @@ class SqliteBackend:
         fit_row: Callable[[Row, list[str]], Row],
         to_string: Callable[[object], str],
         network_safe: bool = False,
+        read_only: bool = False,
     ) -> None:
         self.db_path = Path(db_path)
         self._fit_row = fit_row
         self._to_string = to_string
+        self._read_only = bool(read_only)
         self._lock = threading.RLock()
+        if self._read_only:
+            # 只读副本：mode=ro 打开，不改 journal_mode、不建 meta、关库不 checkpoint —— 零副作用
+            self._conn = sqlite3.connect(
+                f"file:{self.db_path.as_posix()}?mode=ro", uri=True, timeout=10, check_same_thread=False, isolation_level=None
+            )
+            self._conn.execute("PRAGMA busy_timeout=10000")
+            return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(
             str(self.db_path), timeout=10, check_same_thread=False, isolation_level=None
@@ -229,7 +238,8 @@ class SqliteBackend:
 
     def close(self) -> None:
         with self._lock:
-            self.checkpoint()
+            if not self._read_only:
+                self.checkpoint()
             self._conn.close()
 
     # ------------------------------------------------------------------
@@ -261,6 +271,8 @@ class SqliteBackend:
             return str(self._conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
 
     def checkpoint(self) -> None:
+        if self._read_only:
+            return
         with self._lock:
             try:
                 self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")

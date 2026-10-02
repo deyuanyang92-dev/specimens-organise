@@ -50,7 +50,8 @@ def _ensure_openpyxl() -> None:
 
 from . import __version__
 from .action_log_db import ActionLogDatabase  # Tier B: SQLite 操作日志
-from .table_backend import SHEET_SEP, XlsxBackend, xlsx_headers, xlsx_read_rows  # 2026-10-02 路线 1：表后端
+from .table_backend import SHEET_SEP, XlsxBackend, split_table_key, xlsx_headers, xlsx_read_rows  # 2026-10-02 路线 1：表后端
+from .table_backend_sqlite import SqliteBackend  # 2026-10-02 第 2 段：SQLite 真相源
 from .models import (
     ACTION_LOG_FILE,
     ACTION_LOG_HEADERS,
@@ -106,7 +107,11 @@ from .models import (
 )
 
 # 2026-10-02：CHANGE_DETAIL_KEY / CHANGE_SUMMARY_KEY / MANAGED_TABLE_KEYS / SQLITE_DATA_FILE 定义在 models.py
-from .models import CHANGE_DETAIL_KEY, CHANGE_SUMMARY_KEY, MANAGED_TABLE_KEYS, SQLITE_DATA_FILE  # noqa: E402,F401
+from .models import CHANGE_DETAIL_KEY, CHANGE_SUMMARY_KEY, MANAGED_TABLE_KEYS, SQLITE_DATA_FILE, SQLITE_DATA_SCHEMA_VERSION  # noqa: E402,F401
+
+# 新工作区默认后端。第 2 段收尾（Task 11）切到 "sqlite"；在那之前保持 "xlsx" 让每个提交的全量测试都绿。
+DEFAULT_NEW_WORKSPACE_BACKEND = "xlsx"
+_MANAGED_FILE_NAMES = frozenset(split_table_key(k)[0] for k in MANAGED_TABLE_KEYS)
 
 # plan A4 常量：snapshot 完整性
 SNAPSHOT_MANIFEST_FILENAME = "snapshot_manifest.json"
@@ -172,7 +177,8 @@ DEFAULT_CONFIG = {
 
 class ExcelStore:
     def __init__(self, workspace_root: Path | str, lock: bool = False,
-                 create_if_missing: bool = True, read_only: bool = False):
+                 create_if_missing: bool = True, read_only: bool = False,
+                 backend: str | None = None):
         """初始化 ExcelStore。
 
         规范化软件设计 2026-05 多窗口支持:read_only=True 时跳过 lock_workspace,
@@ -211,13 +217,11 @@ class ExcelStore:
         self._rw_lock = threading.RLock()
         # 2026-10-02 路线 1「换底不换壳」：表格读写原语收口到 TableBackend；第 1 段恒为 XlsxBackend，
         # 第 2 段按工作区选 SqliteBackend。业务逻辑（撤销/指纹/派生/锁/快照/事务）不动。
-        self._backend = XlsxBackend(
-            self.data_dir,
-            fit_row=self._fit_headers,
-            to_string=self._string,
-            verify_file=self._verify_workbook_file_can_be_reopened,
-            column_aliases=COLUMN_ALIASES,
-        )
+        self._backend = self._make_xlsx_backend()
+        self._storage_backend_name = "xlsx"
+        self._backend_choice = (backend or "").strip().lower() or None
+        if self._backend_choice not in (None, "xlsx", "sqlite"):
+            raise ValueError(f"backend 只能是 xlsx / sqlite，收到：{backend!r}")
         # S3.1: voucher -> sparse row index 缓存。读 specimen/classification 表时同步建立；
         # _invalidate_cache 删除对应类目。_find_one 由 O(n) 线性扫降到 O(1) 字典查。
         self._voucher_index: dict[str, dict[str, int]] = {}
@@ -258,6 +262,9 @@ class ExcelStore:
             # 用守护线程 + Event 超时：3 秒内释放即正常；卡住则放弃（10min stale 自愈兜底）。
             atexit.register(self._release_lock_with_timeout, 3.0)
 
+        # 2026-10-02 第 2 段：模式识别（有 sqlite → 新模式；新工作区 → DEFAULT_NEW_WORKSPACE_BACKEND；只有 xlsx → 旧模式）
+        self._select_backend()
+        _startup_mark(f"ExcelStore.backend={self._storage_backend_name}")
         # 只读模式守卫:覆盖所有写入 API
         if self._read_only:
             self._install_readonly_guards()
@@ -293,8 +300,82 @@ class ExcelStore:
 
     @property
     def storage_backend_name(self) -> str:
-        """"xlsx"（旧模式，第 1 段恒为此）/ "sqlite"（第 2 段）。"""
-        return "xlsx"
+        """"xlsx"（旧模式）/ "sqlite"（新模式：数据/标本数据.sqlite 是真相源，Excel 只是镜像）。"""
+        return self._storage_backend_name
+
+    @property
+    def sqlite_path(self) -> Path:
+        return self.data_dir / SQLITE_DATA_FILE
+
+    def _make_xlsx_backend(self) -> XlsxBackend:
+        return XlsxBackend(
+            self.data_dir,
+            fit_row=self._fit_headers,
+            to_string=self._string,
+            verify_file=self._verify_workbook_file_can_be_reopened,
+            column_aliases=COLUMN_ALIASES,
+        )
+
+    def _has_xlsx_tables(self) -> bool:
+        return any((self.data_dir / name).exists() for name in (SPECIMEN_FILE, PHOTO_FILE, CLASSIFICATION_FILE, INDEX_FILE))
+
+    def _is_network_workspace(self) -> bool:
+        """网络 / 挂载盘上 SQLite 不能用 WAL（官方警告），SqliteBackend 改走 DELETE + FULL。"""
+        try:
+            from .startup_diag import detect_workspace_on_windows_mounted_filesystem
+
+            if detect_workspace_on_windows_mounted_filesystem(self.root):
+                return True
+        except Exception:
+            pass
+        text = str(self.root)
+        return text.startswith("\\\\") or text.startswith("//")
+
+    def _select_backend(self) -> None:
+        """设计第 1 节「模式识别」。读取 self._backend_choice（构造参数）与磁盘状态决定后端。
+
+        - 显式 backend="xlsx"/"sqlite" → 照办（sqlite 且只读副本但库不存在 → 退回 xlsx，不建库）；
+        - 自动：数据/标本数据.sqlite 存在 → sqlite；只有 xlsx 表 → xlsx（Task 6 在此接入自动转换）；
+          什么都没有的新工作区 → DEFAULT_NEW_WORKSPACE_BACKEND。
+        sqlite 模式下配置补写 storage_backend="sqlite" 并把 data_schema_version 升到 1.2.0
+        （幂等：转换中途断电或手工删键后再开也会补上）；只读副本不写配置。
+        """
+        sqlite_path = self.sqlite_path
+        choice = self._backend_choice
+        if choice is None:
+            if sqlite_path.exists():
+                choice = "sqlite"
+            elif self._has_xlsx_tables():
+                choice = "xlsx"
+            else:
+                choice = DEFAULT_NEW_WORKSPACE_BACKEND
+        if choice == "sqlite" and self._read_only and not sqlite_path.exists():
+            choice = "xlsx"
+        if choice != "sqlite":
+            self._storage_backend_name = "xlsx"
+            return
+        self._backend = SqliteBackend(
+            sqlite_path,
+            fit_row=self._fit_headers,
+            to_string=self._string,
+            network_safe=self._is_network_workspace(),
+            read_only=self._read_only,
+        )
+        self._storage_backend_name = "sqlite"
+        if not self._read_only:
+            changed = False
+            if self.config.get("storage_backend") != "sqlite":
+                self.config["storage_backend"] = "sqlite"
+                changed = True
+            if _version_tuple(str(self.config.get("data_schema_version", "1.0.0"))) < _version_tuple(SQLITE_DATA_SCHEMA_VERSION):
+                self.config["data_schema_version"] = SQLITE_DATA_SCHEMA_VERSION
+                changed = True
+            if changed:
+                self._save_config()
+
+    def export_excel_mirror(self, all_tables: bool = False):
+        """Task 7 实现（Excel 镜像导出）；本占位在 Task 7 删除。"""
+        return None
 
     def _table_key_for(self, path: Path) -> str | None:
         """数据目录内的表文件 → 后端 key（文件名）；别的工作区 / 快照 / 子目录里的文件 → None（直接读 xlsx）。"""
@@ -302,13 +383,27 @@ class ExcelStore:
             rel = Path(path).resolve().relative_to(self.data_dir.resolve())
         except (ValueError, OSError):
             return None
-        return rel.name if len(rel.parts) == 1 else None
+        if len(rel.parts) != 1:
+            return None
+        if self._storage_backend_name == "sqlite" and rel.name not in _MANAGED_FILE_NAMES:
+            return None  # 操作记录.xlsx 兜底 / 入库人员.xlsx 等不受管文件：仍直接读写 xlsx
+        return rel.name
 
-    def close(self) -> None:
+    def close(self, export_excel: bool = True) -> None:
         """释放工作区锁文件。退出应用前应调用，避免遗留过期锁。
 
         `__init__` 已注册 atexit 钩子，但显式调用更可靠。
+        sqlite 模式且 export_excel=True：关库前先生成 Excel 镜像（设计 2.2 时机①）；UI 自己已导出时传 False。
         """
+        if export_excel and self._storage_backend_name == "sqlite" and not self._read_only:
+            try:
+                self.export_excel_mirror()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[close] 生成 Excel 镜像失败：{exc}", file=sys.stderr)
+        try:
+            self._backend.close()
+        except Exception:
+            pass
         adb = getattr(self, "_action_log_db", None)
         if adb is not None:
             try:
@@ -575,7 +670,7 @@ class ExcelStore:
     def _has_workspace_seed_files(self) -> bool:
         return any(
             (self.data_dir / file_name).exists()
-            for file_name in [WORKSPACE_CONFIG_FILE, SPECIMEN_FILE, PHOTO_FILE, CLASSIFICATION_FILE, INDEX_FILE]
+            for file_name in [WORKSPACE_CONFIG_FILE, SPECIMEN_FILE, PHOTO_FILE, CLASSIFICATION_FILE, INDEX_FILE, SQLITE_DATA_FILE]
         )
 
     def list_vouchers(self, series_filter: str | None = None) -> list[str]:
@@ -3088,6 +3183,9 @@ class ExcelStore:
         QThread 跑一次完整 ``ensure_index()`` 做权威校验 + 补缺。
         失败 → 同步链里立刻走完整 ensure_index，保证工作区可用。
         """
+        if self._storage_backend_name == "sqlite":
+            # sqlite 模式：表存在且有表头即视为完好（毫秒级）；UI 层仍会后台跑完整 ensure_index
+            return self._backend.exists(INDEX_FILE) and bool(self._backend.headers(INDEX_FILE))
         index_file_path = self.data_dir / INDEX_FILE
         try:
             stat_result = index_file_path.stat()
@@ -3166,8 +3264,9 @@ class ExcelStore:
         if _version_tuple(current) > _version_tuple(CURRENT_DATA_SCHEMA_VERSION):
             raise ImportConflictError(
                 f"该工作区数据版本为 {current}，高于当前软件支持的 {CURRENT_DATA_SCHEMA_VERSION}，已禁止写入。\n\n"
-                "请升级软件到最新版本后再打开；或先用新版软件的「工具 → 降低工作区兼容版本」"
-                "将工作区版本降至 1.0.0，旧版软件即可重新打开。"
+                "请升级软件到最新版本后再打开。\n"
+                "如需回退到旧版软件：SQLite 模式的工作区请先在新版里用「工具 → 导出 Excel 并降级工作区」；"
+                "旧 xlsx 工作区用「工具 → 降低工作区兼容版本」将版本降至 1.0.0。"
             )
 
     def downgrade_schema_version(self, target: str = "1.0.0") -> None:

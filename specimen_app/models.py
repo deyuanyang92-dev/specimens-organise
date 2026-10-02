@@ -23,7 +23,8 @@ ALLOC_LOG_FILE = "编号分发记录.xlsx"
 SQLITE_DATA_FILE = "标本数据.sqlite"  # 2026-10-02：SQLite 真相源（第 2 段）；存在即新模式
 WORKSPACE_CONFIG_FILE = "工作区配置.json"
 DATA_VERSION_DIR = "数据版本"
-CURRENT_DATA_SCHEMA_VERSION = "1.1.3"
+CURRENT_DATA_SCHEMA_VERSION = "1.2.0"  # 旧：1.1.3。1.2.0 = SQLite 真相源工作区（2026-10-02）；旧版软件遇到它会提示升级
+SQLITE_DATA_SCHEMA_VERSION = "1.2.0"
 
 SPECIMEN_HEADERS = [
     "入库编号*",
