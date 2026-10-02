@@ -53,6 +53,28 @@ jobs:
           PYTHONUTF8: '1'
         run: python build_release.py --version ${{ steps.ver.outputs.version }}
 
+      - name: Smoke-test packaged exe (Windows)
+        # 2026-10-02：旧流程只打包不试跑，打坏的 exe 也会发布。这里真实启动打包产物的 --smoke：
+        # 加载 Qt 插件 / DLL / 全部模块后退出，非 0 退出码 → 不发布。
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $ver = "${{ steps.ver.outputs.version }}"
+          $exe = Get-ChildItem -Path "releases/v$ver" -Recurse -Filter *.exe |
+                 Where-Object { $_.Name -notlike 'installer_*' -and $_.Directory.Name -like "*_v$ver" } |
+                 Select-Object -First 1
+          if (-not $exe) { throw "packaged exe not found under releases/v$ver" }
+          Write-Host "smoke: $($exe.FullName)"
+          $p = Start-Process -FilePath $exe.FullName -ArgumentList '--smoke' -Wait -PassThru
+          Write-Host "exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) {
+            Get-ChildItem "$env:APPDATA\标本入库管理" -Filter 'startup_failure_*.log' -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName }
+            Get-Content "$env:APPDATA\标本入库管理\boot_fault.log" -ErrorAction SilentlyContinue
+            throw "packaged exe failed --smoke"
+          }
+
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         env:

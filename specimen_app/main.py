@@ -30,6 +30,32 @@ def _run_check_only(channel: str) -> int:
     return 0
 
 
+def _run_smoke() -> int:
+    """打包自检：不开窗口、不碰工作区，只验证运行时（Qt 插件、DLL、全部模块）能加载。"""
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        from PyQt5.QtWidgets import QApplication
+
+        from . import __version__
+        from . import ui  # noqa: F401  全部界面模块
+        from .excel_store import ExcelStore  # noqa: F401
+        from .image_cache import ThumbnailCache  # noqa: F401
+
+        app = QApplication.instance() or QApplication(["smoke"])
+        app.processEvents()
+        print(f"[smoke] ok v{__version__}")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        from .boot_guard import write_startup_failure
+
+        log = write_startup_failure(exc)
+        if sys.stderr is not None:
+            print(f"[smoke] FAILED: {exc!r} log={log}", file=sys.stderr)
+        return 3
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="标本入库管理桌面软件")
     parser.add_argument("--workspace", default=None, help="工作区目录")
@@ -41,7 +67,13 @@ def main() -> None:
         "--update-channel", default=None,
         help="(D18) 临时指定本次 --check-only 用的 channel: stable / prerelease。",
     )
+    parser.add_argument(
+        "--smoke", action="store_true",
+        help="(2026-10-02) 自检：加载全部模块 + 建 QApplication + 建主窗口类后退出，退出码 0=正常。发布流程用它试跑打包好的 exe。",
+    )
     args = parser.parse_args()
+    if args.smoke:
+        sys.exit(_run_smoke())
 
     if args.check_only:
         # 不读 settings 也行,但优先用用户选的 channel 保一致。
