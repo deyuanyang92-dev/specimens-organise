@@ -109,6 +109,7 @@ from .models import (
 # 2026-10-02：CHANGE_DETAIL_KEY / CHANGE_SUMMARY_KEY / MANAGED_TABLE_KEYS / SQLITE_DATA_FILE 定义在 models.py
 from .models import CHANGE_DETAIL_KEY, CHANGE_SUMMARY_KEY, MANAGED_TABLE_HEADERS, MANAGED_TABLE_KEYS, SQLITE_DATA_FILE, SQLITE_DATA_SCHEMA_VERSION  # noqa: E402,F401
 from .workspace_convert import ConversionReport, convert_workspace  # noqa: E402
+from .excel_mirror import ExportResult, dirty_keys, expand_to_whole_files, export as _export_mirror  # noqa: E402
 
 # 新工作区默认后端。第 2 段收尾（Task 11）切到 "sqlite"；在那之前保持 "xlsx" 让每个提交的全量测试都绿。
 DEFAULT_NEW_WORKSPACE_BACKEND = "xlsx"
@@ -406,7 +407,7 @@ class ExcelStore:
             self._summary_voucher_set_mtime = -1.0
             self._change_log_ensured = False
 
-    def _auto_convert_to_sqlite(self) -> ConversionReport:
+    def _auto_convert_to_sqlite(self, take_snapshot: bool = True) -> ConversionReport:
         """设计 2.1：快照 → 临时库 → 逐表逐格校验 → 原子改名 → 配置写 storage_backend/1.2.0 → 换后端。
         任一步失败：留在 xlsx 模式，报告写进 self.last_conversion_report（UI 显示），不抛。"""
         report = convert_workspace(
@@ -418,7 +419,7 @@ class ExcelStore:
             table_keys=MANAGED_TABLE_KEYS,
             headers_for=lambda key: list(MANAGED_TABLE_HEADERS[key]),
             column_aliases=COLUMN_ALIASES,
-            snapshot=lambda: self.create_data_snapshot("自动转换为 SQLite", "转换前自动保存的 Excel 数据"),
+            snapshot=(lambda: self.create_data_snapshot("自动转换为 SQLite", "转换前自动保存的 Excel 数据")) if take_snapshot else (lambda: None),
         )
         self.last_conversion_report = report
         if not report.converted:
@@ -440,9 +441,29 @@ class ExcelStore:
         self._save_config()
         return report
 
-    def export_excel_mirror(self, all_tables: bool = False):
-        """Task 7 实现（Excel 镜像导出）；本占位在 Task 7 删除。"""
-        return None
+    def excel_mirror_pending(self) -> int:
+        """自上次生成 Excel 以来变过的受管表数；xlsx 模式恒 0。"""
+        if self._storage_backend_name != "sqlite":
+            return 0
+        return len(dirty_keys(self._backend, MANAGED_TABLE_KEYS))
+
+    def export_excel_mirror(self, all_tables: bool = False) -> ExportResult:
+        """设计 2.2：把脏表（或全部表）从 SQLite 生成为 xlsx 镜像。只读副本 / xlsx 模式返回空结果。
+
+        不持 _rw_lock：每张表的读是后端原子操作，版本号在读行前取，读-标之间的新写入会让表保持脏。
+        """
+        if self._storage_backend_name != "sqlite" or self._read_only:
+            return ExportResult()
+        keys = list(MANAGED_TABLE_KEYS) if all_tables else dirty_keys(self._backend, MANAGED_TABLE_KEYS)
+        if not keys:
+            return ExportResult()
+        keys = expand_to_whole_files(keys, MANAGED_TABLE_KEYS)
+        result = _export_mirror(
+            self._backend, self._make_xlsx_backend(), keys, lambda key: list(MANAGED_TABLE_HEADERS[key])
+        )
+        for file_name, reason in result.failed.items():
+            print(f"[excel_store] Excel 镜像 {file_name} 未能写入：{reason}", file=sys.stderr)
+        return result
 
     def _table_key_for(self, path: Path) -> str | None:
         """数据目录内的表文件 → 后端 key（文件名）；别的工作区 / 快照 / 子目录里的文件 → None（直接读 xlsx）。"""
@@ -2317,13 +2338,18 @@ class ExcelStore:
             snapshot_dir = self.data_dir / DATA_VERSION_DIR / f"{version_id}_{suffix}"
             suffix += 1
         snapshot_dir.mkdir(parents=True)
+        # 2026-10-02 sqlite 模式：先把镜像追平、checkpoint，再拷贝 —— 快照里的 xlsx 与 sqlite 同一时刻一致
+        if self._storage_backend_name == "sqlite" and not self._read_only:
+            self.export_excel_mirror()
+            self._backend.checkpoint()
         # plan A4：边拷贝边算 SHA256 + size，写入 manifest，最后写 .snapshot.complete 标记。
         # 缺标记 = 上次拷贝中途中断（NAS 抖断 / 进程被杀），下次 restore 前由 verify 拦下。
         snapshot_files: dict[str, dict[str, Any]] = {}
         for path in self.data_dir.iterdir():
             if path.name == DATA_VERSION_DIR or path.name == ".workspace.lock":
                 continue
-            if path.is_file() and path.suffix.lower() in {".xlsx", ".json"}:
+            # 旧：只拷 .xlsx/.json。现：加 .sqlite（真相源）；-wal/-shm/.converting 临时文件不拷
+            if path.is_file() and path.suffix.lower() in {".xlsx", ".json", ".sqlite"}:
                 target = snapshot_dir / path.name
                 shutil.copy2(path, target)
                 snapshot_files[path.name] = {
@@ -2346,6 +2372,8 @@ class ExcelStore:
         # plan A4：标记文件必须最后写，写完才算完整快照。
         (snapshot_dir / SNAPSHOT_COMPLETE_MARKER_FILENAME).touch()
         self._record_data_version(operation_type, summary or operation_type, snapshot_dir)
+        if self._storage_backend_name == "sqlite" and not self._read_only:
+            self.export_excel_mirror()  # 上一行往数据版本记录加了一行，把它也追平，快照后 Excel 仍与库一致
         return snapshot_dir
 
     def verify_snapshot_integrity(self, snapshot_path: Path) -> None:
@@ -2738,18 +2766,46 @@ class ExcelStore:
         # plan A4：还原前先校验快照完整性，挡掉 NAS 半残快照导致的静默还原坏数据
         self.verify_snapshot_integrity(snapshot)
         self.create_data_snapshot("回退前快照", f"回退到 {snapshot.name} 前自动保存当前状态")
+        snapshot_sqlite = snapshot / SQLITE_DATA_FILE
+        was_sqlite = self._storage_backend_name == "sqlite"
+        if was_sqlite:
+            # 2026-10-02：先关库再覆盖文件（Windows 上打开着的文件不能替换；Linux 上旧连接会继续读旧 inode）
+            try:
+                self._backend.close()
+            except Exception:
+                pass
+            for stale in (self.sqlite_path, Path(str(self.sqlite_path) + "-wal"), Path(str(self.sqlite_path) + "-shm")):
+                try:
+                    stale.unlink(missing_ok=True)
+                except OSError:
+                    pass
         for path in snapshot.iterdir():
             if not path.is_file():
                 continue
             if path.name in {DATA_VERSION_LOG_FILE, "snapshot_manifest.json", ".workspace.lock"}:
                 continue
-            if path.suffix.lower() in {".xlsx", ".json"}:
+            if path.suffix.lower() in {".xlsx", ".json", ".sqlite"}:
                 shutil.copy2(path, self.data_dir / path.name)
         self.config = self._load_or_create_config()
+        if was_sqlite or snapshot_sqlite.exists():
+            if self.sqlite_path.exists():
+                self._backend = SqliteBackend(
+                    self.sqlite_path, fit_row=self._fit_headers, to_string=self._string, network_safe=self._is_network_workspace()
+                )
+                self._storage_backend_name = "sqlite"
+            else:
+                # 快照来自 xlsx 时代而当前是 sqlite 模式：先回到 xlsx 后端，再由 xlsx 重新转换成 sqlite
+                self._backend = self._make_xlsx_backend()
+                self._storage_backend_name = "xlsx"
+                self.config.pop("storage_backend", None)
+            self._reset_backend_caches()
         self._record_data_version("回退数据版本", f"已恢复：{snapshot.name}", snapshot)
         self.ensure_files()
         self.ensure_index()
         self._sync_next_serial()
+        if was_sqlite and self._storage_backend_name == "xlsx":
+            # 旧快照（无 sqlite）还原到 sqlite 工作区：用还原后的 xlsx 重建库（不再快照，上面已做「回退前快照」）
+            self._auto_convert_to_sqlite(take_snapshot=False)
 
     def undo_last(self) -> dict | None:
         # 规范化软件设计 2026-05 P1 审查修复:_apply_action 失败时不能把 action 标"已撤销"。
