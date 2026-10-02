@@ -50,6 +50,7 @@ def _ensure_openpyxl() -> None:
 
 from . import __version__
 from .action_log_db import ActionLogDatabase  # Tier B: SQLite 操作日志
+from .table_backend import SHEET_SEP, XlsxBackend, xlsx_headers, xlsx_read_rows  # 2026-10-02 路线 1：表后端
 from .models import (
     ACTION_LOG_FILE,
     ACTION_LOG_HEADERS,
@@ -103,6 +104,10 @@ from .models import (
     Row,
     StatusFlags,
 )
+
+# 2026-10-02 路线 1：修改记录.xlsx 两张 sheet 在表后端里的 key（"文件名::sheet名"）
+CHANGE_DETAIL_KEY = f"{CHANGE_LOG_FILE}{SHEET_SEP}修改明细"
+CHANGE_SUMMARY_KEY = f"{CHANGE_LOG_FILE}{SHEET_SEP}修改汇总"
 
 # plan A4 常量：snapshot 完整性
 SNAPSHOT_MANIFEST_FILENAME = "snapshot_manifest.json"
@@ -205,6 +210,15 @@ class ExcelStore:
         # Tier A 后台写线程保护：RLock（可重入）确保主线程读和后台线程写不发生 race。
         # 同一线程内的嵌套调用（如 _append_row_incremental 回退时调 read_rows）仍可安全获取。
         self._rw_lock = threading.RLock()
+        # 2026-10-02 路线 1「换底不换壳」：表格读写原语收口到 TableBackend；第 1 段恒为 XlsxBackend，
+        # 第 2 段按工作区选 SqliteBackend。业务逻辑（撤销/指纹/派生/锁/快照/事务）不动。
+        self._backend = XlsxBackend(
+            self.data_dir,
+            fit_row=self._fit_headers,
+            to_string=self._string,
+            verify_file=self._verify_workbook_file_can_be_reopened,
+            column_aliases=COLUMN_ALIASES,
+        )
         # S3.1: voucher -> sparse row index 缓存。读 specimen/classification 表时同步建立；
         # _invalidate_cache 删除对应类目。_find_one 由 O(n) 线性扫降到 O(1) 字典查。
         self._voucher_index: dict[str, dict[str, int]] = {}
@@ -277,6 +291,19 @@ class ExcelStore:
             except OSError:
                 pass
             _startup_mark("ExcelStore.scan_transaction_journal")
+
+    @property
+    def storage_backend_name(self) -> str:
+        """"xlsx"（旧模式，第 1 段恒为此）/ "sqlite"（第 2 段）。"""
+        return "xlsx"
+
+    def _table_key_for(self, path: Path) -> str | None:
+        """数据目录内的表文件 → 后端 key（文件名）；别的工作区 / 快照 / 子目录里的文件 → None（直接读 xlsx）。"""
+        try:
+            rel = Path(path).resolve().relative_to(self.data_dir.resolve())
+        except (ValueError, OSError):
+            return None
+        return rel.name if len(rel.parts) == 1 else None
 
     def close(self) -> None:
         """释放工作区锁文件。退出应用前应调用，避免遗留过期锁。
@@ -643,45 +670,18 @@ class ExcelStore:
         }
 
     def _stream_columns(self, path: Path, wanted_columns: set[str]) -> "Iterator[dict[str, str]]":
-        """流式读 Excel,只 yield 包含 wanted_columns 字段的 sparse dict。
+        """流式读表，只 yield 包含 wanted_columns 字段的 sparse dict。
 
-        规范化软件设计 2026-05 新增,供 workspace_overview 用,避免 read_rows 全列读 + 缓存。
-        - 不进 _row_cache,本方法只服务 overview 的轻量聚合。
-        - 流式 iter_rows,不 list() 物化。
-        - 不在 wanted_columns 内的列直接跳,sparse dict 进一步省内存。
-        - 文件不存在 / 表头为空 -> yield 0 行。
+        规范化软件设计 2026-05 新增，供 workspace_overview 用，避免 read_rows 全列读 + 缓存；不进 _row_cache。
+        旧：此处直接 openpyxl 流式读（已原样搬入 table_backend.XlsxBackend.stream_columns）。
         """
-        if not path.exists():
+        key = self._table_key_for(path)
+        if key is None:
+            yield from XlsxBackend(
+                Path(path).parent, fit_row=self._fit_headers, to_string=self._string, column_aliases=COLUMN_ALIASES
+            ).stream_columns(Path(path).name, wanted_columns)
             return
-        _ensure_openpyxl()
-        wb = load_workbook(path, read_only=True, data_only=True)
-        try:
-            ws = wb.active
-            rows_iter = ws.iter_rows(values_only=True)
-            try:
-                header_row = next(rows_iter)
-            except StopIteration:
-                return
-            headers = [self._string(v) for v in header_row]
-            # 向后兼容：wanted_columns 含新列名时也匹配旧列名（alias），输出归一为新名。
-            alias_reverse = {new: old for old, new in COLUMN_ALIASES.items()}
-            extra_wanted = {alias_reverse[h] for h in wanted_columns if h in alias_reverse}
-            effective_wanted = wanted_columns | extra_wanted
-            # 预计算 wanted 列在 raw 中的 (idx, canonical_header) 列表,避免每行重判定。
-            wanted_idx: list[tuple[int, str]] = [
-                (i, COLUMN_ALIASES.get(h, h)) for i, h in enumerate(headers) if h in effective_wanted
-            ]
-            for raw in rows_iter:
-                row: dict[str, str] = {}
-                for idx, canonical in wanted_idx:
-                    if idx < len(raw):
-                        value = self._string(raw[idx])
-                        if value != "":
-                            row[canonical] = value
-                if row:
-                    yield row
-        finally:
-            wb.close()
+        yield from self._backend.stream_columns(key, wanted_columns)
 
     def summary_records(self) -> list[dict[str, Any]]:
         """把分散在多个 Excel 的字段汇总成一张宽表（纯内存视图，不改任何文件结构）。
@@ -1900,14 +1900,11 @@ class ExcelStore:
         旧：每次 next_voucher / 重复检测都全扫 INDEX 表 _read_plain_rows。
         新：set 缓存 + mtime 校验，next_voucher 撞号检测降到 O(1)。
         """
-        path = self.data_dir / INDEX_FILE
-        try:
-            current_mtime = path.stat().st_mtime
-        except OSError:
-            current_mtime = 0.0
+        # 旧：path.stat().st_mtime 判缓存失效；现：后端 version_token
+        current_mtime = self._backend.version_token(INDEX_FILE)
         if self._index_voucher_set is not None and self._index_voucher_set_mtime == current_mtime:
             return self._index_voucher_set
-        rows = self._read_plain_rows(path, INDEX_HEADERS) if path.exists() else []
+        rows = self._read_plain_rows(self.data_dir / INDEX_FILE, INDEX_HEADERS) if self._backend.exists(INDEX_FILE) else []
         self._index_voucher_set = {
             self._value(r, "入库编号") for r in rows if self._value(r, "入库编号")
         }
@@ -2986,11 +2983,8 @@ class ExcelStore:
         return h.hexdigest()
 
     def _cached_rows(self, file_key: str, loader: Callable[[], list[Row]]) -> list[Row]:
-        file_path = self.data_dir / file_key
-        try:
-            current_mtime = file_path.stat().st_mtime
-        except OSError:
-            current_mtime = 0.0
+        # 旧：current_mtime = (self.data_dir / file_key).stat().st_mtime；现：后端变更标记（xlsx=mtime，sqlite=计数）
+        current_mtime = self._backend.version_token(file_key)
         cached_mtime = self._file_mtimes.get(file_key, -1.0)
         if file_key in self._row_cache and cached_mtime == current_mtime:
             # LRU: move_to_end 让命中项标为最近使用
@@ -3321,18 +3315,14 @@ class ExcelStore:
         # 旧：read_only 也会走到这里 → 缺文件自动建表头 → 用户以为只看，其实写了。
         if self._read_only:
             return
-        if not path.exists():
-            _ensure_openpyxl()
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Sheet1"
-            ws.append(headers)
-            # 原：wb.save(path) 直接写，崩溃留下残缺文件导致下次 path.exists() 为 True
-            # 但内容损坏。现：用原子替换。
-            tmp = path.with_suffix(f".{os.getpid()}.tmp")
-            wb.save(tmp)
-            self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
-            tmp.replace(path)
+        key = self._table_key_for(path)
+        # 旧：if not path.exists(): Workbook() + 表头 + 原子替换（已搬入后端）
+        if key is not None:
+            if not self._backend.exists(key):
+                self._backend.replace_rows(key, headers, [])
+                return
+        elif not path.exists():
+            self._write_plain_rows(path, headers, [])
             return
         rows = self._read_plain_rows(path)
         existing_headers = self._headers(path)
@@ -3350,21 +3340,19 @@ class ExcelStore:
         # plan A2: 只读契约——见 _ensure_workbook 同源注释。
         if self._read_only:
             return
-        path = self.data_dir / CHANGE_LOG_FILE
-        if path.exists():
+        # 旧：if path.exists(): return（一次 stat）。后端的 exists(sheet key) 要开一次 workbook 看 sheet 名，
+        # 每次保存都查太贵 → 每个 store 实例只核一次；之后写路径（replace_many）缺文件/缺 sheet 会自建，不会丢。
+        if getattr(self, "_change_log_ensured", False):
             return
-        _ensure_openpyxl()
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "修改明细"
-        ws.append(CHANGE_LOG_HEADERS)
-        summary = wb.create_sheet("修改汇总")
-        summary.append(CHANGE_SUMMARY_HEADERS)
-        # 原：直接写，改用原子替换，与 _ensure_workbook 保持一致。
-        tmp = path.with_suffix(f".{os.getpid()}.tmp")
-        wb.save(tmp)
-        self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
-        tmp.replace(path)
+        if self._backend.exists(CHANGE_DETAIL_KEY):
+            self._change_log_ensured = True
+            return
+        # 旧：Workbook() 两张 sheet（修改明细 / 修改汇总）+ 原子替换（已搬入后端 replace_many）
+        self._backend.replace_many([
+            (CHANGE_DETAIL_KEY, CHANGE_LOG_HEADERS, []),
+            (CHANGE_SUMMARY_KEY, CHANGE_SUMMARY_HEADERS, []),
+        ])
+        self._change_log_ensured = True
 
     def _ensure_alloc_log(self) -> None:
         # plan A2: 只读契约由 _ensure_workbook 守门，这里无需重复判断。
@@ -3819,11 +3807,8 @@ class ExcelStore:
         供 next_voucher() 跳号使用：注销编号永不被自动分配。
         结果缓存在 _voided_cache；分发日志写入或外部 mtime 变化后自动清除缓存。
         """
-        path = self.data_dir / ALLOC_LOG_FILE
-        try:
-            current_mtime = path.stat().st_mtime
-        except OSError:
-            current_mtime = 0.0
+        # 旧：path.stat().st_mtime；现：后端 version_token
+        current_mtime = self._backend.version_token(ALLOC_LOG_FILE)
         if self._voided_cache is not None and self._voided_cache_mtime == current_mtime:
             # 旧：每次返回新 set，调用方误改返回值不会污染 store 内部状态。
             return set(self._voided_cache)
@@ -3900,100 +3885,76 @@ class ExcelStore:
     def _write_changes_and_summary(self, voucher: str, category: str, old_row: Row, new_row: Row, action_type: str, admin_name: str = "") -> None:
         """Append field changes and update summary in a single file write."""
         now = self._now()
-        path = self.data_dir / CHANGE_LOG_FILE
         self._ensure_change_log()
-        with self._open_workbook(path) as wb:
-            if "修改明细" not in wb.sheetnames:
-                wb.create_sheet("修改明细")
-            if "修改汇总" not in wb.sheetnames:
-                wb.create_sheet("修改汇总")
-            detail_rows = self._rows_from_sheet(wb["修改明细"], CHANGE_LOG_HEADERS)
-            summary_rows = self._rows_from_sheet(wb["修改汇总"], CHANGE_SUMMARY_HEADERS)
-            for field in CATEGORY_HEADERS[category]:
-                old = self._value(old_row, field)
-                new = self._value(new_row, field)
-                if old != new:
-                    entry: Row = {
-                        "入库编号": voucher,
-                        "信息类别": DISPLAY_CATEGORY_NAMES[category],
-                        "字段名": field,
-                        "旧值": old,
-                        "新值": new,
-                        "修改时间": now,
-                        "操作类型": action_type,
-                    }
-                    if admin_name:
-                        entry["修改人"] = admin_name
-                    detail_rows.append(entry)
-            if not any(self._value(row, "入库编号") == voucher for row in summary_rows):
-                summary_rows.append(
-                    {
-                        "入库编号": voucher,
-                        "创建时间": now,
-                        "第一次修改时间": "",
-                        "第二次修改时间": "",
-                        "最近修改时间": "",
-                        "修改次数": 0,
-                    }
-                )
-            for row in summary_rows:
-                if self._value(row, "入库编号") == voucher:
-                    count = int(row.get("修改次数") or 0) + 1
-                    row["修改次数"] = count
-                    if count == 1:
-                        row["第一次修改时间"] = now
-                    elif count == 2:
-                        row["第二次修改时间"] = now
-                    row["最近修改时间"] = now
-                    break
-            self._replace_sheet(wb["修改明细"], CHANGE_LOG_HEADERS, detail_rows)
-            self._replace_sheet(wb["修改汇总"], CHANGE_SUMMARY_HEADERS, summary_rows)
-            tmp = path.with_suffix(f".{os.getpid()}.tmp")
-            wb.save(tmp)
-            self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
-            tmp.replace(path)
+        # 旧：load 整本 修改记录.xlsx → _rows_from_sheet 两张 → 计算 → _replace_sheet 两张 → 原子保存。
+        # 现：后端 read_many（同一文件只 load 一次）→ 计算 → replace_many（两张 sheet 一次 load/save）。
+        detail_rows, summary_rows = self._backend.read_many([
+            (CHANGE_DETAIL_KEY, CHANGE_LOG_HEADERS),
+            (CHANGE_SUMMARY_KEY, CHANGE_SUMMARY_HEADERS),
+        ])
+        for field in CATEGORY_HEADERS[category]:
+            old = self._value(old_row, field)
+            new = self._value(new_row, field)
+            if old != new:
+                entry: Row = {
+                    "入库编号": voucher,
+                    "信息类别": DISPLAY_CATEGORY_NAMES[category],
+                    "字段名": field,
+                    "旧值": old,
+                    "新值": new,
+                    "修改时间": now,
+                    "操作类型": action_type,
+                }
+                if admin_name:
+                    entry["修改人"] = admin_name
+                detail_rows.append(entry)
+        if not any(self._value(row, "入库编号") == voucher for row in summary_rows):
+            summary_rows.append(
+                {
+                    "入库编号": voucher,
+                    "创建时间": now,
+                    "第一次修改时间": "",
+                    "第二次修改时间": "",
+                    "最近修改时间": "",
+                    "修改次数": 0,
+                }
+            )
+        for row in summary_rows:
+            if self._value(row, "入库编号") == voucher:
+                count = int(row.get("修改次数") or 0) + 1
+                row["修改次数"] = count
+                if count == 1:
+                    row["第一次修改时间"] = now
+                elif count == 2:
+                    row["第二次修改时间"] = now
+                row["最近修改时间"] = now
+                break
+        self._backend.replace_many([
+            (CHANGE_DETAIL_KEY, CHANGE_LOG_HEADERS, detail_rows),
+            (CHANGE_SUMMARY_KEY, CHANGE_SUMMARY_HEADERS, summary_rows),
+        ])
 
     def _read_change_detail_rows(self) -> list[Row]:
-        path = self.data_dir / CHANGE_LOG_FILE
-        return self._read_sheet_rows(path, "修改明细", CHANGE_LOG_HEADERS)
+        return self._backend.read_rows(CHANGE_DETAIL_KEY, CHANGE_LOG_HEADERS)
 
     def _write_change_detail_rows(self, rows: list[Row]) -> None:
-        path = self.data_dir / CHANGE_LOG_FILE
-        with self._open_workbook(path) as wb:
-            if "修改明细" not in wb.sheetnames:
-                wb.create_sheet("修改明细")
-            ws = wb["修改明细"]
-            self._replace_sheet(ws, CHANGE_LOG_HEADERS, rows)
-            tmp = path.with_suffix(f".{os.getpid()}.tmp")
-            wb.save(tmp)
-            self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
-            tmp.replace(path)
+        # 旧：_open_workbook + _replace_sheet("修改明细") + 原子保存（已搬入后端）
+        self._backend.replace_rows(CHANGE_DETAIL_KEY, CHANGE_LOG_HEADERS, rows)
 
     def _read_summary_rows(self) -> list[Row]:
-        return self._read_sheet_rows(self.data_dir / CHANGE_LOG_FILE, "修改汇总", CHANGE_SUMMARY_HEADERS)
+        return self._backend.read_rows(CHANGE_SUMMARY_KEY, CHANGE_SUMMARY_HEADERS)
 
     def _write_summary_rows(self, rows: list[Row]) -> None:
-        path = self.data_dir / CHANGE_LOG_FILE
-        with self._open_workbook(path) as wb:
-            if "修改汇总" not in wb.sheetnames:
-                wb.create_sheet("修改汇总")
-            ws = wb["修改汇总"]
-            self._replace_sheet(ws, CHANGE_SUMMARY_HEADERS, rows)
-            tmp = path.with_suffix(f".{os.getpid()}.tmp")
-            wb.save(tmp)
-            self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
-            tmp.replace(path)
+        # 旧：_open_workbook + _replace_sheet("修改汇总") + 原子保存（已搬入后端）
+        self._backend.replace_rows(CHANGE_SUMMARY_KEY, CHANGE_SUMMARY_HEADERS, rows)
 
     def _ensure_summary_voucher_set(self) -> set[str]:
         """lazy 构建 修改汇总 表 voucher set 缓存，避免 _ensure_summary_row 全量重写。"""
-        path = self.data_dir / CHANGE_LOG_FILE
-        try:
-            cur_mtime = path.stat().st_mtime
-        except OSError:
-            cur_mtime = 0.0
+        # 旧：path.stat().st_mtime；现：后端 version_token
+        cur_mtime = self._backend.version_token(CHANGE_LOG_FILE)
         if self._summary_voucher_set is not None and self._summary_voucher_set_mtime == cur_mtime:
             return self._summary_voucher_set
-        rows = self._read_summary_rows() if path.exists() else []
+        rows = self._read_summary_rows() if self._backend.exists(CHANGE_LOG_FILE) else []
         self._summary_voucher_set = {
             self._value(r, "入库编号") for r in rows if self._value(r, "入库编号")
         }
@@ -4003,7 +3964,8 @@ class ExcelStore:
     def _ensure_summary_row(self, voucher: str, created_at: str | None = None) -> None:
         # 旧：每次都 _read_summary_rows + any 查重 + _write_summary_rows 整表重写
         # （N 行 _replace_sheet → delete_rows + N append，5000 行 ~150ms）。
-        # 新：_summary_voucher_set O(1) 查重 + load_workbook + ws.append 单行。
+        # 新：_summary_voucher_set O(1) 查重 + 后端 append_rows 单行
+        #     （openpyxl load+ws.append、失败全量重写兜底 均已搬入 XlsxBackend.append_rows）。
         s = self._ensure_summary_voucher_set()
         if voucher in s:
             return
@@ -4015,35 +3977,9 @@ class ExcelStore:
             "最近修改时间": "",
             "修改次数": 0,
         }
-        path = self.data_dir / CHANGE_LOG_FILE
-        try:
-            _ensure_openpyxl()
-            wb = load_workbook(path)
-            try:
-                if "修改汇总" not in wb.sheetnames:
-                    wb.create_sheet("修改汇总")
-                    wb["修改汇总"].append(CHANGE_SUMMARY_HEADERS)
-                ws = wb["修改汇总"]
-                ws.append([str(new_row.get(h, "")) for h in CHANGE_SUMMARY_HEADERS])
-                tmp = path.with_suffix(f".{os.getpid()}.tmp")
-                wb.save(tmp)
-                self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
-                tmp.replace(path)
-            finally:
-                try:
-                    wb.close()
-                except Exception:
-                    pass
-        except Exception:
-            # 降级：全量重写兜底
-            rows = self._read_summary_rows()
-            rows.append(new_row)
-            self._write_summary_rows(rows)
+        self._backend.append_rows(CHANGE_SUMMARY_KEY, CHANGE_SUMMARY_HEADERS, [new_row])
         s.add(voucher)
-        try:
-            self._summary_voucher_set_mtime = path.stat().st_mtime
-        except OSError:
-            self._summary_voucher_set_mtime = -1.0
+        self._summary_voucher_set_mtime = self._backend.version_token(CHANGE_LOG_FILE)
 
     def _update_summary_modified(self, voucher: str) -> None:
         rows = self._read_summary_rows()
@@ -4306,35 +4242,13 @@ class ExcelStore:
         self._append_row_incremental(category, row)
 
     def _append_row_incremental(self, category: str, row: Row) -> None:
-        """单行增量 append xlsx；缓存增量更新而非全文件 invalidate。"""
+        """单行增量 append；缓存增量更新而非全文件 invalidate。"""
         file_key = CATEGORY_FILES[category]
         headers = CATEGORY_HEADERS[category]
-        path = self.data_dir / file_key
         fitted = self._fit_headers(row, headers)
-        disk_ok = True
-        try:
-            _ensure_openpyxl()
-            wb = load_workbook(path)
-            try:
-                ws = wb.active
-                ws.append([fitted.get(h, "") for h in headers])
-                tmp = path.with_suffix(f".{os.getpid()}.tmp")
-                wb.save(tmp)
-                self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
-                tmp.replace(path)
-            finally:
-                try:
-                    wb.close()
-                except Exception:
-                    pass
-        except Exception:
-            disk_ok = False
-        if not disk_ok:
-            # 失败回退：load/save 异常 → 全量重写兜底
-            rows = self.read_rows(category)
-            rows.append(fitted)
-            self._write_rows(category, rows)
-            return
+        # 旧：openpyxl load_workbook + ws.append + 原子替换；失败回退 read_rows + _write_rows 全量重写
+        #     （已搬入 XlsxBackend.append_rows，含兜底）。
+        self._backend.append_rows(file_key, headers, [fitted])
         # 缓存增量更新（RLock 仅保护内存 dict 操作，不持锁等待磁盘 I/O）
         # 旧：无锁，后台线程写缓存与主线程读缓存存在 race。新：_rw_lock 保护。
         with self._rw_lock:
@@ -4350,10 +4264,7 @@ class ExcelStore:
                         self._photo_voucher_index.setdefault(voucher, []).append(new_idx)
                     elif file_key in (SPECIMEN_FILE, CLASSIFICATION_FILE):
                         self._voucher_index.setdefault(file_key, {}).setdefault(voucher, new_idx)
-                try:
-                    self._file_mtimes[file_key] = path.stat().st_mtime
-                except OSError:
-                    self._file_mtimes[file_key] = 0.0
+                self._file_mtimes[file_key] = self._backend.version_token(file_key)
         # plan D2: _append_row_incremental 绕过 _write_rows，必须自己触发汇总缓存失效
         if category in ("specimen", "classification", "photo"):
             self._mark_inventory_summary_cache_invalid()
@@ -4407,42 +4318,18 @@ class ExcelStore:
 
     def _append_index_row(self, row: Row) -> None:
         # 旧：read_plain_rows 全读 + any 查重 + _write_plain_rows 整本重写。
-        # 新：先用 _ensure_index_voucher_set O(1) 查重；非重复时走 openpyxl load+ws.append 增量写。
-        # 失败回退全量重写保持一致性。
+        # 新：先用 _ensure_index_voucher_set O(1) 查重；非重复时走后端 append_rows
+        #     （openpyxl load+ws.append 增量写、失败回退全量重写 已搬入 XlsxBackend）。
         voucher = self._value(row, "入库编号")
         if voucher:
             index_set = self._ensure_index_voucher_set()
             if voucher in index_set:
                 return
-        path = self.data_dir / INDEX_FILE
         fitted = self._fit_headers(row, INDEX_HEADERS)
-        try:
-            _ensure_openpyxl()
-            wb = load_workbook(path)
-            try:
-                ws = wb.active
-                ws.append([fitted.get(h, "") for h in INDEX_HEADERS])
-                tmp = path.with_suffix(f".{os.getpid()}.tmp")
-                wb.save(tmp)
-                self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
-                tmp.replace(path)
-            finally:
-                try:
-                    wb.close()
-                except Exception:
-                    pass
-        except Exception:
-            # 降级：load 失败 → 全量重写
-            rows = self._read_plain_rows(path, INDEX_HEADERS)
-            rows.append(fitted)
-            self._write_plain_rows(path, INDEX_HEADERS, rows)
+        self._backend.append_rows(INDEX_FILE, INDEX_HEADERS, [fitted])
         # 增量维护 _index_voucher_set
         if self._index_voucher_set is not None and voucher:
             self._index_voucher_set.add(voucher)
-            try:
-                self._index_voucher_set_mtime = path.stat().st_mtime
-            except OSError:
-                self._index_voucher_set_mtime = -1.0
 
     def _find_index(self, voucher: str) -> Row | None:
         for row in self._read_plain_rows(self.data_dir / INDEX_FILE, INDEX_HEADERS):
@@ -4758,126 +4645,41 @@ class ExcelStore:
         return [self._fit_headers(row, required_headers) for row in self._read_plain_rows(path, required_headers)]
 
     def _headers(self, path: Path) -> list[str]:
-        _ensure_openpyxl()
-        wb = load_workbook(path, read_only=True, data_only=True)
-        try:
-            ws = wb.active
-            return [self._string(cell.value) for cell in next(ws.iter_rows(max_row=1))]
-        finally:
-            wb.close()
+        # 旧：load_workbook(read_only) 取第一行（已搬入 table_backend.xlsx_headers）
+        key = self._table_key_for(path)
+        if key is not None:
+            return self._backend.headers(key)
+        return xlsx_headers(path, self._string)
 
     def _read_plain_rows(self, path: Path, fallback_headers: list[str] | None = None) -> list[Row]:
-        if not path.exists():
-            return []
-        _ensure_openpyxl()
-        wb = load_workbook(path, read_only=True, data_only=True)
-        try:
-            ws = wb.active
-            # 规范化软件设计 2026-05 启动卡死优化:
-            # 旧 `rows = list(ws.iter_rows(values_only=True))` 一次性物化整张表 -> 瞬时 RSS +30MB
-            # (2GB 机器立刻触发 swap 卡死)。改流式 iter -> 解析一行处理一行,峰值减半。
-            rows_iter = ws.iter_rows(values_only=True)
-            try:
-                header_row = next(rows_iter)
-            except StopIteration:
-                return []
-            headers = [self._string(value) for value in header_row]
-            if fallback_headers:
-                headers = headers or fallback_headers
-            # sparse row dict:只保留非空字段。调用方走 `_value(row, field)` 或 `row.get(field, "")`,
-            # 空字段返 ""。`read_rows` 出口处补 dense 保 API 契约。
-            data: list[Row] = []
-            for raw in rows_iter:
-                row: Row = {}
-                for idx, header in enumerate(headers):
-                    if not header:
-                        continue
-                    if idx >= len(raw):
-                        continue
-                    value = self._string(raw[idx])
-                    if value != "":
-                        row[header] = value
-                if row:  # 非空行才进数据
-                    data.append(row)
-            # 向后兼容：重命名字段的旧列名 → 新列名（内存归一，不改写 Excel 文件）
-            for row in data:
-                for old_col, new_col in COLUMN_ALIASES.items():
-                    if old_col in row and new_col not in row:
-                        row[new_col] = row.pop(old_col)
-            return data
-        finally:
-            wb.close()
+        # 旧：此处 openpyxl 流式读 + sparse dict + COLUMN_ALIASES 归一（已原样搬入 table_backend）。
+        key = self._table_key_for(path)
+        if key is not None:
+            return self._backend.read_rows(key, fallback_headers)
+        # 外部路径（导入别的工作区、快照目录）仍直接读 xlsx 文件
+        return xlsx_read_rows(path, self._string, COLUMN_ALIASES, fallback_headers)
 
     def _read_sheet_rows(self, path: Path, sheet_name: str, fallback_headers: list[str]) -> list[Row]:
-        if not path.exists():
-            return []
-        _ensure_openpyxl()
-        wb = load_workbook(path, read_only=True, data_only=True)
-        try:
-            if sheet_name not in wb.sheetnames:
-                return []
-            return self._rows_from_sheet(wb[sheet_name], fallback_headers)
-        finally:
-            wb.close()
-
-    def _rows_from_sheet(self, ws: Any, fallback_headers: list[str]) -> list[Row]:
-        """Read sparse rows from an already-open worksheet."""
-        rows_iter = ws.iter_rows(values_only=True)
-        try:
-            header_row = next(rows_iter)
-        except StopIteration:
-            return []
-        headers = [self._string(value) for value in header_row] or fallback_headers
-        data: list[Row] = []
-        for raw in rows_iter:
-            row: Row = {}
-            for idx, header in enumerate(headers):
-                if not header or idx >= len(raw):
-                    continue
-                value = self._string(raw[idx])
-                if value != "":
-                    row[header] = value
-            if row:
-                data.append(row)
-        return data
+        key = self._table_key_for(path)
+        if key is not None:
+            return self._backend.read_rows(f"{key}{SHEET_SEP}{sheet_name}", fallback_headers)
+        return xlsx_read_rows(path, self._string, COLUMN_ALIASES, fallback_headers, sheet=sheet_name)
 
     def _write_plain_rows(self, path: Path, headers: list[str], rows: list[Row]) -> None:
-        _ensure_openpyxl()
-        wb = Workbook()
-        # 规范化软件设计 2026-05 P1 审查修复:Workbook 用 try/finally close,防 save/replace 异常时文件句柄泄漏。
-        try:
-            ws = wb.active
-            ws.title = "Sheet1"
-            ws.append(headers)
-            for row in rows:
-                fitted = self._fit_headers(row, headers)
-                ws.append([fitted.get(header, "") for header in headers])
-            tmp = path.with_suffix(f".{os.getpid()}.tmp")
-            wb.save(tmp)
-            self._verify_workbook_file_can_be_reopened(tmp)  # plan A5: 写后校验 ZIP 完整
-            tmp.replace(path)
-        finally:
-            try:
-                wb.close()
-            except Exception:
-                pass
-        self._invalidate_cache(path.name)
-
-    def _replace_sheet(self, ws: Any, headers: list[str], rows: list[Row]) -> None:
-        ws.delete_rows(1, ws.max_row)
-        ws.append(headers)
-        for row in rows:
-            fitted = self._fit_headers(row, headers)
-            ws.append([fitted.get(header, "") for header in headers])
-
-    @contextmanager
-    def _open_workbook(self, path: Path) -> Iterator[Any]:
-        _ensure_openpyxl()
-        wb = load_workbook(path)
-        try:
-            yield wb
-        finally:
-            wb.close()
+        # 旧：Workbook() + Sheet1 + 表头/行 + tmp→校验→replace（已原样搬入 XlsxBackend.replace_many）
+        key = self._table_key_for(path)
+        if key is not None:
+            self._backend.replace_rows(key, headers, rows)
+        else:
+            # 冲突报告等不在 数据/ 目录的输出文件：仍直接写 xlsx
+            XlsxBackend(
+                Path(path).parent,
+                fit_row=self._fit_headers,
+                to_string=self._string,
+                verify_file=self._verify_workbook_file_can_be_reopened,
+                column_aliases=COLUMN_ALIASES,
+            ).replace_rows(Path(path).name, headers, rows)
+        self._invalidate_cache(Path(path).name)
 
     def _fit_headers(self, row: Row, headers: list[str]) -> Row:
         result = {}
