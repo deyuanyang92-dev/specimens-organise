@@ -107,10 +107,13 @@ from .models import (
 )
 
 # 2026-10-02：CHANGE_DETAIL_KEY / CHANGE_SUMMARY_KEY / MANAGED_TABLE_KEYS / SQLITE_DATA_FILE 定义在 models.py
-from .models import CHANGE_DETAIL_KEY, CHANGE_SUMMARY_KEY, MANAGED_TABLE_KEYS, SQLITE_DATA_FILE, SQLITE_DATA_SCHEMA_VERSION  # noqa: E402,F401
+from .models import CHANGE_DETAIL_KEY, CHANGE_SUMMARY_KEY, MANAGED_TABLE_HEADERS, MANAGED_TABLE_KEYS, SQLITE_DATA_FILE, SQLITE_DATA_SCHEMA_VERSION  # noqa: E402,F401
+from .workspace_convert import ConversionReport, convert_workspace  # noqa: E402
 
 # 新工作区默认后端。第 2 段收尾（Task 11）切到 "sqlite"；在那之前保持 "xlsx" 让每个提交的全量测试都绿。
 DEFAULT_NEW_WORKSPACE_BACKEND = "xlsx"
+# 旧工作区自动转 SQLite（设计 2.1，用户裁定不弹窗）。与上面的默认值同在 Task 11 一起打开。
+AUTO_CONVERT_XLSX_WORKSPACES = False
 _MANAGED_FILE_NAMES = frozenset(split_table_key(k)[0] for k in MANAGED_TABLE_KEYS)
 
 # plan A4 常量：snapshot 完整性
@@ -297,6 +300,11 @@ class ExcelStore:
             except OSError:
                 pass
             _startup_mark("ExcelStore.scan_transaction_journal")
+        # 2026-10-02 第 2 段：旧工作区自动转换。放在 __init__ 末尾——此时 store 已完整可用（快照/日志都能走）。
+        self.last_conversion_report: ConversionReport | None = None
+        if self._should_auto_convert():
+            self._auto_convert_to_sqlite()
+            _startup_mark(f"ExcelStore.auto_convert converted={bool(self.last_conversion_report and self.last_conversion_report.converted)}")
 
     @property
     def storage_backend_name(self) -> str:
@@ -372,6 +380,65 @@ class ExcelStore:
                 changed = True
             if changed:
                 self._save_config()
+
+    def _should_auto_convert(self) -> bool:
+        return (
+            AUTO_CONVERT_XLSX_WORKSPACES
+            and self._backend_choice is None
+            and not self._read_only
+            and self._storage_backend_name == "xlsx"
+            and self._has_xlsx_tables()
+            and not self.sqlite_path.exists()
+        )
+
+    def _reset_backend_caches(self) -> None:
+        """换后端后把所有按文件 mtime / 变更计数判失效的缓存清空。"""
+        with self._rw_lock:
+            self._row_cache.clear()
+            self._file_mtimes.clear()
+            self._voucher_index.clear()
+            self._photo_voucher_index = {}
+            self._index_voucher_set = None
+            self._index_voucher_set_mtime = -1.0
+            self._voided_cache = None
+            self._voided_cache_mtime = -1.0
+            self._summary_voucher_set = None
+            self._summary_voucher_set_mtime = -1.0
+            self._change_log_ensured = False
+
+    def _auto_convert_to_sqlite(self) -> ConversionReport:
+        """设计 2.1：快照 → 临时库 → 逐表逐格校验 → 原子改名 → 配置写 storage_backend/1.2.0 → 换后端。
+        任一步失败：留在 xlsx 模式，报告写进 self.last_conversion_report（UI 显示），不抛。"""
+        report = convert_workspace(
+            self.sqlite_path,
+            xlsx_backend=self._backend,
+            make_sqlite_backend=lambda path: SqliteBackend(
+                path, fit_row=self._fit_headers, to_string=self._string, network_safe=self._is_network_workspace()
+            ),
+            table_keys=MANAGED_TABLE_KEYS,
+            headers_for=lambda key: list(MANAGED_TABLE_HEADERS[key]),
+            column_aliases=COLUMN_ALIASES,
+            snapshot=lambda: self.create_data_snapshot("自动转换为 SQLite", "转换前自动保存的 Excel 数据"),
+        )
+        self.last_conversion_report = report
+        if not report.converted:
+            print(f"[excel_store] 工作区未转换为 SQLite，继续使用 xlsx：{report.reason}", file=sys.stderr)
+            return report
+        old_backend = self._backend
+        self._backend = SqliteBackend(
+            self.sqlite_path, fit_row=self._fit_headers, to_string=self._string, network_safe=self._is_network_workspace()
+        )
+        self._storage_backend_name = "sqlite"
+        try:
+            old_backend.close()
+        except Exception:
+            pass
+        self._reset_backend_caches()
+        self.config["storage_backend"] = "sqlite"
+        if _version_tuple(str(self.config.get("data_schema_version", "1.0.0"))) < _version_tuple(SQLITE_DATA_SCHEMA_VERSION):
+            self.config["data_schema_version"] = SQLITE_DATA_SCHEMA_VERSION
+        self._save_config()
+        return report
 
     def export_excel_mirror(self, all_tables: bool = False):
         """Task 7 实现（Excel 镜像导出）；本占位在 Task 7 删除。"""
