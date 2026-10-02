@@ -465,7 +465,15 @@ def apply_app_icon(variant: str) -> None:
         widget.setWindowIcon(icon)
 
 
-def _species_matcher() -> SpeciesMatcher:
+def _workspace_species_preset(workspace_root: Path | str | None) -> Path | None:
+    """工作区里的预设表：用户手动输入的新物种记在这里（升级不覆盖，同工作区的人共用）。"""
+    if not workspace_root:
+        return None
+    return Path(workspace_root) / "字段模版" / "表格信息预设字段.xlsx"
+
+
+# 旧（§7）：def _species_matcher() -> SpeciesMatcher:
+def _species_matcher(workspace_root: Path | str | None = None) -> SpeciesMatcher:
     """用软件自带的分类预设建 SpeciesMatcher。
 
     旧逻辑：读 workspace_root/字段模版/表格信息预设字段.xlsx —— 工作区缺该文件时
@@ -479,7 +487,13 @@ def _species_matcher() -> SpeciesMatcher:
         _startup_mark(f"taxonomy preset found: {preset}")
     else:
         _startup_mark("taxonomy preset: NOT FOUND — species autofill will be disabled")
-    return SpeciesMatcher(preset or Path("__missing_taxonomy_preset__.xlsx"))
+    # 旧：return SpeciesMatcher(preset or Path("__missing_taxonomy_preset__.xlsx"))
+    # 2026-10-02：再合并工作区预设（用户记忆），工作区同名物种优先。
+    extra = []
+    ws_preset = _workspace_species_preset(workspace_root)
+    if ws_preset is not None and (preset is None or os.path.normcase(os.path.abspath(ws_preset)) != os.path.normcase(os.path.abspath(preset))):
+        extra.append(ws_preset)
+    return SpeciesMatcher(preset or Path("__missing_taxonomy_preset__.xlsx"), extra_paths=extra)
 
 
 # ---------------------------------------------------------------------------
@@ -1274,7 +1288,7 @@ class SpecimenWindow(QMainWindow):
                 raise SystemExit from exc
 
             _startup_mark("SpecimenWindow: ExcelStore ready")
-            self.matcher = _species_matcher()  # 旧：读 workspace_root/字段模版/，现读软件自带预设
+            self.matcher = _species_matcher(self.workspace_root)  # 自带预设 + 工作区预设（用户记忆）
             # plan B1: 锁文件 heartbeat 由后台线程维持，主写入前由 store 自检。
             # 只读副本不抢锁，自然不需要心跳。
             self._lock_heartbeat_thread: LockHeartbeatThread | None = None
@@ -6271,7 +6285,39 @@ class SpecimenWindow(QMainWindow):
         saved = self._flush_pending_saves(category)
         names = {"specimen": "标本信息", "photo": "照片信息", "classification": "分类信息"}
         # 旧：f"...已保存 ({saved} 项)"。现在字段保存在后台线程落盘，文案改为"已提交"更准确。
-        self.statusBar().showMessage(f"{names.get(category, category)}已提交保存 ({saved} 项，后台写入中)", 2000)
+        message = f"{names.get(category, category)}已提交保存 ({saved} 项，后台写入中)"
+        if category == "classification":
+            learned = self._remember_new_species()
+            if learned:
+                message += f"；新物种「{learned}」已记入物种库，下次输入可自动匹配"
+        self.statusBar().showMessage(message, 4000 if category == "classification" else 2000)
+
+    def _remember_new_species(self) -> str | None:
+        """保存分类信息时：手动输入的种名若不在物种库里，记入工作区 字段模版/表格信息预设字段.xlsx。
+
+        2026-10-02 用户需求："手动输入后保存，下次输入可以避免手动输入"。
+        自带预设随升级替换，故写工作区那份（升级不覆盖、同工作区共用）。返回记住的中文种名或 None。
+        """
+        try:
+            widgets = getattr(self, "class_widgets", {}) or {}
+            def _text(field: str) -> str:
+                w = widgets.get(field)
+                return w.text().strip() if w is not None and hasattr(w, "text") else ""
+            chinese = _text("种名*")
+            latin, family, family_latin = _text("种拉丁"), _text("科*"), _text("科拉丁")
+            if not chinese or not (latin or family):
+                return None  # 只有中文名、其他全空：记了也补不出东西
+            if self.matcher is None or self.matcher.knows_species(chinese):
+                return None
+            target = _workspace_species_preset(self.workspace_root)
+            if target is None:
+                return None
+            from .species import remember_species
+            if remember_species(target, chinese, latin, family, family_latin):
+                return chinese
+        except Exception as exc:  # noqa: BLE001 记忆失败不影响保存
+            print(f"[species] 记住新物种失败：{exc}", file=sys.stderr)
+        return None
 
     def _save_all_panels(self) -> None:
         """Save all pending changes across all panels."""
@@ -7067,7 +7113,7 @@ class SpecimenWindow(QMainWindow):
             self.store.close()
         self.store = new_store
         self.workspace_root = target_path
-        self.matcher = _species_matcher()  # 旧：读 workspace_root/字段模版/，现读软件自带预设
+        self.matcher = _species_matcher(self.workspace_root)  # 自带预设 + 工作区预设（用户记忆）
         # thumbnail_cache：未绑定启动时为 None，这里首次创建。
         if self.thumbnail_cache is None:
             self.thumbnail_cache = ThumbnailCache(self.workspace_root)
