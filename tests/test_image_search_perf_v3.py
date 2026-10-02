@@ -196,5 +196,67 @@ class ResultAssemblyTests(unittest.TestCase):
         self.assertFalse(legacy.exists())
 
 
+class PhotoMapsNoFilesystemTests(unittest.TestCase):
+    """检索窗口每次打开都算两张"照片→编号"映射：旧实现对每张照片 resolve+exists 2–5 次，
+    1306 张在网络盘上是分钟级。现在必须是纯字符串运算。"""
+
+    def setUp(self):
+        from PIL import Image
+
+        from specimen_app.excel_store import ExcelStore
+
+        self.tmp = Path(tempfile.mkdtemp())
+        self.cfg = self.tmp / "cfg"
+        self._p = patch.object(app_settings, "app_config_dir", return_value=self.cfg)
+        self._p.start()
+        self.ws = self.tmp / "ws"
+        self.ws.mkdir()
+        self.store = ExcelStore(self.ws, backend="xlsx")
+        self.v = self.store.create_specimen()
+        self.external = self.tmp / "外部"
+        self.external.mkdir()
+        self.original = self.external / "GXRG-B-YC001-1.jpg"
+        Image.new("RGB", (8, 8), "red").save(self.original, "JPEG")
+        self.row = self.store.add_photo(self.v, self.original, allow_outside=True)
+        self.archived = self.store.resolve_photo_path(self.row)
+
+    def tearDown(self):
+        self.store.close()
+        self._p.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_maps_are_pure_string_and_cover_all_aliases(self):
+        from specimen_app.image_search import _path_key
+
+        with patch.object(Path, "resolve", side_effect=AssertionError("resolve")), patch.object(Path, "exists", side_effect=AssertionError("exists")), patch.object(Path, "is_dir", side_effect=AssertionError("is_dir")):
+            vouchers = self.store.get_all_photo_voucher_map()
+            aliases = self.store.get_photo_search_alias_map()
+        norm_v = {_path_key(k): v for k, v in vouchers.items()}
+        self.assertEqual(norm_v.get(_path_key(self.archived)), [self.v])
+        self.assertEqual(norm_v.get(_path_key(self.original)), [self.v])
+        norm_a = {_path_key(k): _path_key(v) for k, v in aliases.items()}
+        self.assertEqual(norm_a.get(_path_key(self.original)), _path_key(self.archived))
+        self.assertEqual(norm_a.get(_path_key(self.archived)), _path_key(self.archived))
+
+    def test_photo_path_candidates_without_filesystem(self):
+        with patch.object(Path, "resolve", side_effect=AssertionError("resolve")), patch.object(Path, "exists", side_effect=AssertionError("exists")), patch.object(Path, "is_dir", side_effect=AssertionError("is_dir")):
+            cands = self.store.photo_path_candidates(self.row)
+        self.assertEqual(cands[0], self.archived)
+        self.assertIn(self.original, cands)
+
+    def test_search_marks_original_as_linked_via_string_maps(self):
+        from specimen_app.image_search import clear_image_index, image_search_results
+
+        clear_image_index()
+        results = image_search_results(
+            self.ws, self.v, {}, {}, self.store.photo_path_candidates(self.row), query="GXRG-B-YC001",
+            extra_roots=[self.external], suffixes={".jpg"},
+            path_to_vouchers=self.store.get_all_photo_voucher_map(), canonical_photo_paths=self.store.get_photo_search_alias_map(),
+        )
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].is_linked)
+        self.assertEqual(results[0].linked_vouchers, [self.v])
+
+
 if __name__ == "__main__":
     unittest.main()
