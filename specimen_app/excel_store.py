@@ -110,6 +110,7 @@ from .models import (
 from .models import CHANGE_DETAIL_KEY, CHANGE_SUMMARY_KEY, MANAGED_TABLE_HEADERS, MANAGED_TABLE_KEYS, SQLITE_DATA_FILE, SQLITE_DATA_SCHEMA_VERSION, XLSX_DATA_SCHEMA_VERSION  # noqa: E402,F401
 from .workspace_convert import ConversionReport, convert_workspace  # noqa: E402
 from .excel_mirror import ExportResult, dirty_keys, expand_to_whole_files, export as _export_mirror  # noqa: E402
+from . import workspace_tables as _workspace_tables  # noqa: E402  2026-10-02 跨工作区读取（有 sqlite 读 sqlite）
 
 # 新工作区默认后端。第 2 段收尾（Task 11）切到 "sqlite"；在那之前保持 "xlsx" 让每个提交的全量测试都绿。
 DEFAULT_NEW_WORKSPACE_BACKEND = "xlsx"
@@ -1010,6 +1011,12 @@ class ExcelStore:
         """
         key = self._table_key_for(path)
         if key is None:
+            if _workspace_tables.sqlite_file_for(path) is not None:
+                for row in _workspace_tables.read_table(path, column_aliases=COLUMN_ALIASES)[1]:
+                    picked = {k: v for k, v in row.items() if k in wanted_columns}
+                    if picked:
+                        yield picked
+                return
             yield from XlsxBackend(
                 Path(path).parent, fit_row=self._fit_headers, to_string=self._string, column_aliases=COLUMN_ALIASES
             ).stream_columns(Path(path).name, wanted_columns)
@@ -5033,7 +5040,8 @@ class ExcelStore:
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def _read_external_rows(self, path: Path, required_headers: list[str]) -> list[Row]:
-        if not path.exists():
+        # 旧：if not path.exists(): return []（SQLite 模式的源工作区没有 xlsx 也要能读）
+        if not path.exists() and _workspace_tables.sqlite_file_for(path) is None:
             return []
         return [self._fit_headers(row, required_headers) for row in self._read_plain_rows(path, required_headers)]
 
@@ -5042,6 +5050,8 @@ class ExcelStore:
         key = self._table_key_for(path)
         if key is not None:
             return self._backend.headers(key)
+        if _workspace_tables.sqlite_file_for(path) is not None:
+            return _workspace_tables.read_table(path)[0]
         return xlsx_headers(path, self._string)
 
     def _read_plain_rows(self, path: Path, fallback_headers: list[str] | None = None) -> list[Row]:
@@ -5049,7 +5059,9 @@ class ExcelStore:
         key = self._table_key_for(path)
         if key is not None:
             return self._backend.read_rows(key, fallback_headers)
-        # 外部路径（导入别的工作区、快照目录）仍直接读 xlsx 文件
+        # 外部路径（导入别的工作区、快照目录）：对方是 SQLite 模式（可能没生成镜像）→ 读它的库；否则直接读 xlsx
+        if _workspace_tables.sqlite_file_for(path) is not None:
+            return _workspace_tables.read_table(path, fallback_headers, COLUMN_ALIASES)[1]
         return xlsx_read_rows(path, self._string, COLUMN_ALIASES, fallback_headers)
 
     def _read_sheet_rows(self, path: Path, sheet_name: str, fallback_headers: list[str]) -> list[Row]:

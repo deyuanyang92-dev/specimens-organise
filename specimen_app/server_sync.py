@@ -81,9 +81,22 @@ def _voucher_in_range(voucher: str, range_start: str, range_end: str) -> bool:
     return b[1] <= a[1] <= c[1]
 
 
+def _close_wb(wb) -> None:
+    if wb is not None:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
 def _read_source_vouchers(source_dir: Path) -> list[str]:
     """轻量读子目录 数据/标本信息.xlsx 取所有非空 voucher（不开 ExcelStore，零副作用）。"""
     sb_path = source_dir / "数据" / SPECIMEN_FILE
+    # 2026-10-02：源是 SQLite 模式（可能没生成 Excel 镜像）→ 读库
+    from .workspace_tables import column_values, sqlite_file_for
+
+    if sqlite_file_for(sb_path) is not None:
+        return column_values(sb_path, "入库编号*")
     if not sb_path.exists():
         return []
     try:
@@ -161,15 +174,23 @@ def _scan_name_conflicts(processed_subdirs: list[Path]) -> dict[str, list[dict]]
     by_name: dict[str, list[dict]] = {}
     for subdir in processed_subdirs:
         photo_xlsx = subdir / "数据" / "照片信息.xlsx"
-        if not photo_xlsx.exists():
-            continue
-        try:
-            from openpyxl import load_workbook  # lazy, P1 优化
-            wb = load_workbook(photo_xlsx, read_only=True, data_only=True)
-        except Exception:
-            continue
-        # P1 审查修复:流式 iter,不 list 物化整表。
-        try:
+        wb = None
+        from .workspace_tables import read_table_raw, sqlite_file_for
+
+        if sqlite_file_for(photo_xlsx) is not None:
+            # 2026-10-02：源工作区是 SQLite 模式（可能还没生成 Excel 镜像）→ 直接读库
+            header, body = read_table_raw(photo_xlsx)
+            if not header:
+                continue
+            rows_iter = iter(body)
+        else:
+            if not photo_xlsx.exists():
+                continue
+            try:
+                from openpyxl import load_workbook  # lazy, P1 优化
+                wb = load_workbook(photo_xlsx, read_only=True, data_only=True)
+            except Exception:
+                continue
             ws = wb.active
             rows_iter = ws.iter_rows(values_only=True)
             try:
@@ -178,13 +199,15 @@ def _scan_name_conflicts(processed_subdirs: list[Path]) -> dict[str, list[dict]]
                 wb.close()
                 continue
             header = [str(c) if c is not None else "" for c in header_row]
+        # P1 审查修复:流式 iter,不 list 物化整表。
+        try:
             try:
                 orig_idx = header.index("原始文件名")
                 sha_idx = header.index("文件SHA256")
                 vch_idx = header.index("入库编号*")
                 fn_idx = header.index("文件名")
             except ValueError:
-                wb.close()
+                _close_wb(wb)
                 continue
             for r in rows_iter:
                 if not r:
@@ -206,7 +229,7 @@ def _scan_name_conflicts(processed_subdirs: list[Path]) -> dict[str, list[dict]]
                     }
                 )
         finally:
-            wb.close()
+            _close_wb(wb)
     # 只保留真正冲突的（≥2 条记录 + ≥2 个不同 SHA256）
     conflicts: dict[str, list[dict]] = {}
     for name, entries in by_name.items():
@@ -350,7 +373,14 @@ def _unique_dest(parent: Path, name: str) -> Path:
 
 
 def _read_xlsx_rows_safe(path: Path) -> tuple[list[str], list[list]]:
-    """轻量读 xlsx 表头 + 数据行（只读，零副作用）。失败返回 ([], [])。"""
+    """轻量读 xlsx 表头 + 数据行（只读，零副作用）。失败返回 ([], [])。
+
+    2026-10-02：同目录有 标本数据.sqlite（对方是 SQLite 模式）时改读库——xlsx 可能还没生成。
+    """
+    from .workspace_tables import read_table_raw, sqlite_file_for
+
+    if sqlite_file_for(path) is not None:
+        return read_table_raw(path)
     if not path.exists():
         return [], []
     try:
