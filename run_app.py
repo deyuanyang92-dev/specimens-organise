@@ -23,15 +23,44 @@ if _is_wsl:
     os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
     os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")  # (留作 WebEngine 兼容,本期未引入)
 
+# 2026-10-02 启动保护：打包版 --windowed 无控制台，旧的 print 什么也显示不出来 → "双击没反应"。
+# 先开 faulthandler（C 层崩溃也留栈），import / 启动失败写日志 + Windows 系统弹窗。
+from specimen_app.boot_guard import enable_fault_log, report_startup_failure, show_fatal
+
+enable_fault_log()
+
+# 旧（§7 保留）：
+# try:
+#     from specimen_app.main import main
+# except ImportError as exc:
+#     print(f"\n[错误] 缺少依赖库：{exc}")
+#     print("请运行：  pip install -r requirements.txt")
+#     print("或直接下载打包好的 EXE（无需安装 Python）：")
+#     print("  https://github.com/deyuanyang92-dev/specimens-organise/releases")
+#     sys.exit(1)
 try:
     from specimen_app.main import main
 except ImportError as exc:
-    print(f"\n[错误] 缺少依赖库：{exc}")
-    print("请运行：  pip install -r requirements.txt")
-    print("或直接下载打包好的 EXE（无需安装 Python）：")
-    print("  https://github.com/deyuanyang92-dev/specimens-organise/releases")
+    if getattr(sys, "frozen", False):
+        report_startup_failure(exc)
+    else:
+        show_fatal(
+            f"\n[错误] 缺少依赖库：{exc}\n请运行：  pip install -r requirements.txt\n"
+            "或直接下载打包好的 EXE（无需安装 Python）：\n"
+            "  https://github.com/deyuanyang92-dev/specimens-organise/releases"
+        )
+    sys.exit(1)
+except Exception as exc:  # noqa: BLE001
+    report_startup_failure(exc)
     sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    # 旧：main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException as exc:  # noqa: BLE001
+        report_startup_failure(exc)
+        sys.exit(1)
