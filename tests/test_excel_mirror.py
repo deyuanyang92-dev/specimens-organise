@@ -137,5 +137,65 @@ class ExcelMirrorTests(unittest.TestCase):
         self.assertEqual(self.store.get_specimen(self.v)["备注"], "版本 A")
 
 
+class DowngradeTests(unittest.TestCase):
+    """Task 8：导出 Excel 并降级工作区（回退到旧版软件可开的 xlsx 模式）。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.data = self.tmp / "数据"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_downgrade_round_trip_keeps_data_and_leaves_backup(self):
+        store = ExcelStore(self.tmp, backend="sqlite")
+        v = store.create_specimen()
+        store.set_fields("specimen", v, {"备注": "降级前"})
+        store.set_fields("classification", v, {"种名*": "Nereis"})
+        bak = store.downgrade_to_xlsx_workspace()
+        self.assertEqual(store.storage_backend_name, "xlsx")
+        self.assertTrue(bak.exists() and bak.name.startswith(SQLITE_DATA_FILE + ".bak-"))
+        self.assertFalse((self.data / SQLITE_DATA_FILE).exists())
+        self.assertEqual(store.config.get("data_schema_version"), "1.1.3")
+        self.assertNotIn("storage_backend", store.config)
+        self.assertEqual(store.get_specimen(v)["备注"], "降级前")
+        store.close()
+        reopened = ExcelStore(self.tmp)
+        try:
+            self.assertEqual(reopened.storage_backend_name, "xlsx")
+            self.assertEqual(reopened.get_specimen(v)["备注"], "降级前")
+            self.assertEqual(reopened.get_classification(v)["种名*"], "Nereis")
+            self.assertEqual(sorted(reopened.list_vouchers()), [v])
+        finally:
+            reopened.close()
+
+    def test_downgrade_refuses_when_export_fails(self):
+        store = ExcelStore(self.tmp, backend="sqlite")
+        try:
+            v = store.create_specimen()
+            real_replace = Path.replace
+
+            def flaky(self_path, target):
+                if Path(target).name == SPECIMEN_FILE:
+                    raise PermissionError("locked")
+                return real_replace(self_path, target)
+
+            with patch.object(Path, "replace", flaky):
+                with self.assertRaises(RuntimeError):
+                    store.downgrade_to_xlsx_workspace()
+            self.assertEqual(store.storage_backend_name, "sqlite")
+            self.assertTrue((self.data / SQLITE_DATA_FILE).exists())
+            self.assertEqual(store.get_specimen(v)["入库编号*"], v)
+        finally:
+            store.close(export_excel=False)
+
+    def test_downgrade_on_xlsx_workspace_is_noop(self):
+        store = ExcelStore(self.tmp, backend="xlsx")
+        try:
+            self.assertIsNone(store.downgrade_to_xlsx_workspace())
+        finally:
+            store.close()
+
+
 if __name__ == "__main__":
     unittest.main()

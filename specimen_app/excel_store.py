@@ -531,6 +531,42 @@ class ExcelStore:
             print(f"[excel_store] Excel 镜像 {file_name} 未能写入：{reason}", file=sys.stderr)
         return result
 
+    def downgrade_to_xlsx_workspace(self) -> Path | None:
+        """设计 2.3「导出 Excel 并降级工作区」：让旧版软件能重新打开。
+
+        全量生成 Excel → 逐表读回与库比对 → 关库 → 标本数据.sqlite 改名 .bak-<时间>（不删）→
+        配置版本回 1.1.3、去掉 storage_backend → 切回 XlsxBackend。任何一步失败都不降级（抛 RuntimeError）。
+        xlsx 模式下返回 None。
+        """
+        if self._storage_backend_name != "sqlite":
+            return None
+        if self._read_only:
+            raise RuntimeError("只读副本不能降级工作区")
+        result = self.export_excel_mirror(all_tables=True)
+        if result.failed:
+            detail = "；".join(f"{name}: {reason}" for name, reason in result.failed.items())
+            raise RuntimeError(f"导出 Excel 失败，未降级：{detail}")
+        xlsx = self._make_xlsx_backend()
+        for key in MANAGED_TABLE_KEYS:
+            if xlsx.read_rows(key, MANAGED_TABLE_HEADERS[key]) != self._backend.read_rows(key, MANAGED_TABLE_HEADERS[key]):
+                raise RuntimeError(f"{key} 导出的 Excel 与数据库内容不一致，未降级")
+        self._backend.close()
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = self.sqlite_path.with_name(f"{SQLITE_DATA_FILE}.bak-{stamp}")
+        os.replace(self.sqlite_path, backup)
+        for stale in (Path(str(self.sqlite_path) + "-wal"), Path(str(self.sqlite_path) + "-shm")):
+            try:
+                stale.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._backend = xlsx
+        self._storage_backend_name = "xlsx"
+        self.config.pop("storage_backend", None)
+        self.config["data_schema_version"] = XLSX_DATA_SCHEMA_VERSION
+        self._save_config()
+        self._reset_backend_caches()
+        return backup
+
     def _table_key_for(self, path: Path) -> str | None:
         """数据目录内的表文件 → 后端 key（文件名）；别的工作区 / 快照 / 子目录里的文件 → None（直接读 xlsx）。
 
@@ -5133,7 +5169,7 @@ _SERIALIZED_MUTATORS = (
     "downgrade_schema_version", "batch_reserve_vouchers", "log_alloc_event", "cancel_batch_reservation",
     "reset_next_serial", "rollback_to_voucher", "cancel_placeholder_vouchers", "void_vouchers", "set_active_series",
     "add_series", "remove_series", "update_series_counter", "upgrade_to_multi_user_protocol", "undo_last", "redo_last",
-    "import_workspace",
+    "import_workspace", "downgrade_to_xlsx_workspace",
 )
 # create_data_snapshot / export_excel_mirror 不在此列：它们用 _mirror_lock（见 __init__ 注释）。
 for _name in _SERIALIZED_MUTATORS:
