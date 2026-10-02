@@ -1454,9 +1454,10 @@ class CoreTests(unittest.TestCase):
         entries = indexed_image_entries([photo_dir], cache_root=self.tmp)
 
         self.assertEqual([entry.path for entry in entries], [image])
-        cache_dir = self.tmp / "数据" / "图片搜索索引缓存"
-        self.assertTrue((cache_dir / "image_search.sqlite3").exists())
-        self.assertEqual(list(cache_dir.glob("*.json")), [])
+        # 2026-10-02 起索引库在本机 cache 目录（ImageIndexStore.path），不在工作区；工作区里不得再出现索引缓存
+        from specimen_app.image_index import ImageIndexStore
+        self.assertTrue(ImageIndexStore(self.tmp).path.exists())
+        self.assertFalse((self.tmp / "数据" / "图片搜索索引缓存").exists())
 
     def test_image_search_uses_core_identifier_from_tube_number(self) -> None:
         photo_dir = self.tmp / "照片"
@@ -1478,17 +1479,17 @@ class CoreTests(unittest.TestCase):
         source.mkdir()
         image_path = source / "large.jpg"
         Image.new("RGB", (120, 80), "red").save(image_path)
-        cache = ThumbnailCache(self.tmp)
+        cache = ThumbnailCache(self.tmp)  # 2026-10-02 起缩略图缓存在本机 cache 目录（cache.cache_dir），不在工作区
         first = cache.thumbnail(image_path, (40, 40))
-        cached_files = sorted((self.tmp / "数据" / "缩略图缓存").glob("*.jpg"))
+        cached_files = sorted(cache.cache_dir.glob("*.jpg"))
         self.assertEqual(len(cached_files), 1)
         second = cache.thumbnail(image_path, (40, 40))
         self.assertEqual(second.size, first.size)
-        self.assertEqual(sorted((self.tmp / "数据" / "缩略图缓存").glob("*.jpg")), cached_files)
+        self.assertEqual(sorted(cache.cache_dir.glob("*.jpg")), cached_files)
         Image.new("RGB", (130, 90), "blue").save(image_path)
         third = cache.thumbnail(image_path, (40, 40))
         self.assertLessEqual(third.width, 40)
-        self.assertEqual(len(list((self.tmp / "数据" / "缩略图缓存").glob("*.jpg"))), 2)
+        self.assertEqual(len(list(cache.cache_dir.glob("*.jpg"))), 2)
 
     def test_thumbnail_cache_shrink_limit_evicts_resident_images(self) -> None:
         source = self.tmp / "照片"

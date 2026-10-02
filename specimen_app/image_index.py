@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
 from .image_match import natural_sort_key
+from .local_cache import local_cache_dir, read_only_sqlite_uri
 
 
 SUPPORTED_IMAGE_SUFFIX_ORDER = (
@@ -284,13 +285,14 @@ def iter_workspace_images(root: Path | str) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 def image_index_key(roots: list[Path | str], max_depth: int) -> tuple[tuple[str, ...], int]:
-    return (tuple(str(Path(root).resolve()) for root in roots), max_depth)
+    # 旧：Path(root).resolve()（网络盘一次往返，且主线程常调）。现：纯字符串 abspath。
+    return (tuple(os.path.abspath(str(root)) for root in roots), max_depth)
 
 
 def effective_image_search_depth(roots: list[Path | str], max_depth: int = 0) -> int:
-    if any(Path(r).resolve() == Path("/") for r in roots) and max_depth == 0:
+    if any(os.path.abspath(str(r)) == os.path.abspath("/") for r in roots) and max_depth == 0:
         return 4
-    if any(Path(r).resolve() == Path("/") for r in roots):
+    if any(os.path.abspath(str(r)) == os.path.abspath("/") for r in roots):
         return min(max_depth, 4)
     return max_depth
 
@@ -307,7 +309,7 @@ def image_search_depth(
 def image_search_roots(workspace: Path, extra_roots: list[Path | str] | None = None) -> list[Path]:
     roots: list[Path] = []
     if extra_roots:
-        candidates = [Path(root).resolve() for root in extra_roots]
+        candidates = [Path(os.path.abspath(str(root))) for root in extra_roots]
     else:
         photo_dir = workspace / "照片"
         candidates = [photo_dir if photo_dir.is_dir() else workspace]
@@ -339,8 +341,10 @@ class ImageIndexStore:
     """磁盘索引（每工作区一个 SQLite），大作用域不进应用内存。"""
 
     def __init__(self, workspace: Path | str):
-        self.workspace = Path(workspace).resolve()
-        self.path = self.workspace / "数据" / IMAGE_INDEX_CACHE_DIR_NAME / IMAGE_INDEX_SQLITE_FILE_NAME
+        self.workspace = Path(os.path.abspath(str(workspace)))
+        # 旧：self.workspace / "数据" / 图片搜索索引缓存 / image_search.sqlite3（在工作区里，网络盘上每次都走 SMB）
+        # 现：本机 app 配置目录下的 cache/image_index/<工作区指纹>/（见 local_cache.py）
+        self.path = local_cache_dir(self.workspace, "image_index") / IMAGE_INDEX_SQLITE_FILE_NAME
 
     # -- 连接 / 结构 ---------------------------------------------------------
 
@@ -352,7 +356,7 @@ class ImageIndexStore:
         """
         if not self.path.exists():
             raise FileNotFoundError(self.path)
-        conn = sqlite3.connect(f"file:{self.path.as_posix()}?mode=ro", uri=True, timeout=10)
+        conn = sqlite3.connect(read_only_sqlite_uri(self.path), uri=True, timeout=10)
         conn.create_function("py_lower", 1, _py_lower, deterministic=True)
         return conn
 
@@ -432,6 +436,24 @@ class ImageIndexStore:
                 yield conn
         finally:
             conn.close()
+
+    def _discard_legacy_workspace_index(self) -> None:
+        """2026-10-02：索引已搬到本机，工作区里旧的 数据/图片搜索索引缓存/（可达数百 MB）直接删掉，
+        不再在网络盘上做任何迁移/VACUUM。只在 reconcile（工作线程）里调，失败忽略。"""
+        legacy_dir = self.workspace / "数据" / IMAGE_INDEX_CACHE_DIR_NAME
+        if not legacy_dir.is_dir():
+            return
+        for name in (IMAGE_INDEX_SQLITE_FILE_NAME, IMAGE_INDEX_SQLITE_FILE_NAME + "-wal", IMAGE_INDEX_SQLITE_FILE_NAME + "-shm", IMAGE_INDEX_SQLITE_FILE_NAME + "-journal"):
+            try:
+                (legacy_dir / name).unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            for stale in legacy_dir.glob("*.json"):
+                stale.unlink(missing_ok=True)
+            legacy_dir.rmdir()
+        except OSError:
+            pass
 
     def _vacuum_if_needed(self) -> None:
         """v1 → v2 迁移后回收 tokens 表占的空间；只在 reconcile（工作线程）里调用。"""
@@ -560,6 +582,7 @@ class ImageIndexStore:
                     (scope_key, roots_json, max_depth, scan_started - LAST_SCAN_SAFETY_MARGIN_SECONDS),
                 )
             self._vacuum_if_needed()
+            self._discard_legacy_workspace_index()
             return ImageIndexUpdate(
                 scanned=len(current_by_path),
                 added=len(added),

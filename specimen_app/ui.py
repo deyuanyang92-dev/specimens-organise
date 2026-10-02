@@ -8348,6 +8348,11 @@ class ImageSearchDialog(QDialog):
         roots = self._parse_search_roots()
         if not image_index_exists(self.app.workspace_root, roots):
             return
+        # 2026-10-02 Everything 式：根目录 mtime 没变且 10 分钟内扫过 → 不扫（旧：每次打开/改范围都走一遍目录树）
+        from .image_search import scope_needs_reconcile
+
+        if not scope_needs_reconcile(self.app.workspace_root, roots):
+            return
         if self._scope_index_worker is not None and self._scope_index_worker.isRunning():
             self._scope_index_worker.requestInterruption()
             self._scope_index_worker.wait(1000)

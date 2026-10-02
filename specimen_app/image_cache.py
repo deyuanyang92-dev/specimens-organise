@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
+import os
 import math
 import threading
 import uuid
@@ -9,6 +11,7 @@ from pathlib import Path
 from typing import Iterable
 
 from PIL import Image, ImageOps
+from .local_cache import local_cache_dir
 
 _NUMPY = None
 _TIFFFILE = None
@@ -45,9 +48,12 @@ def _default_memory_limit() -> int:
 
 class ThumbnailCache:
     def __init__(self, workspace_root: Path | str, memory_limit_bytes: int | None = None):
-        self.workspace_root = Path(workspace_root).resolve()
-        self.cache_dir = self.workspace_root / "数据" / "缩略图缓存"
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.workspace_root = Path(os.path.abspath(str(workspace_root)))
+        # 旧：self.workspace_root / "数据" / "缩略图缓存"（在工作区里，网络盘上每张缩略图读写都走 SMB）
+        # 现：本机缓存目录（local_cache.py）。
+        self.cache_dir = local_cache_dir(self.workspace_root, "thumbnails")
+        # 旧位置只读回退：以前在工作区里生成过的缩略图不白费——本机没有时从那里拷一份过来
+        self.legacy_cache_dir = self.workspace_root / "数据" / "缩略图缓存"
         # memory_limit_bytes=None 时按环境自动选(规范化软件设计 2026-05 新增)。
         if memory_limit_bytes is None:
             memory_limit_bytes = _default_memory_limit()
@@ -57,18 +63,25 @@ class ThumbnailCache:
         self._lock = threading.RLock()
 
     def set_workspace(self, workspace_root: Path | str) -> None:
-        self.workspace_root = Path(workspace_root).resolve()
-        self.cache_dir = self.workspace_root / "数据" / "缩略图缓存"
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.workspace_root = Path(os.path.abspath(str(workspace_root)))
+        self.cache_dir = local_cache_dir(self.workspace_root, "thumbnails")
+        self.legacy_cache_dir = self.workspace_root / "数据" / "缩略图缓存"
         self.clear_memory_cache()
 
     def thumbnail(self, source: Path | str, size: tuple[int, int]) -> Image.Image:
-        source_path = Path(source).resolve()
+        source_path = Path(os.path.abspath(str(source)))  # 旧：resolve()，网络盘一次往返
         key = self._cache_key(source_path, size)
         cached_image = self._get_from_memory(key)
         if cached_image is not None:
             return cached_image
         cached = self.cache_dir / f"{key}.jpg"
+        if not cached.exists():
+            legacy = self.legacy_cache_dir / f"{key}.jpg"
+            try:
+                if legacy.exists():
+                    shutil.copy2(legacy, cached)  # 搬一次到本机，以后不再碰网络盘
+            except OSError:
+                pass
         if cached.exists():
             with Image.open(cached) as image:
                 loaded = image.copy()
