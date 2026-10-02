@@ -85,6 +85,35 @@ class XlsxBackendContractTests(unittest.TestCase):
         self.assertEqual(self.b.read_rows("c.xlsx" + SHEET_SEP + "修改明细"), [{"x": "d9"}])
         self.assertEqual([r["y"] for r in self.b.read_rows("c.xlsx" + SHEET_SEP + "修改汇总")], ["s1", "s2"])
 
+    def test_read_many_loads_each_file_once_and_keeps_order(self):
+        self.b.replace_many([
+            ("c.xlsx" + SHEET_SEP + "修改明细", ["x"], [{"x": "d1"}]),
+            ("c.xlsx" + SHEET_SEP + "修改汇总", ["y"], [{"y": "s1"}]),
+        ])
+        self.b.replace_rows("t.xlsx", ["a"], [{"a": "1"}])
+        got = self.b.read_many([
+            ("c.xlsx" + SHEET_SEP + "修改汇总", ["y"]),
+            ("t.xlsx", None),
+            ("c.xlsx" + SHEET_SEP + "修改明细", ["x"]),
+            ("missing.xlsx", ["z"]),
+        ])
+        self.assertEqual(got, [[{"y": "s1"}], [{"a": "1"}], [{"x": "d1"}], []])
+
+    def test_replace_many_preserves_unknown_extra_sheets(self):
+        from openpyxl import Workbook
+        wb = Workbook(); ws = wb.active; ws.title = "修改明细"; ws.append(["x"]); ws.append(["d1"])
+        wb.create_sheet("修改汇总").append(["y"]); extra = wb.create_sheet("用户自加"); extra.append(["keep"]); extra.append(["me"])
+        wb.save(self.data / "c.xlsx"); wb.close()
+        self.b.replace_many([
+            ("c.xlsx" + SHEET_SEP + "修改明细", ["x"], [{"x": "d2"}]),
+            ("c.xlsx" + SHEET_SEP + "修改汇总", ["y"], [{"y": "s2"}]),
+        ])
+        wb = load_workbook(self.data / "c.xlsx", read_only=True)
+        self.assertEqual(wb.sheetnames, ["修改明细", "修改汇总", "用户自加"])
+        self.assertEqual([r[0] for r in wb["用户自加"].iter_rows(values_only=True)], ["keep", "me"])
+        wb.close()
+        self.assertEqual(self.b.read_rows("c.xlsx" + SHEET_SEP + "修改明细"), [{"x": "d2"}])
+
     def test_read_normalises_column_aliases(self):
         self.b.replace_rows("t.xlsx", ["采集地点缩写*"], [{"采集地点缩写*": "QD"}])
         self.assertEqual(self.b.read_rows("t.xlsx"), [{"采集地缩写*": "QD"}])
@@ -110,6 +139,52 @@ class XlsxBackendContractTests(unittest.TestCase):
         self.b.replace_rows("t.xlsx", ["a"], [{"a": "1"}])
         self.assertEqual(xlsx_read_rows(self.data / "t.xlsx", _s, {}), [{"a": "1"}])
         self.assertEqual(xlsx_read_rows(self.data / "missing.xlsx", _s, {}), [])
+
+
+class StoreUsesBackendTests(unittest.TestCase):
+    """Task 2：ExcelStore 的读写原语全部经过 self._backend。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_store_routes_reads_and_writes_through_backend(self):
+        from specimen_app.excel_store import ExcelStore
+        from specimen_app.models import CHANGE_LOG_FILE, SPECIMEN_FILE
+
+        store = ExcelStore(self.tmp)
+        try:
+            self.assertEqual(store.storage_backend_name, "xlsx")
+            v = store.create_specimen()
+            store.set_fields("specimen", v, {"备注": "via backend"})
+            calls: list[str] = []
+            orig = store._backend.read_rows
+
+            def spy(key, fallback_headers=None):
+                calls.append(key)
+                return orig(key, fallback_headers)
+
+            store._backend.read_rows = spy  # type: ignore[method-assign]
+            store._invalidate_cache(SPECIMEN_FILE)
+            self.assertEqual(store.get_specimen(v)["备注"], "via backend")
+            self.assertIn(SPECIMEN_FILE, calls)
+            detail = store._backend.read_rows(CHANGE_LOG_FILE + SHEET_SEP + "修改明细", None)
+            self.assertTrue(any(r.get("字段名") == "备注" and r.get("新值") == "via backend" for r in detail))
+        finally:
+            store.close()
+
+    def test_table_key_for_external_path_is_none(self):
+        from specimen_app.excel_store import ExcelStore
+
+        store = ExcelStore(self.tmp)
+        try:
+            self.assertEqual(store._table_key_for(store.data_dir / "标本信息.xlsx"), "标本信息.xlsx")
+            self.assertIsNone(store._table_key_for(self.tmp / "别处" / "标本信息.xlsx"))
+            self.assertIsNone(store._table_key_for(store.data_dir / "数据版本" / "x" / "标本信息.xlsx"))
+        finally:
+            store.close()
 
 
 if __name__ == "__main__":

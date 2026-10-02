@@ -15,6 +15,7 @@ SqliteBackend。XlsxBackend 的每个方法体都是从 excel_store.py 原样搬
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Protocol
 
@@ -28,11 +29,31 @@ def split_table_key(key: str) -> tuple[str, str | None]:
     return file_name, (sheet or None)
 
 
-def _openpyxl():
-    # 懒加载：启动不付 openpyxl 导入成本（与 excel_store._ensure_openpyxl 同理）
-    from openpyxl import Workbook, load_workbook
+_OPENPYXL: tuple[Any, Any] | None = None
 
-    return Workbook, load_workbook
+
+def _openpyxl():
+    """懒加载 openpyxl，并沿用 excel_store._ensure_openpyxl 的 numpy 屏蔽：
+
+    openpyxl 若发现 numpy 已可导入会顺手 import 它（2GB 机器上多占几十 MB）。首次导入时若
+    numpy 尚未被别人导入，就临时把 sys.modules["numpy"] 置 None 让 openpyxl 走纯 Python 路径。
+    """
+    global _OPENPYXL
+    if _OPENPYXL is not None:
+        return _OPENPYXL
+    numpy_module = sys.modules.get("numpy")
+    blocked = "numpy" not in sys.modules
+    if blocked:
+        sys.modules["numpy"] = None  # type: ignore[assignment]
+    try:
+        from openpyxl import Workbook, load_workbook
+    finally:
+        if blocked:
+            sys.modules.pop("numpy", None)
+        elif numpy_module is not None:
+            sys.modules["numpy"] = numpy_module
+    _OPENPYXL = (Workbook, load_workbook)
+    return _OPENPYXL
 
 
 class TableBackend(Protocol):
@@ -43,6 +64,8 @@ class TableBackend(Protocol):
     def headers(self, key: str) -> list[str]: ...
 
     def read_rows(self, key: str, fallback_headers: list[str] | None = None) -> list[Row]: ...
+
+    def read_many(self, items: list[tuple[str, list[str] | None]]) -> list[list[Row]]: ...
 
     def replace_rows(self, key: str, headers: list[str], rows: Iterable[Row]) -> None: ...
 
@@ -202,6 +225,36 @@ class XlsxBackend:
             self._path(key), self._to_string, self._column_aliases, fallback_headers, split_table_key(key)[1]
         )
 
+    def read_many(self, items: list[tuple[str, list[str] | None]]) -> list[list[Row]]:
+        """多张表一次读：同一文件只 load 一次（修改记录两张 sheet 走这里）。结果顺序与 items 一致。"""
+        results: list[list[Row] | None] = [None] * len(items)
+        by_file: dict[str, list[int]] = {}
+        for idx, (key, _) in enumerate(items):
+            by_file.setdefault(split_table_key(key)[0], []).append(idx)
+        _, load_workbook = _openpyxl()
+        for file_name, indices in by_file.items():
+            path = self.data_dir / file_name
+            if not path.exists():
+                for idx in indices:
+                    results[idx] = []
+                continue
+            wb = load_workbook(path, read_only=True, data_only=True)
+            try:
+                for idx in indices:
+                    key, fallback = items[idx]
+                    _, sheet = split_table_key(key)
+                    if sheet is None:
+                        ws = wb.active
+                    elif sheet in wb.sheetnames:
+                        ws = wb[sheet]
+                    else:
+                        results[idx] = []
+                        continue
+                    results[idx] = _rows_from_ws(ws, self._to_string, self._column_aliases, fallback)
+            finally:
+                wb.close()
+        return [r if r is not None else [] for r in results]
+
     def version_token(self, key: str) -> float:
         # 旧 _cached_rows / _ensure_index_voucher_set 等：用文件 mtime 判缓存失效；缺文件按 0.0
         try:
@@ -236,12 +289,28 @@ class XlsxBackend:
                         pass
                 continue
             # 旧 _write_changes_and_summary / 修改明细整表替换：load 整本，_replace_sheet
-            # （delete_rows + 表头 + 行），其它 sheet 原样保留，原子替换
+            # （delete_rows + 表头 + 行），其它 sheet 原样保留，原子替换。
+            # 优化：先用 read_only 看一眼 sheet 名（毫秒级）；文件里所有 sheet 都在本次替换范围内时
+            # 直接新建 Workbook（省掉整本 load，1500 条标本的修改记录 ≈ 0.1 s/次）；
+            # 有不认识的 sheet（用户自加）才走旧的整本 load 以保留它。
+            replacing = {sheet or "Sheet1" for sheet, _, _ in sheet_items}
+            existing_sheets: list[str] = []
             if path.exists():
+                probe = load_workbook(path, read_only=True)
+                try:
+                    existing_sheets = list(probe.sheetnames)
+                finally:
+                    probe.close()
+            if existing_sheets and not set(existing_sheets).issubset(replacing):
                 wb = load_workbook(path)
             else:
                 wb = Workbook()
                 wb.remove(wb.active)
+                # 保持原 sheet 顺序：先按文件里的顺序建，缺的再按本次顺序补
+                order = [n for n in existing_sheets if n in replacing] + [n for n in (sheet or "Sheet1" for sheet, _, _ in sheet_items) if n not in existing_sheets]
+                for name in order:
+                    if name not in wb.sheetnames:
+                        wb.create_sheet(name)
             try:
                 for sheet, headers, rows in sheet_items:
                     name = sheet or "Sheet1"
