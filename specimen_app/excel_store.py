@@ -53,6 +53,7 @@ from .action_log_db import ActionLogDatabase  # Tier B: SQLite 操作日志
 from .table_backend import SHEET_SEP, XlsxBackend, split_table_key, xlsx_headers, xlsx_read_rows  # 2026-10-02 路线 1：表后端
 from .table_backend_sqlite import SqliteBackend  # 2026-10-02 第 2 段：SQLite 真相源
 from .models import (
+    WorkspaceFileBusyError,
     ACTION_LOG_FILE,
     ACTION_LOG_HEADERS,
     ALLOC_LOG_FILE,
@@ -3446,7 +3447,23 @@ class ExcelStore:
             # LRU: move_to_end 让命中项标为最近使用
             self._row_cache.move_to_end(file_key)
             return [row.copy() for row in self._row_cache[file_key]]
-        rows = loader()
+        # 旧：rows = loader() —— 文件被占用（重试已在后端做过）时 PermissionError 直接冒到 GUI 槽函数 → 程序退出
+        try:
+            rows = loader()
+        except PermissionError as exc:
+            stale = self._row_cache.get(file_key)
+            if stale is not None and not self._current_thread_is_mutating():
+                # 只读路径：用上次读到的行顶一下（不更新 _file_mtimes，下次读照常重试磁盘）。
+                # 写路径（持 _mutation_lock）绝不用旧缓存——否则"读旧 → 改 → 写回"会覆盖磁盘上更新的数据。
+                import logging
+                logging.getLogger(__name__).warning("读取 %s 被占用，暂用上次缓存：%s", file_key, exc)
+                return [row.copy() for row in stale]
+            if isinstance(exc, WorkspaceFileBusyError):
+                raise
+            raise WorkspaceFileBusyError(
+                f"数据文件「{file_key}」正被其他程序占用（Excel / 杀毒软件 / 网盘同步），暂时无法读取。"
+                "请关闭占用它的程序后重试。"
+            ) from exc
         self._row_cache[file_key] = rows
         self._row_cache.move_to_end(file_key)
         self._file_mtimes[file_key] = current_mtime
@@ -3460,6 +3477,16 @@ class ExcelStore:
             if evicted_key == PHOTO_FILE:
                 self._photo_voucher_index = {}
         return [row.copy() for row in rows]
+
+    def _current_thread_is_mutating(self) -> bool:
+        """当前线程是否持有写者锁（在某个 _serialized 改数据方法内部）。判断不了时按"是"处理（保守）。"""
+        is_owned = getattr(self._mutation_lock, "_is_owned", None)
+        if is_owned is None:
+            return True
+        try:
+            return bool(is_owned())
+        except Exception:
+            return True
 
     def _build_voucher_index_for(self, file_key: str, sparse_rows: list[Row]) -> None:
         """填充缓存后为 specimen/classification/photo 表建 voucher 索引（按 sparse 行下标）。"""

@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Protocol
 
@@ -82,6 +83,26 @@ class TableBackend(Protocol):
 
 
 # ---------------------------------------------------------------------------
+# v0.10.40：文件被短暂占用时重试（crash_20261003_151423：读 标本信息.xlsx 时 PermissionError 直接崩）
+# ---------------------------------------------------------------------------
+
+# Windows 上杀毒 / 同步盘（OneDrive、坚果云…）/ 资源管理器预览 / 刚 MoveFileEx 替换完的文件，
+# 常有几十到几百毫秒的独占窗口，此时 open() 报 [Errno 13]。总等待 ≈ 1.55 s，够跨过这类窗口；
+# 真被 Excel 长期独占时仍会抛出，由上层（ExcelStore 旧缓存 / UI 提示）处理。
+_LOCK_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8)
+
+
+def retry_on_file_lock(fn: Callable[[], Any], delays: tuple[float, ...] = _LOCK_RETRY_DELAYS) -> Any:
+    """执行 fn；遇 PermissionError 按 delays 退避重试，耗尽后抛最后一次的 PermissionError。其他异常不重试。"""
+    for delay in delays:
+        try:
+            return fn()
+        except PermissionError:
+            time.sleep(delay)
+    return fn()
+
+
+# ---------------------------------------------------------------------------
 # 模块级 xlsx 读取（store 读"别的工作区"的文件、workspace_tables 都复用）
 # ---------------------------------------------------------------------------
 
@@ -121,7 +142,8 @@ def xlsx_read_rows(path: Path | str, to_string: Callable[[object], str], column_
     if not path.exists():
         return []
     _, load_workbook = _openpyxl()
-    wb = load_workbook(path, read_only=True, data_only=True)
+    # 旧：wb = load_workbook(path, read_only=True, data_only=True)  —— 文件被短暂占用即抛 PermissionError
+    wb = retry_on_file_lock(lambda: load_workbook(path, read_only=True, data_only=True))
     try:
         if sheet is not None:
             if sheet not in wb.sheetnames:
@@ -139,7 +161,8 @@ def xlsx_headers(path: Path | str, to_string: Callable[[object], str], sheet: st
     if not path.exists():
         return []
     _, load_workbook = _openpyxl()
-    wb = load_workbook(path, read_only=True, data_only=True)
+    # 旧：wb = load_workbook(path, read_only=True, data_only=True)  —— 文件被短暂占用即抛 PermissionError
+    wb = retry_on_file_lock(lambda: load_workbook(path, read_only=True, data_only=True))
     try:
         if sheet is not None:
             if sheet not in wb.sheetnames:
@@ -190,7 +213,8 @@ class XlsxBackend:
             wb.save(tmp)
             if self._verify_file is not None:
                 self._verify_file(tmp)
-            tmp.replace(path)
+            # 旧：tmp.replace(path) —— 目标正被杀毒 / 同步盘扫描时 Windows 报 PermissionError，整次保存失败
+            retry_on_file_lock(lambda: tmp.replace(path))
         finally:
             try:
                 tmp.unlink(missing_ok=True)
@@ -240,7 +264,8 @@ class XlsxBackend:
                 for idx in indices:
                     results[idx] = []
                 continue
-            wb = load_workbook(path, read_only=True, data_only=True)
+            # 旧：wb = load_workbook(path, read_only=True, data_only=True)
+            wb = retry_on_file_lock(lambda p=path: load_workbook(p, read_only=True, data_only=True))
             try:
                 for idx in indices:
                     key, fallback = items[idx]

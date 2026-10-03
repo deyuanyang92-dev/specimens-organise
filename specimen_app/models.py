@@ -238,6 +238,13 @@ class WorkspaceError(RuntimeError):
     """Base class for workspace-level failures."""
 
 
+class WorkspaceFileBusyError(PermissionError):
+    """工作区数据文件被其他程序短暂占用（杀毒扫描 / 同步盘 / Excel 打开 / 刚原子替换完），重试后仍打不开。
+
+    继承 PermissionError：旧代码 ``except PermissionError`` 照样接得住（v0.10.40）。
+    """
+
+
 class WorkspaceLockedError(WorkspaceError):
     """Raised when the workspace lock is held by another process."""
 
