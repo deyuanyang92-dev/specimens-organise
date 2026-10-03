@@ -27,6 +27,7 @@ for /f "tokens=2 delims= " %%v in ('python --version 2^>^&1') do set PYVER=%%v
 echo [信息] Python %PYVER%
 echo.
 
+set PYTHONUTF8=1
 :: ---- 安装依赖 ----
 echo [1/3] 安装项目依赖...
 pip install -r requirements.txt -q
@@ -63,14 +64,38 @@ if errorlevel 1 (
     exit /b 1
 )
 
+for /f %%v in ('python -c "from specimen_app import __version__; print(__version__)"') do set APPVER=%%v
+
+:: ---- 试跑打包好的 exe（2026-10-03：与 GitHub 自动打包同一道检查，打坏的包不要拿去用）----
+echo [检查] 试跑打包产物 --smoke ...
+set SMOKE_EXE=
+for /r "releases\v%APPVER%" %%f in (*.exe) do (
+    echo %%~nxf | findstr /b /c:"installer_" >nul || set "SMOKE_EXE=%%f"
+)
+if not defined SMOKE_EXE (
+    echo [警告] 未找到打包好的 exe，跳过试跑
+) else (
+    set QT_QPA_PLATFORM=offscreen
+    rem GUI 程序直接调用不会等它结束，必须 start /wait 才拿得到退出码
+    start "" /wait "%SMOKE_EXE%" --smoke
+    if errorlevel 1 (
+        echo [错误] 打包产物试跑失败，日志见 %%APPDATA%%\标本入库管理\startup_failure_*.log
+        pause
+        exit /b 1
+    )
+    set QT_QPA_PLATFORM=
+)
+
 echo.
 echo ========================================
-echo   构建成功！
+echo   构建成功！v%APPVER%
 echo.
-echo   输出目录: dist\标本入库管理\
-echo   分发方式: 将该目录打包为 ZIP
+:: 旧：echo   输出目录: dist\标本入库管理\  —— build_release.py 实际输出在 releases\v版本号\
+echo   输出目录: releases\v%APPVER%\
+echo     installer_v%APPVER%_windows.exe  安装器（需装 Inno Setup 6 才会生成）
+echo     setup_v%APPVER%_windows.zip      便携版（整体解压运行）
 echo ========================================
 echo.
 echo 按任意键打开输出目录...
 pause >nul
-explorer "dist\标本入库管理"
+explorer "releases\v%APPVER%"

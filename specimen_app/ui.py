@@ -1361,6 +1361,9 @@ class SpecimenWindow(QMainWindow):
         # 主线程与工作线程都会碰它，必须加锁。
         self._queued_field_saves: dict[str, dict[str, str]] = {}
         self._queued_field_saves_lock = threading.Lock()
+        # v0.10.40 未保存修改恢复日志（见 edit_journal.py）；按工作区懒建，只读窗口不用。
+        self._edit_journal_obj = None
+        self._edit_journal_root = None
         # 自动保存开关：True=输入停 0.5s 自动写；False=只在点「保存」按钮时写。工具栏可勾选切换。
         self.auto_save_enabled = load_settings().auto_save_enabled
         self._list_refresh_timer = QTimer(self)
@@ -1437,6 +1440,7 @@ class SpecimenWindow(QMainWindow):
         if self._is_closing or self.store is None:
             return
         self.statusBar().showMessage("工作区已加载", 2000)
+        QTimer.singleShot(2500, self._offer_edit_recovery)  # v0.10.40：排在"上次未正常退出"提示之后
         # 分类预设缺失时显示持久黄色警告条（旧：8 秒状态栏消息，极易错过）。
         if self.matcher is not None and not list(self.matcher.all_rows()):
             self._preset_warning_banner.show()
@@ -2630,6 +2634,7 @@ class SpecimenWindow(QMainWindow):
         help_menu.addSeparator()
         help_menu.addAction("检查更新…", self._check_github_update_from_help)
         help_menu.addAction("打开崩溃日志目录…", self._open_crash_log_dir)
+        help_menu.addAction("恢复未保存的修改…", lambda: self._offer_edit_recovery(manual=True))
         help_menu.addSeparator()
         help_menu.addAction("关于…", self._open_about_dialog)
 
@@ -3311,10 +3316,17 @@ class SpecimenWindow(QMainWindow):
             # 旧"接管编号"分集已删，所有用户实际录入的号都统一在本任务编号里。
             created = self._active_task["本任务编号"]
             claimed = len(created)
-            ingested = sum(
-                1 for v in created
-                if self.store is not None and self.store.is_voucher_ingestion_complete(v)
-            )
+            # 旧：ingested = sum(1 for v in created if self.store is not None and self.store.is_voucher_ingestion_complete(v))
+            #     —— 这是 crash_20261003_151423 的崩溃点：指示器计数读 xlsx 被占用 → 整个程序退出。
+            #     现：计数读失败就沿用上一次的数字，指示器只是显示，不值得崩溃。
+            try:
+                ingested = sum(
+                    1 for v in created
+                    if self.store is not None and self.store.is_voucher_ingestion_complete(v)
+                )
+                self._last_task_ingested = ingested
+            except Exception:
+                ingested = getattr(self, "_last_task_ingested", 0)
             self._task_label.setText(
                 f"● {person} · {status} · 认领 {claimed} · 入库 {ingested}"
             )
@@ -4169,6 +4181,7 @@ class SpecimenWindow(QMainWindow):
         # 的原子替换，在 WSL + Windows 挂载目录中单次就可能耗时数百毫秒。
         key = f"{voucher}:{category}"
         self._pending_save_fields.setdefault(key, set()).add(field)
+        self._journal_record(voucher, category, field)
         if key not in self._save_timers:
             timer = QTimer(self)
             timer.setSingleShot(True)
@@ -4219,6 +4232,110 @@ class SpecimenWindow(QMainWindow):
     # ------------------------------------------------------------------
     # P0-1（2026-10-02）：specimen / classification 字段保存后台化
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # v0.10.40 未保存修改恢复日志（异常退出恢复）
+    # ------------------------------------------------------------------
+    def _edit_journal(self):
+        """当前工作区的 EditJournal；只读窗口 / 无工作区返回 None。"""
+        if self.read_only or self.store is None or self.workspace_root is None:
+            return None
+        if self._edit_journal_obj is None or self._edit_journal_root != self.workspace_root:
+            try:
+                from .app_settings import app_config_dir
+                from .edit_journal import EditJournal
+                self._edit_journal_obj = EditJournal(app_config_dir() / "recovery", self.workspace_root)
+                self._edit_journal_root = self.workspace_root
+            except Exception:
+                self._edit_journal_obj = None
+        return self._edit_journal_obj
+
+    def _journal_record(self, voucher: str, category: str, field: str) -> None:
+        if category not in ("specimen", "classification"):
+            return
+        journal = self._edit_journal()
+        if journal is None:
+            return
+        widgets = self.specimen_widgets if category == "specimen" else self.class_widgets
+        widget = widgets.get(field)
+        if widget is None:
+            return
+        try:
+            journal.record(voucher, category, {field: _wget(widget)})
+        except Exception:
+            pass
+
+    def _journal_confirm(self, voucher: str, category: str, updates: dict[str, str]) -> None:
+        journal = self._edit_journal()
+        if journal is not None:
+            journal.confirm_saved(voucher, category, updates)
+
+    def _offer_edit_recovery(self, manual: bool = False) -> None:
+        """打开工作区后（或手动）检查恢复日志：有未落盘的修改就问用户要不要写回。"""
+        journal = self._edit_journal()
+        if journal is None:
+            if manual:
+                QMessageBox.information(self, "恢复未保存的修改", "当前窗口是只读的或未打开工作区。")
+            return
+        pending = []
+        for voucher, category, fields, updated_at in journal.pending():
+            try:
+                row = (self.store.get_specimen(voucher) if category == "specimen"
+                       else self.store.get_classification(voucher)) or {}
+            except Exception:
+                row = {}
+            diff = {k: v for k, v in fields.items() if str(row.get(k, "")) != v}
+            if not diff:
+                journal.confirm_saved(voucher, category, fields)  # 其实已写进去了（崩在确认之前）
+                continue
+            pending.append((voucher, category, diff, updated_at, row))
+        if not pending:
+            if manual:
+                QMessageBox.information(self, "恢复未保存的修改", "没有需要恢复的修改。")
+            return
+        cat_name = {"specimen": "标本信息", "classification": "分类信息"}
+        lines = []
+        for voucher, category, diff, updated_at, row in pending:
+            for k, v in diff.items():
+                lines.append(f"{voucher} · {cat_name.get(category, category)} · {k}：「{row.get(k, '')}」→「{v}」  ({updated_at})")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("恢复未保存的修改")
+        box.setText(f"发现 {len(lines)} 处修改在上次退出前没有写进工作区（程序异常退出或保存失败）。\n要把它们写回吗？")
+        box.setDetailedText("\n".join(lines))
+        restore_btn = box.addButton("恢复写入", QMessageBox.AcceptRole)
+        discard_btn = box.addButton("丢弃这些修改", QMessageBox.DestructiveRole)
+        box.addButton("稍后再说", QMessageBox.RejectRole)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is discard_btn:
+            journal.discard_all()
+            self.statusBar().showMessage("已丢弃未保存的修改", 4000)
+            return
+        if clicked is not restore_btn:
+            return
+        ok, failed = 0, []
+        for voucher, category, diff, _, _ in pending:
+            try:
+                self.store.set_fields(category, voucher, diff)
+                journal.confirm_saved(voucher, category, diff)
+                ok += 1
+                try:
+                    self.patch_voucher_row(voucher, "updated")
+                except Exception:
+                    pass
+            except Exception as exc:  # noqa: BLE001
+                failed.append(f"{voucher}：{exc}")
+        if self.current_voucher:
+            try:
+                self.select_voucher(self.current_voucher)
+            except Exception:
+                pass
+        if failed:
+            QMessageBox.warning(self, "恢复未保存的修改",
+                                f"已恢复 {ok} 组；{len(failed)} 组失败（仍保留在恢复日志里）：\n" + "\n".join(failed[:10]))
+        else:
+            self.statusBar().showMessage(f"已恢复 {ok} 组未保存的修改", 5000)
+
     def _collect_text_updates(self, category: str, fields: set[str]) -> dict[str, str]:
         """在 GUI 线程读控件值（控件只能在 GUI 线程碰）。"""
         widgets = self.specimen_widgets if category == "specimen" else self.class_widgets
@@ -4254,21 +4371,26 @@ class SpecimenWindow(QMainWindow):
                 return
             self._queued_field_saves[key] = dict(updates)
         # store 在入队时绑定：切换工作区时排队中的任务仍写旧工作区（切换前已排空，这是兜底）
+        # 旧：worker.enqueue(..., self._run_queued_field_save, store, key, category, voucher)
         accepted = worker.enqueue(
-            f"save_fields:{category}:{voucher}", self._run_queued_field_save, store, key, category, voucher
+            f"save_fields:{category}:{voucher}", self._run_queued_field_save, store, key, category, voucher,
+            self._edit_journal(),
         )
         if not accepted:
             with self._queued_field_saves_lock:
                 self._queued_field_saves.pop(key, None)
             self._save_text_fields(category, fields, voucher)
 
-    def _run_queued_field_save(self, store, key: str, category: str, voucher: str) -> tuple[str, str, bool]:
+    def _run_queued_field_save(self, store, key: str, category: str, voucher: str,
+                               journal=None) -> tuple[str, str, bool]:
         """【工作线程】取出该组最新字段合集并写盘。只碰 store，不碰任何控件。"""
         with self._queued_field_saves_lock:
             updates = self._queued_field_saves.pop(key, None)
         if not updates:
             return (category, voucher, False)
         changed = store.set_fields(category, voucher, updates)
+        if journal is not None:
+            journal.confirm_saved(voucher, category, updates)  # 已落盘 → 从恢复日志删掉
         return (category, voucher, bool(changed))
 
     def _on_field_save_done(self, category: str, voucher: str, changed: bool, elapsed_ms: float) -> None:
@@ -4315,7 +4437,12 @@ class SpecimenWindow(QMainWindow):
                     self._loading = False
             except Exception:
                 pass
-        QMessageBox.critical(self, "保存失败", error_msg)
+        # 旧：QMessageBox.critical(self, "保存失败", error_msg)
+        QMessageBox.critical(
+            self, "保存失败",
+            f"{error_msg}\n\n这次修改没有丢：已暂存在本机恢复日志里。"
+            "关闭占用文件的程序后，点「帮助 → 恢复未保存的修改…」即可重新写入。",
+        )
 
     def _drain_store_worker(self, timeout_ms: int = 120000) -> bool:
         """等后台写线程把排队的保存全部写完（保持事件循环转动，状态栏可见）。False = 超时。"""
@@ -4373,6 +4500,7 @@ class SpecimenWindow(QMainWindow):
                     widget = self.specimen_widgets[field]
                     updates[field] = _wget(widget)
                 changed = self.store.set_fields("specimen", voucher, updates)
+                self._journal_confirm(voucher, "specimen", updates)
                 if changed:
                     specimen = self.store.get_specimen(voucher) or {}
                     self._loading = True
@@ -4387,6 +4515,7 @@ class SpecimenWindow(QMainWindow):
             else:
                 updates = {field: self.class_widgets[field].text() for field in fields}
                 self.store.set_fields("classification", voucher, updates)
+                self._journal_confirm(voucher, "classification", updates)
             self.patch_voucher_row(voucher, "updated")
         except Exception as exc:
             try:
@@ -5258,7 +5387,33 @@ class SpecimenWindow(QMainWindow):
             self.statusBar().showMessage("", 100)
 
     def _on_store_op_done(self, op_id: str, result: object, elapsed_ms: float) -> None:
-        """后台操作完成：根据操作类型更新 UI。"""
+        """后台操作完成：根据操作类型更新 UI。
+
+        v0.10.40：数据已经写完，这里只是刷新界面。刷新时读文件出错（crash_20261003_151423：
+        标本信息.xlsx 被占用 → PermissionError）不能再冒出去把程序带崩——记日志 + 状态栏提示即可。
+        """
+        try:
+            self._on_store_op_done_impl(op_id, result, elapsed_ms)
+        except Exception as exc:  # noqa: BLE001 - UI 刷新失败不影响已落盘的数据
+            self._report_recovered_error("刷新界面", exc)
+
+    def _report_recovered_error(self, what: str, exc: BaseException) -> None:
+        """已兜住的异常：写 crash 日志（上下文 recovered，不触发"上次未正常退出"提示）+ 状态栏提示。"""
+        try:
+            from .crash_log import write_crash_log
+            write_crash_log(type(exc), exc, exc.__traceback__, context_note=f"recovered:{what}")
+        except Exception:
+            pass
+        if isinstance(exc, PermissionError):
+            msg = f"{what}时数据文件暂时被其他程序占用（Excel / 杀毒 / 网盘同步），稍后会自动重试。数据已保存。"
+        else:
+            msg = f"{what}出错（已记录日志，数据不受影响）：{exc}"
+        try:
+            self.statusBar().showMessage(msg, 8000)
+        except Exception:
+            pass
+
+    def _on_store_op_done_impl(self, op_id: str, result: object, elapsed_ms: float) -> None:
         if op_id.startswith("save_fields:"):
             category, voucher, changed = result  # type: ignore[misc]
             self._on_field_save_done(str(category), str(voucher), bool(changed), elapsed_ms)
@@ -7137,6 +7292,7 @@ class SpecimenWindow(QMainWindow):
         self.current_photo_index = 0
         self._photo_view_states.clear()
         self.refresh_list()
+        QTimer.singleShot(500, self._offer_edit_recovery)  # v0.10.40
         vouchers = self._all_vouchers
         if vouchers:
             self.select_voucher(vouchers[0])
@@ -10809,6 +10965,18 @@ def _install_qt_exception_dialog() -> None:
     def _hook(exc_type, exc_value, exc_tb):
         _orig(exc_type, exc_value, exc_tb)
         if exc_type is KeyboardInterrupt:
+            return
+        # v0.10.40：文件被占用（Excel / 杀毒 / 网盘同步）是可恢复的环境问题，不是程序崩溃——
+        # 给一句人话提示，程序继续运行（crash 日志上面已照常写入，便于追查）。
+        if isinstance(exc_type, type) and issubclass(exc_type, PermissionError):
+            try:
+                QMessageBox.warning(
+                    QApplication.activeWindow(), "文件暂时被占用",
+                    f"{exc_value}\n\n程序没有退出，已保存的数据不受影响。"
+                    "请关闭正在打开该文件的程序（如 Excel）后继续操作。",
+                )
+            except Exception:
+                pass
             return
         text = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
         try:

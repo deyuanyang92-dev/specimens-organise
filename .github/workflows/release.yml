@@ -8,6 +8,9 @@ on:
   push:
     tags:
       - 'v*'
+  # 2026-10-03：GitHub 网页 Actions → Release → Run workflow 手动打包（不打标签、不发 Release）。
+  # 产物挂在该次运行页面的 Artifacts 里下载，用于发版前试装 / 给个别用户临时包。
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -43,7 +46,14 @@ jobs:
       - name: Resolve version
         id: ver
         shell: bash
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        # 旧：run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        #     —— 手动触发时 GITHUB_REF_NAME 是分支名（main），不能当版本号；改读代码里的 __version__。
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(python -c 'from specimen_app import __version__; print(__version__)')" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build release
         # v0.10.8 fix: 强制 Python stdout/stderr UTF-8（Windows runner 默认 cp1252，
@@ -75,7 +85,18 @@ jobs:
             throw "packaged exe failed --smoke"
           }
 
+      - name: Upload build artifacts (manual run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: specimen-organise-v${{ steps.ver.outputs.version }}-${{ matrix.platform }}
+          path: |
+            releases/v${{ steps.ver.outputs.version }}/installer_*.exe
+            releases/v${{ steps.ver.outputs.version }}/setup_*.zip
+          retention-days: 14
+
       - name: Upload release assets
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         env:
           # 安全：head_commit.message 是 untrusted 字符串，必须经 env 引用而非
