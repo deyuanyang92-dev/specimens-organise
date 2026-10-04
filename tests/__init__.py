@@ -15,6 +15,7 @@ _os.environ.setdefault("SPECIMEN_LOCAL_CACHE_DIR", _tempfile.mkdtemp(prefix="spe
 # 2026-10-04：配置目录（崩溃日志 / 恢复日志 / 本机备份 / 升级文件 / settings.json）也重定向到临时目录。
 # app_config_dir() 优先读 APPDATA —— Windows CI 上若用真实 APPDATA，上一个用例留下的恢复日志、
 # "上次未正常退出"标记等会让后续用例弹出模态框而挂住。
+_os.environ["SPECIMEN_NO_SYSTEM_DIALOGS"] = "1"  # 子进程里的 Windows 系统错误框也不弹（boot_guard）
 _os.environ["APPDATA"] = _tempfile.mkdtemp(prefix="specimen_appdata_test_")
 
 # 文件被占用的重试在测试里调成几毫秒：故意模拟占用的用例不必每次真等 1.5 s。
@@ -41,9 +42,26 @@ def _tracking_store_init(self, *args, **kwargs):
 _es.ExcelStore.__init__ = _tracking_store_init
 
 
-def close_all_open_stores() -> None:
+def close_all_open_stores(keep=None) -> None:
+    import gc
+
     for store in list(_OPEN_STORES):
+        if store is keep:
+            continue
         try:
             store.close()
         except Exception:
             pass
+    gc.collect()  # 已无人引用但未关闭的 sqlite 连接（如快照还原换下的旧连接）也一并释放
+
+
+def closing_other_stores(aggregate):
+    """包装合并函数：调用前关闭除目标库外所有测试里打开的 store。
+
+    真实场景里 incoming/ 下的来源工作区来自别的电脑，本进程不会开着它们；测试造来源时开了没关，
+    Windows 上目录改名加锁就失败（WinError 5/32），而 Linux 不受影响。
+    """
+    def _wrapped(target, *args, **kwargs):
+        close_all_open_stores(keep=target)
+        return aggregate(target, *args, **kwargs)
+    return _wrapped

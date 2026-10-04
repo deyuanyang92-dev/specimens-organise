@@ -20,6 +20,11 @@ from specimen_app.excel_store import ExcelStore
 from specimen_app.models import DATA_VERSION_DIR
 from specimen_app.server_sync import aggregate_incoming
 
+# 2026-10-04：Windows 上来源工作区若仍被本测试进程打开，合并时目录改名会失败 —— 见 tests.closing_other_stores
+from tests import closing_other_stores as _closing_other_stores  # noqa: E402
+
+aggregate_incoming = _closing_other_stores(aggregate_incoming)
+
 
 class LegacyDetectionTests(unittest.TestCase):
     def setUp(self) -> None:
