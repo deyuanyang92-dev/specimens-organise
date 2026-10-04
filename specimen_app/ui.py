@@ -5446,7 +5446,8 @@ class SpecimenWindow(QMainWindow):
         if op_id == "daily_backup":
             if result:
                 _snap, local_copy = result  # type: ignore[misc]
-                where = "工作区 + 本机" if local_copy else "工作区（本机副本未成功）"
+                # 旧：where = "工作区 + 本机" if local_copy else "工作区（本机副本未成功）"
+                where = "工作区 + 本机" if local_copy else f"仅工作区；本机副本未成功，请检查备份位置 {self._local_backup_root()} 是否可用"
                 self.statusBar().showMessage(f"今日自动备份已完成（{where}，{elapsed_ms / 1000:.1f}s）", 5000)
             return
         if op_id.startswith("save_fields:"):
@@ -5493,8 +5494,9 @@ class SpecimenWindow(QMainWindow):
     # v0.10.42 每日自动备份（见 daily_backup.py）
     # ------------------------------------------------------------------
     def _local_backup_root(self) -> Path:
-        from .app_settings import app_config_dir
-        return app_config_dir() / "backups"
+        # 旧：return app_config_dir() / "backups" —— 固定在 C 盘 %APPDATA%；v0.10.43 起可在设置里改
+        from .app_settings import local_backup_dir
+        return local_backup_dir()
 
     def _schedule_daily_backup(self) -> None:
         """每个工作区每天第一次打开：交给后台写线程做一份备份（与保存串行，关窗前会排空）。"""
@@ -5506,14 +5508,38 @@ class SpecimenWindow(QMainWindow):
         from . import daily_backup
         worker.enqueue("daily_backup", daily_backup.run_daily_backup, self.store, self._local_backup_root())
 
+    def _validated_backup_dir(self, new_value: str, old_value: str) -> str:
+        """设置里改了备份位置：不可写 → 提示并保留原设置；与工作区同盘 → 提醒（仍允许）。"""
+        from . import daily_backup
+        if new_value == (old_value or ""):
+            return new_value
+        if not new_value:
+            return ""  # 恢复默认位置
+        problem = daily_backup.check_backup_dir_writable(new_value)
+        if problem:
+            QMessageBox.warning(self, "备份位置不可用", f"{new_value}\n\n{problem}\n\n备份位置保持不变。")
+            return old_value or ""
+        if self.workspace_root is not None and daily_backup.same_drive(new_value, self.workspace_root):
+            QMessageBox.information(
+                self, "提醒：与工作区在同一个盘",
+                f"备份位置 {new_value} 和当前工作区在同一个盘。\n"
+                "这个盘损坏时，工作区和备份会一起丢失。建议选另一块硬盘或移动硬盘。\n\n（仍按你的选择保存。）",
+            )
+        self.statusBar().showMessage(
+            f"每日备份位置已改为：{new_value}（以前位置里的备份仍可在「从本机备份恢复数据…」里找到）", 8000)
+        return new_value
+
     def _restore_from_local_backup_dialog(self) -> None:
         from . import daily_backup
         if self.store is None or self.read_only:
             QMessageBox.information(self, "从本机备份恢复", "当前窗口是只读的或未打开工作区。")
             return
-        backups = daily_backup.list_local_backups(self._local_backup_root(), self.store)
+        # 当前位置 + 默认位置都找：改过备份位置后，旧位置里的备份仍可恢复
+        from .app_settings import default_local_backup_dir
+        backups = daily_backup.list_local_backups_in([self._local_backup_root(), default_local_backup_dir()], self.store)
         if not backups:
-            QMessageBox.information(self, "从本机备份恢复", "本机还没有这个工作区的备份（每天第一次打开工作区时自动生成）。")
+            QMessageBox.information(self, "从本机备份恢复",
+                                    f"还没有这个工作区的备份（每天第一次打开工作区时自动生成）。\n备份位置：{self._local_backup_root()}")
             return
         labels = [daily_backup.describe_backup(b) for b in backups]
         choice, ok = QInputDialog.getItem(self, "从本机备份恢复", "选择要恢复到的备份（新的在上）：", labels, 0, False)
@@ -8218,6 +8244,9 @@ class SpecimenWindow(QMainWindow):
             mode_key = dlg.photo_management_combo.currentData()
             current_settings.photo_management_mode = mode_key if mode_key in PHOTO_MANAGEMENT_OPTIONS else "copy_with_absolute"
             current_settings.photo_library_path = dlg.photo_library_edit.text().strip()
+            current_settings.local_backup_dir = self._validated_backup_dir(
+                dlg.local_backup_dir_edit.text().strip(), current_settings.local_backup_dir
+            )
             current_settings.image_viewer_path = dlg.image_viewer_path
             current_settings.photo_filename_fill_shortcut = dlg.photo_filename_fill_shortcut
             current_settings.check_updates_on_startup = dlg.check_updates_box.isChecked()
@@ -10665,6 +10694,17 @@ class SettingsDialog(QDialog):
         library_row.addWidget(browse_btn)
         layout.addRow("自定义照片库", library_row)
 
+        # v0.10.43：每日备份的本机副本位置（默认在 C 盘 %APPDATA%，系统盘重装会丢）
+        backup_row = QHBoxLayout()
+        self.local_backup_dir_edit = QLineEdit(current_settings.local_backup_dir)
+        from .app_settings import default_local_backup_dir
+        self.local_backup_dir_edit.setPlaceholderText(f"留空 = {default_local_backup_dir()}")
+        backup_row.addWidget(self.local_backup_dir_edit, stretch=1)
+        backup_browse_btn = QPushButton("选择")
+        backup_browse_btn.clicked.connect(self._choose_local_backup_dir)
+        backup_row.addWidget(backup_browse_btn)
+        layout.addRow("每日备份位置", backup_row)
+
         # 自定义图片查看器：留空 = 用系统默认程序打开原图。
         viewer_row = QHBoxLayout()
         self.image_viewer_edit = QLineEdit(current_settings.image_viewer_path)
@@ -10770,6 +10810,7 @@ class SettingsDialog(QDialog):
         management_idx = management_keys.index(defaults.photo_management_mode)
         self.photo_management_combo.setCurrentIndex(management_idx)
         self.photo_library_edit.setText(defaults.photo_library_path)
+        self.local_backup_dir_edit.setText(defaults.local_backup_dir)
         self.image_viewer_edit.setText(defaults.image_viewer_path)
         self.photo_fill_shortcut_edit.setText(defaults.photo_filename_fill_shortcut)
         self.check_updates_box.setChecked((defaults.auto_update_mode or "off") != "off")  # 旧：defaults.check_updates_on_startup
@@ -10811,6 +10852,12 @@ class SettingsDialog(QDialog):
         directory = QFileDialog.getExistingDirectory(self, "选择自定义照片库", current or str(self.app.workspace_root))
         if directory:
             self.photo_library_edit.setText(directory)
+
+    def _choose_local_backup_dir(self) -> None:
+        current = self.local_backup_dir_edit.text().strip()
+        directory = QFileDialog.getExistingDirectory(self, "选择每日备份位置（建议非系统盘、非工作区所在盘）", current or "")
+        if directory:
+            self.local_backup_dir_edit.setText(directory)
 
     def _choose_image_viewer(self) -> None:
         current = self.image_viewer_edit.text().strip()

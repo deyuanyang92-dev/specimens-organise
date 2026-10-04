@@ -61,6 +61,8 @@ class AppSettings:
     preview_quality: str = "standard"
     photo_management_mode: str = "copy_with_absolute"
     photo_library_path: str = ""
+    # v0.10.43：每日备份"本机副本"的位置。留空 = <配置目录>/backups（Windows 上在 C 盘 %APPDATA%）。
+    local_backup_dir: str = ""
     search_paths: list[str] = field(default_factory=list)
     show_grid_filenames: bool = True
     photo_filename_fill_shortcut: str = DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT
@@ -129,6 +131,17 @@ def app_config_dir() -> Path:
     if base:
         return Path(base) / APP_DIR_NAME
     return Path.home() / ".specimen_inventory"
+
+
+def default_local_backup_dir() -> Path:
+    return app_config_dir() / "backups"
+
+
+def local_backup_dir(settings: "AppSettings | None" = None) -> Path:
+    """每日备份本机副本的目录：设置里指定了就用指定的，否则默认 <配置目录>/backups。"""
+    settings = settings or load_settings()
+    custom = (settings.local_backup_dir or "").strip()
+    return Path(custom).expanduser() if custom else default_local_backup_dir()
 
 
 def settings_path() -> Path:
@@ -272,6 +285,7 @@ def load_settings() -> AppSettings:
         preview_quality=str(data.get("preview_quality", "standard")),
         photo_management_mode=photo_management_mode,
         photo_library_path=str(data.get("photo_library_path", "")),
+        local_backup_dir=str(data.get("local_backup_dir", "") or ""),
         search_paths=[str(item) for item in data.get("search_paths", []) if item],
         show_grid_filenames=show_grid_filenames,
         photo_filename_fill_shortcut=photo_filename_fill_shortcut.strip(),
@@ -322,6 +336,7 @@ def save_settings(settings: AppSettings) -> None:
         "preview_quality": settings.preview_quality,
         "photo_management_mode": settings.photo_management_mode,
         "photo_library_path": settings.photo_library_path,
+        "local_backup_dir": settings.local_backup_dir,
         "search_paths": settings.search_paths[:20],
         "show_grid_filenames": settings.show_grid_filenames,
         "photo_filename_fill_shortcut": settings.photo_filename_fill_shortcut or DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT,

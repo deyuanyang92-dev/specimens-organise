@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 from datetime import date
@@ -112,6 +113,51 @@ def list_local_backups(local_root: Path | str, store) -> list[Path]:
     except OSError:
         return []
     return sorted(items, key=lambda p: p.name, reverse=True)
+
+
+def list_local_backups_in(roots: list[Path | str], store) -> list[Path]:
+    """在多个备份根目录里找该工作区的备份（改过备份位置后，旧位置里的备份仍可用来恢复）。新的在前。"""
+    seen: set[str] = set()
+    found: list[Path] = []
+    for root in roots:
+        try:
+            resolved = str(Path(root).resolve())
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        found.extend(list_local_backups(root, store))
+    return sorted(found, key=lambda p: p.name, reverse=True)
+
+
+def check_backup_dir_writable(directory: Path | str) -> str | None:
+    """检查备份位置可用：能建目录、能写文件。可用返回 None，否则返回原因（给用户看的）。"""
+    directory = Path(directory).expanduser()
+    if not directory.is_absolute():
+        return "请选择一个完整的文件夹路径（例如 D:\\标本备份）。"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe = directory / f".write_test_{os.getpid()}"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        return f"无法写入该文件夹：{exc}"
+    return None
+
+
+def same_drive(a: Path | str, b: Path | str) -> bool:
+    """两个路径是否在同一个盘（Windows 盘符 / UNC 共享；其他系统比较挂载设备）。"""
+    try:
+        pa, pb = Path(a).resolve(), Path(b).resolve()
+    except OSError:
+        return False
+    if pa.drive or pb.drive:
+        return pa.drive.casefold() == pb.drive.casefold()
+    try:
+        return pa.stat().st_dev == pb.stat().st_dev
+    except OSError:
+        return False
 
 
 def describe_backup(snapshot_dir: Path) -> str:
