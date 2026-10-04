@@ -18,7 +18,8 @@ GitHub 在自己的 Windows 机器上打包、试跑、上传 Release，用户�
    - `setup_v0.10.40_windows.zip`：便携版（整体解压运行）
    - `app_v*.zip` / `update_manifest_*.json`：给软件内自动更新用，不要手动下载
 
-流程定义在 `.github/workflows/release.yml`。打包后会真实启动 exe 跑 `--smoke`，启动失败就**不发布**。
+流程定义在 `.github/workflows/release.yml`：先在 Windows + Linux 上跑全量测试（`ci.yml`），**测试不过不打包**；
+打包后再真实启动 exe 跑 `--smoke`，启动失败也**不发布**。每次普通推送也会自动跑同一套测试。
 标签名必须和 `__version__` 一致，否则自动更新会比对错版本。
 
 ## 方式二：GitHub 上手动点按钮打包（不发布）

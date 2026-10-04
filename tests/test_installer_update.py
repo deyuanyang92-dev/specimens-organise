@@ -102,3 +102,36 @@ class InstallRootAndScriptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(__import__("sys").platform == "win32", "PowerShell 助手只在 Windows 上真跑")
+class HelperScriptRealRunTests(unittest.TestCase):
+    """在真实 Windows（CI windows-latest）上执行助手脚本：等进程退出 → 跑"安装器" → 写结果 → 重新打开。"""
+
+    def test_helper_runs_installer_and_records_result(self):
+        import os
+        import subprocess
+        import sys
+        tmp = Path(tempfile.mkdtemp(prefix="升级测试_"))
+        try:
+            root = tmp / "标本入库管理"
+            (root / "current").mkdir(parents=True)
+            sysdir = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+            shutil.copy2(sysdir / "whoami.exe", root / "current" / "app.exe")  # 重新打开的"新版"：立即退出
+            fake_installer = tmp / "installer_v0.10.99_windows.exe"
+            shutil.copy2(sys.executable, fake_installer)  # python.exe /VERYSILENT … → 退出码 2，充当"安装失败"
+            dead = subprocess.Popen([sys.executable, "-c", "pass"])
+            dead.wait()
+            updates = tmp / "updates"
+            script = installer_update.write_helper_script(
+                updates, pid=dead.pid, installer=fake_installer, install_root=root,
+                from_version="0.10.41", to_version="0.10.99")
+            r = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+                               capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            info = installer_update.read_and_clear_result(updates)
+            self.assertIsNotNone(info, r.stdout + r.stderr)
+            self.assertEqual(info["to_version"], "0.10.99")
+            self.assertNotEqual(info["exit_code"], 0)  # 失败被如实记录，下次启动会提示用户
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)

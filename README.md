@@ -193,4 +193,4 @@ python build_release.py --version 0.4.0
 build.bat
 ```
 
-详见 [docs/build-windows.md](docs/build-windows.md) 和 [docs/build-linux.md](docs/build-linux.md)。
+详见 [docs/build-windows.md](docs/build-windows.md)、[docs/robustness.md](docs/robustness.md)（稳健性 / 数据恢复 / 维护纪律） 和 [docs/build-linux.md](docs/build-linux.md)。
