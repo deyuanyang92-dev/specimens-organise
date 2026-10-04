@@ -4291,6 +4291,8 @@ class SpecimenWindow(QMainWindow):
 
     def _offer_edit_recovery(self, manual: bool = False) -> None:
         """打开工作区后（或手动）检查恢复日志：有未落盘的修改就问用户要不要写回。"""
+        if getattr(self, "_is_closing", False):
+            return  # 定时器到点时窗口已关闭：不再弹框（否则关窗后冒出无主模态框）
         journal = self._edit_journal()
         if journal is None:
             if manual:
@@ -7866,6 +7868,8 @@ class SpecimenWindow(QMainWindow):
 
     def _report_last_installer_update(self) -> None:
         """启动时：上次一键升级若失败，告诉用户（成功则状态栏一句）。"""
+        if getattr(self, "_is_closing", False):
+            return
         from .app_settings import app_config_dir
         from . import installer_update
         info = installer_update.read_and_clear_result(installer_update.updates_dir(app_config_dir()))
