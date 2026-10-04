@@ -1,0 +1,8 @@
+========== GUI 线程停摆 3.4s（阈值 2.0s）==========
+context: gui_stall
+Version:  v0.10.44
+time: 2026-10-04T10:00:00
+主线程此刻的调用栈（最后一行就是卡住的位置）：
+  File "run_app.py", line 10, in <module>
+  File "specimen_app\ui.py", line 4100, in select_voucher
+  File "specimen_app\excel_store.py", line 3519, in read_rows

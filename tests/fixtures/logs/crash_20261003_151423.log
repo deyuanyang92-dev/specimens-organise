@@ -1,0 +1,30 @@
+========== specimen-organise crash report ==========
+Time:     2026-10-03T15:14:23
+Version:  v0.10.37
+Platform: Windows-10-10.0.26200-SP0
+Python:   3.11.9
+PID:      11456
+Context:  main_thread
+Exception:
+Traceback (most recent call last):
+  File "specimen_app\ui.py", line 5250, in _on_store_op_done
+  File "specimen_app\ui.py", line 4282, in _on_field_save_done
+  File "specimen_app\ui.py", line 3119, in patch_voucher_row
+  File "specimen_app\ui.py", line 3300, in _update_task_indicator
+  File "specimen_app\ui.py", line 3302, in <genexpr>
+  File "specimen_app\excel_store.py", line 4186, in is_voucher_ingestion_complete
+  File "specimen_app\excel_store.py", line 1143, in status_for
+  File "specimen_app\excel_store.py", line 1171, in get_specimen
+  File "specimen_app\excel_store.py", line 4761, in _find_one
+  File "specimen_app\excel_store.py", line 3519, in read_rows
+  File "specimen_app\excel_store.py", line 3449, in _cached_rows
+  File "specimen_app\excel_store.py", line 3521, in <lambda>
+  File "specimen_app\excel_store.py", line 5135, in _read_plain_rows
+  File "specimen_app\table_backend.py", line 226, in read_rows
+  File "specimen_app\table_backend.py", line 124, in xlsx_read_rows
+  File "openpyxl\reader\excel.py", line 346, in load_workbook
+  File "openpyxl\reader\excel.py", line 123, in __init__
+  File "openpyxl\reader\excel.py", line 95, in _validate_archive
+  File "zipfile.py", line 1294, in __init__
+PermissionError: [Errno 13] Permission denied: 'H:\\标本整理\\数据\\标本信息.xlsx'
+========== end report ==========
