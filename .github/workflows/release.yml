@@ -16,7 +16,12 @@ permissions:
   contents: write
 
 jobs:
+  # 2026-10-04 发布质量门：全量测试（Windows + Linux）通过才打包、发布。
+  test:
+    uses: ./.github/workflows/ci.yml
+
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:
