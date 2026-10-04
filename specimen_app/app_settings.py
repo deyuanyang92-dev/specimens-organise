@@ -25,7 +25,7 @@ PREVIEW_QUALITY_SIZES = {
 
 PHOTO_MANAGEMENT_OPTIONS = {
     "copy_with_absolute": "复制到工作区照片库，并记录绝对路径",
-    "absolute_only": "仅记录绝对路径，不复制",
+    "absolute_only": "仅记录绝对路径，不复制（多人协作任务包工作区仍会复制）",
     "copy_to_custom_library": "复制到自定义照片库，并记录绝对路径",
 }
 
@@ -59,7 +59,10 @@ class AppSettings:
     last_workspace: str = ""
     recent_workspaces: list[str] = field(default_factory=list)
     preview_quality: str = "standard"
-    photo_management_mode: str = "copy_with_absolute"
+    # 旧：photo_management_mode: str = "copy_with_absolute" —— 关联照片会在工作区 照片/ 多存一份。
+    # v0.10.45 用户决定默认不复制（照片已在用户自己的目录里，不需要第二份）。
+    photo_management_mode: str = "absolute_only"
+    photo_no_copy_default_applied: bool = True  # v0.10.45 一次性迁移已做（新安装无需迁移）
     photo_library_path: str = ""
     # v0.10.43：每日备份"本机副本"的位置。留空 = <配置目录>/backups（Windows 上在 C 盘 %APPDATA%）。
     local_backup_dir: str = ""
@@ -184,7 +187,15 @@ def load_settings() -> AppSettings:
         splitter_sizes = raw_sizes
     else:
         splitter_sizes = []
-    photo_management_mode = _str_choice("photo_management_mode", PHOTO_MANAGEMENT_OPTIONS, "copy_with_absolute")
+    # 旧：默认 "copy_with_absolute"
+    photo_management_mode = _str_choice("photo_management_mode", PHOTO_MANAGEMENT_OPTIONS, "absolute_only")
+    # v0.10.45 一次性：旧默认"复制到工作区"的用户切到"不复制"（用户要求）；选了"自定义照片库"的不动。
+    # 只做一次，之后用户在设置里改回"复制"会被尊重。
+    photo_no_copy_default_applied = _bool("photo_no_copy_default_applied", False)
+    if not photo_no_copy_default_applied:
+        if photo_management_mode == "copy_with_absolute":
+            photo_management_mode = "absolute_only"
+        photo_no_copy_default_applied = True
     check_updates_on_startup = _bool("check_updates_on_startup", False)
     carry_over_specimen_fields = _bool("carry_over_specimen_fields", True)
     raw_summary_columns = data.get("summary_visible_columns", [])
@@ -284,6 +295,7 @@ def load_settings() -> AppSettings:
         recent_workspaces=[str(item) for item in data.get("recent_workspaces", []) if item],
         preview_quality=str(data.get("preview_quality", "standard")),
         photo_management_mode=photo_management_mode,
+        photo_no_copy_default_applied=photo_no_copy_default_applied,
         photo_library_path=str(data.get("photo_library_path", "")),
         local_backup_dir=str(data.get("local_backup_dir", "") or ""),
         search_paths=[str(item) for item in data.get("search_paths", []) if item],
@@ -335,6 +347,7 @@ def save_settings(settings: AppSettings) -> None:
         "recent_workspaces": settings.recent_workspaces[:10],
         "preview_quality": settings.preview_quality,
         "photo_management_mode": settings.photo_management_mode,
+        "photo_no_copy_default_applied": settings.photo_no_copy_default_applied,
         "photo_library_path": settings.photo_library_path,
         "local_backup_dir": settings.local_backup_dir,
         "search_paths": settings.search_paths[:20],

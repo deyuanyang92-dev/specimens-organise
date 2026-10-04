@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -5754,7 +5755,12 @@ class SpecimenWindow(QMainWindow):
 
     def _photo_management_settings(self) -> tuple[str, str]:
         settings = load_settings()
-        mode = settings.photo_management_mode if settings.photo_management_mode in PHOTO_MANAGEMENT_OPTIONS else "copy_with_absolute"
+        # 旧：无效值回落 "copy_with_absolute"；v0.10.45 默认不复制
+        mode = settings.photo_management_mode if settings.photo_management_mode in PHOTO_MANAGEMENT_OPTIONS else "absolute_only"
+        # v0.10.45：多人协作任务包工作区（根目录有任务 manifest.json）仍复制到工作区 照片/——
+        # 录入员整目录交回中心机合并时，照片要跟着走；只记 D:\… 绝对路径的话中心机找不到，合并会报缺失。
+        if mode == "absolute_only" and _is_task_package_workspace(self.workspace_root):
+            mode = "copy_with_absolute"
         library_path = settings.photo_library_path.strip()
         if mode == "copy_to_custom_library" and not library_path:
             raise ValueError("请先在设置中选择自定义照片库目录。")
@@ -8242,7 +8248,7 @@ class SpecimenWindow(QMainWindow):
             idx = dlg.quality_combo.currentIndex()
             current_settings.preview_quality = quality_keys[idx] if 0 <= idx < len(quality_keys) else "compressed"
             mode_key = dlg.photo_management_combo.currentData()
-            current_settings.photo_management_mode = mode_key if mode_key in PHOTO_MANAGEMENT_OPTIONS else "copy_with_absolute"
+            current_settings.photo_management_mode = mode_key if mode_key in PHOTO_MANAGEMENT_OPTIONS else "absolute_only"
             current_settings.photo_library_path = dlg.photo_library_edit.text().strip()
             current_settings.local_backup_dir = self._validated_backup_dir(
                 dlg.local_backup_dir_edit.text().strip(), current_settings.local_backup_dir
@@ -11223,6 +11229,17 @@ def _post_crash_dialog_to_main_thread(text: str) -> None:
         bridge.show_text.emit(text)
     except Exception:
         pass
+
+
+def _is_task_package_workspace(workspace_root) -> bool:
+    """由「任务包」建立的协作工作区：根目录有 manifest.json 且含 task_id / assignee（task_package.py）。"""
+    if workspace_root is None:
+        return False
+    try:
+        data = json.loads((Path(workspace_root) / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and bool(data.get("task_id")) and bool(data.get("assignee"))
 
 
 def _install_qt_exception_dialog() -> None:
