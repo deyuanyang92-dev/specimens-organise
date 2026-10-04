@@ -17,7 +17,7 @@ from typing import Any, Callable, Optional, TYPE_CHECKING
 # 实际真正用 PIL 的代码在 image_cache.py 顶层 import,本模块顶层无需再加载,省 5-10MB 启动 RSS。
 if TYPE_CHECKING:
     from PIL import Image  # type: ignore[import-not-found]
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPoint, QSize, QByteArray, QModelIndex
+from PyQt5.QtCore import QObject, Qt, QTimer, QThread, pyqtSignal, QPoint, QSize, QByteArray, QModelIndex
 from PyQt5.QtGui import QImage, QPixmap, QKeySequence, QFont, QPainter, QCursor, QFontMetrics, QColor, QStandardItem, QStandardItemModel
 from PyQt5.QtWidgets import (
     QAction,
@@ -1441,6 +1441,8 @@ class SpecimenWindow(QMainWindow):
             return
         self.statusBar().showMessage("工作区已加载", 2000)
         QTimer.singleShot(2500, self._offer_edit_recovery)  # v0.10.40：排在"上次未正常退出"提示之后
+        QTimer.singleShot(8000, self._schedule_daily_backup)  # v0.10.42：避开启动繁忙期
+        QTimer.singleShot(3000, self._report_last_installer_update)  # v0.10.42
         # 分类预设缺失时显示持久黄色警告条（旧：8 秒状态栏消息，极易错过）。
         if self.matcher is not None and not list(self.matcher.all_rows()):
             self._preset_warning_banner.show()
@@ -2635,6 +2637,7 @@ class SpecimenWindow(QMainWindow):
         help_menu.addAction("检查更新…", self._check_github_update_from_help)
         help_menu.addAction("打开崩溃日志目录…", self._open_crash_log_dir)
         help_menu.addAction("恢复未保存的修改…", lambda: self._offer_edit_recovery(manual=True))
+        help_menu.addAction("从本机备份恢复数据…", self._restore_from_local_backup_dialog)
         help_menu.addSeparator()
         help_menu.addAction("关于…", self._open_about_dialog)
 
@@ -4097,13 +4100,34 @@ class SpecimenWindow(QMainWindow):
                     val = _wget(w)
                     if val.strip():
                         _pinned[field] = val.strip()
+        # 旧：先 self._loading = True、self.current_voucher = voucher，再读 store —— 读失败（文件被占用）时
+        #     _loading 永远停在 True → schedule_save 一律 return → 之后所有编辑静默不保存；且控件还显示上一个
+        #     编号的值、current_voucher 却已是新编号，一保存就把旧值写进新编号。
+        # 现：先读（失败就不切换、提示），读成功再改状态；改控件放在 try/finally 里保证 _loading 复位。
+        try:
+            specimen = self.store.get_specimen(voucher) or {}
+            classification = self.store.get_classification(voucher) or {}
+            photos = self.store.get_photos(voucher)
+        except Exception as exc:  # noqa: BLE001
+            self._report_recovered_error(f"打开 {voucher}", exc)
+            return
         self._loading = True
+        try:
+            self._apply_voucher_to_widgets(voucher, specimen, classification, photos, _pinned)
+        finally:
+            self._loading = False
+        self.refresh_photo_table()
+        if defer_preview:
+            QTimer.singleShot(250, self.load_current_photo)
+        else:
+            self.load_current_photo()
+
+    def _apply_voucher_to_widgets(self, voucher: str, specimen: dict, classification: dict,
+                                  photos: list, _pinned: dict[str, str]) -> None:
         self.current_voucher = voucher
         # 动态更新照片面板标题，显示当前入库编号
         if hasattr(self, "_photo_panel_title") and self._photo_panel_title:
             self._photo_panel_title.setText(f"照片信息 — {voucher}")
-        specimen = self.store.get_specimen(voucher) or {}
-        classification = self.store.get_classification(voucher) or {}
         for field, widget in self.specimen_widgets.items():
             widget.blockSignals(True)
             # 字段固定：当前编辑器中已修改的 CARRY_OVER 字段值保持不变
@@ -4114,15 +4138,11 @@ class SpecimenWindow(QMainWindow):
             widget.blockSignals(True)
             widget.setText(str(classification.get(field, "")))
             widget.blockSignals(False)
-        self.current_photos = self.store.get_photos(voucher)
+        # 旧：self.current_photos = self.store.get_photos(voucher)（已移到 select_voucher 开头先读）
+        self.current_photos = photos
         self.current_photo_index = min(self.current_photo_index, max(0, len(self.current_photos) - 1))
         self._photo_page = 0
-        self._loading = False
-        self.refresh_photo_table()
-        if defer_preview:
-            QTimer.singleShot(250, self.load_current_photo)
-        else:
-            self.load_current_photo()
+        # 旧：self._loading = False / refresh_photo_table / load_current_photo —— 移回 select_voucher（finally 之后）
 
     # ---- Field save (debounced) ----
 
@@ -4271,6 +4291,8 @@ class SpecimenWindow(QMainWindow):
 
     def _offer_edit_recovery(self, manual: bool = False) -> None:
         """打开工作区后（或手动）检查恢复日志：有未落盘的修改就问用户要不要写回。"""
+        if getattr(self, "_is_closing", False):
+            return  # 定时器到点时窗口已关闭：不再弹框（否则关窗后冒出无主模态框）
         journal = self._edit_journal()
         if journal is None:
             if manual:
@@ -4477,10 +4499,17 @@ class SpecimenWindow(QMainWindow):
             return
         try:
             self.store.set_photo_fields_batch(voucher, self.current_photo_index, updates)
-        except PermissionError:
-            return  # 只读副本忽略（A2 守卫已经拦在 UI 层）
+        # 旧：except PermissionError: return —— 只读副本之外，文件被占用（WorkspaceFileBusyError 也是 PermissionError）
+        #     时用户改的照片信息被静默丢弃；except Exception 只打 stderr（打包版看不到）。现：只读才静默，其余明确告诉用户。
+        except PermissionError as exc:
+            if self.read_only:
+                return
+            QMessageBox.warning(self, "照片信息未保存", f"{exc}\n\n刚才的修改还在输入框里，关闭占用文件的程序后点「保存」即可。")
+            self._pending_save_fields.setdefault(f"{voucher}:photo", set()).update(updates)
+            return
         except Exception as exc:
             print(f"[D3] batch photo save failed: {exc}", file=sys.stderr)
+            QMessageBox.warning(self, "照片信息未保存", f"保存照片信息失败：{exc}")
             return
         self.current_photos = self.store.get_photos(voucher)
         self.refresh_photo_table()
@@ -5414,6 +5443,12 @@ class SpecimenWindow(QMainWindow):
             pass
 
     def _on_store_op_done_impl(self, op_id: str, result: object, elapsed_ms: float) -> None:
+        if op_id == "daily_backup":
+            if result:
+                _snap, local_copy = result  # type: ignore[misc]
+                where = "工作区 + 本机" if local_copy else "工作区（本机副本未成功）"
+                self.statusBar().showMessage(f"今日自动备份已完成（{where}，{elapsed_ms / 1000:.1f}s）", 5000)
+            return
         if op_id.startswith("save_fields:"):
             category, voucher, changed = result  # type: ignore[misc]
             self._on_field_save_done(str(category), str(voucher), bool(changed), elapsed_ms)
@@ -5454,8 +5489,60 @@ class SpecimenWindow(QMainWindow):
             else:
                 self.statusBar().showMessage("没有可重做的操作", 2000)
 
+    # ------------------------------------------------------------------
+    # v0.10.42 每日自动备份（见 daily_backup.py）
+    # ------------------------------------------------------------------
+    def _local_backup_root(self) -> Path:
+        from .app_settings import app_config_dir
+        return app_config_dir() / "backups"
+
+    def _schedule_daily_backup(self) -> None:
+        """每个工作区每天第一次打开：交给后台写线程做一份备份（与保存串行，关窗前会排空）。"""
+        if self._is_closing or self.read_only or self.store is None:
+            return
+        worker = getattr(self, "_store_worker", None)
+        if worker is None or not worker.isRunning() or not worker.accepting():
+            return
+        from . import daily_backup
+        worker.enqueue("daily_backup", daily_backup.run_daily_backup, self.store, self._local_backup_root())
+
+    def _restore_from_local_backup_dialog(self) -> None:
+        from . import daily_backup
+        if self.store is None or self.read_only:
+            QMessageBox.information(self, "从本机备份恢复", "当前窗口是只读的或未打开工作区。")
+            return
+        backups = daily_backup.list_local_backups(self._local_backup_root(), self.store)
+        if not backups:
+            QMessageBox.information(self, "从本机备份恢复", "本机还没有这个工作区的备份（每天第一次打开工作区时自动生成）。")
+            return
+        labels = [daily_backup.describe_backup(b) for b in backups]
+        choice, ok = QInputDialog.getItem(self, "从本机备份恢复", "选择要恢复到的备份（新的在上）：", labels, 0, False)
+        if not ok:
+            return
+        backup = backups[labels.index(choice)]
+        if QMessageBox.question(
+            self, "确认恢复",
+            f"把工作区数据恢复到：\n{choice}\n\n恢复前会自动给当前数据做一份「回退前快照」，恢复后仍可在版本管理里退回。",
+        ) != QMessageBox.Yes:
+            return
+        try:
+            self._flush_pending_saves()
+            self._drain_store_worker(timeout_ms=120000)
+            daily_backup.restore_from_local_backup(self.store, backup)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "恢复失败", f"{exc}\n\n当前数据未被改动或已有回退前快照。")
+            return
+        self.refresh_list()
+        self.reload_current()
+        QMessageBox.information(self, "恢复完成", f"已恢复到：{choice}")
+
     def _on_store_op_error(self, op_id: str, error_msg: str) -> None:
         """后台操作失败：弹错误提示。"""
+        if op_id == "daily_backup":
+            # 备份失败不打断录入：状态栏提示 + 日志，明天 / 下次打开再试
+            print(f"[daily_backup] 失败：{error_msg}", file=sys.stderr)
+            self.statusBar().showMessage(f"今日自动备份未完成（{error_msg}），下次打开工作区会再试", 10000)
+            return
         if op_id.startswith("save_fields:"):
             _, category, voucher = op_id.split(":", 2)
             self._on_field_save_error(category, voucher, error_msg)
@@ -6120,6 +6207,15 @@ class SpecimenWindow(QMainWindow):
             pass
 
     def load_current_photo(self) -> None:
+        # v0.10.42：任何异常都要把 _loading 复位，否则之后所有编辑静默不保存（见 select_voucher 注释）
+        try:
+            self._load_current_photo_impl()
+        except Exception as exc:  # noqa: BLE001
+            self._report_recovered_error("加载照片", exc)
+        finally:
+            self._loading = False
+
+    def _load_current_photo_impl(self) -> None:
         self._loading = True
         for widget in self.photo_widgets.values():
             widget.blockSignals(True)
@@ -7267,6 +7363,14 @@ class SpecimenWindow(QMainWindow):
                 self.manager.unregister(self)
             self.store.close()
         self.store = new_store
+        # v0.10.42：旧：心跳线程只在启动时为最初的 store 建，切换工作区后仍给已关闭的旧 store 写心跳 →
+        #     新工作区的锁没人续 → 180 s 后可被别的进程判失效抢走 → 双写。现：心跳改跟新 store。
+        hb = getattr(self, "_lock_heartbeat_thread", None)
+        if hb is not None:
+            hb._store = new_store
+        elif not self.read_only:
+            self._lock_heartbeat_thread = LockHeartbeatThread(new_store, interval_seconds=60.0, parent=self)
+            self._lock_heartbeat_thread.start()
         self.workspace_root = target_path
         self.matcher = _species_matcher(self.workspace_root)  # 自带预设 + 工作区预设（用户记忆）
         # thumbnail_cache：未绑定启动时为 None，这里首次创建。
@@ -7293,6 +7397,7 @@ class SpecimenWindow(QMainWindow):
         self._photo_view_states.clear()
         self.refresh_list()
         QTimer.singleShot(500, self._offer_edit_recovery)  # v0.10.40
+        QTimer.singleShot(8000, self._schedule_daily_backup)  # v0.10.42
         vouchers = self._all_vouchers
         if vouchers:
             self.select_voucher(vouchers[0])
@@ -7657,6 +7762,12 @@ class SpecimenWindow(QMainWindow):
                 f"当前 v{__version__} 已是该 channel 最新版本。",
             )
             return
+        # v0.10.42：安装器安装的 Windows 版 → 主流做法：下载安装器 → 关闭 → 静默安装 → 自动重启。
+        #     旧的 zip + current 链接切换路径只留给便携版 / 非 Windows（见 installer_update.py 文档）。
+        from . import installer_update
+        if installer_update.supports_installer_update():
+            self._installer_update_download(release)
+            return
         # 已下载的 pending 直接重用,不重复下。
         from .updater_pending import read_pending
         pending = read_pending()
@@ -7686,6 +7797,93 @@ class SpecimenWindow(QMainWindow):
         )
         self._oneclick_dl_worker = worker
         worker.start()
+
+    # ------------------------------------------------------------------
+    # v0.10.42 一键升级：安装器静默安装（installer_update.py）
+    # ------------------------------------------------------------------
+    def _installer_update_download(self, release) -> None:
+        from .app_settings import app_config_dir
+        from . import installer_update
+        dest = installer_update.updates_dir(app_config_dir())
+        window = self
+
+        class _InstallerDownload(QThread):
+            progress = pyqtSignal(int)
+            done = pyqtSignal(object, str)
+
+            def run(self_inner):
+                try:
+                    path = installer_update.download_installer(release, dest, self_inner.progress.emit)
+                    self_inner.done.emit(path, "")
+                except Exception as exc:  # noqa: BLE001
+                    self_inner.done.emit(None, str(exc))
+
+        worker = _InstallerDownload(self)
+        worker.progress.connect(lambda pct: window.statusBar().showMessage(f"正在下载新版 v{release.version} … {pct}%", 0))
+        worker.done.connect(lambda path, err: self._installer_update_ready(release, path, err))
+        self._installer_dl_worker = worker
+        self.statusBar().showMessage(f"正在下载新版 v{release.version} …", 0)
+        worker.start()
+
+    def _installer_update_ready(self, release, installer_path, error: str) -> None:
+        self._oneclick_in_progress = False
+        self.statusBar().clearMessage()
+        if error or installer_path is None:
+            QMessageBox.warning(self, "下载新版失败", f"{error}\n\n当前版本不受影响，可稍后在「升级」菜单重试。")
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle("新版已就绪")
+        box.setText(f"v{release.version} 已下载并校验通过。\n\n"
+                    "点「立即重启更新」：软件会先保存所有修改并关闭，自动安装新版后重新打开（约半分钟）。\n"
+                    "数据在工作区里，升级不会改动。")
+        now_btn = box.addButton("立即重启更新", QMessageBox.AcceptRole)
+        box.addButton("稍后", QMessageBox.RejectRole)
+        box.exec_()
+        if box.clickedButton() is not now_btn:
+            self.statusBar().showMessage(f"新版 v{release.version} 已下载，随时可在「升级」菜单一键安装", 10000)
+            return
+        self._launch_installer_update(release, Path(installer_path))
+
+    def _launch_installer_update(self, release, installer_path: Path) -> None:
+        from .app_settings import app_config_dir
+        from . import installer_update
+        root = installer_update.find_inno_install_root()
+        if root is None:
+            QMessageBox.warning(self, "无法自动更新", f"没有找到安装目录。请手动运行：\n{installer_path}")
+            return
+        try:
+            script = installer_update.write_helper_script(
+                installer_update.updates_dir(app_config_dir()),
+                pid=os.getpid(), installer=installer_path, install_root=root,
+                workspace=str(self.workspace_root or ""), from_version=__version__, to_version=release.version,
+            )
+            installer_update.launch_helper(script)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "无法自动更新", f"{exc}\n\n可手动运行：{installer_path}")
+            return
+        # 正常关闭流程：保存 + 排空写线程 + 写正常退出标记，然后退出，让助手接手安装
+        self.close()
+        QApplication.instance().quit()
+
+    def _report_last_installer_update(self) -> None:
+        """启动时：上次一键升级若失败，告诉用户（成功则状态栏一句）。"""
+        if getattr(self, "_is_closing", False):
+            return
+        from .app_settings import app_config_dir
+        from . import installer_update
+        info = installer_update.read_and_clear_result(installer_update.updates_dir(app_config_dir()))
+        if not info:
+            return
+        rc = info.get("exit_code")
+        if rc == 0:
+            self.statusBar().showMessage(f"已更新到 v{info.get('to_version', __version__)}", 8000)
+        else:
+            QMessageBox.warning(
+                self, "上次自动更新未完成",
+                f"更新到 v{info.get('to_version', '?')} 时安装器返回 {rc}，已继续使用 v{__version__}，数据不受影响。\n\n"
+                f"安装日志：{info.get('log', '')}\n可在「升级」菜单重试，或手动运行下载好的安装器。",
+            )
 
     def _oneclick_after_download(self, release, target_dir, incremental, error) -> None:
         self._oneclick_in_progress = False
@@ -8023,6 +8221,10 @@ class SpecimenWindow(QMainWindow):
             current_settings.image_viewer_path = dlg.image_viewer_path
             current_settings.photo_filename_fill_shortcut = dlg.photo_filename_fill_shortcut
             current_settings.check_updates_on_startup = dlg.check_updates_box.isChecked()
+            if not dlg.check_updates_box.isChecked():
+                current_settings.auto_update_mode = "off"
+            elif (current_settings.auto_update_mode or "off") == "off":
+                current_settings.auto_update_mode = "notify"
             current_settings.ui_font_size = dlg.font_size
             current_settings.cursor_style = dlg.cursor_style
             current_settings.app_icon_variant = dlg.app_icon_variant
@@ -10478,7 +10680,9 @@ class SettingsDialog(QDialog):
         layout.addRow("照片名填充快捷键", self.photo_fill_shortcut_edit)
 
         self.check_updates_box = QCheckBox("启动时自动检查 GitHub 更新")
-        self.check_updates_box.setChecked(current_settings.check_updates_on_startup)
+        # 旧：setChecked(current_settings.check_updates_on_startup) —— 该旧键早已不控制检查（真正的开关是
+        #     auto_update_mode），复选框勾不勾都没用。现：显示并控制 auto_update_mode 是否为 off。
+        self.check_updates_box.setChecked((current_settings.auto_update_mode or "off") != "off")
         layout.addRow("软件更新", self.check_updates_box)
 
         # 界面字体大小：影响所有主体字体（列表/表单/标签/按钮等）。
@@ -10568,7 +10772,7 @@ class SettingsDialog(QDialog):
         self.photo_library_edit.setText(defaults.photo_library_path)
         self.image_viewer_edit.setText(defaults.image_viewer_path)
         self.photo_fill_shortcut_edit.setText(defaults.photo_filename_fill_shortcut)
-        self.check_updates_box.setChecked(defaults.check_updates_on_startup)
+        self.check_updates_box.setChecked((defaults.auto_update_mode or "off") != "off")  # 旧：defaults.check_updates_on_startup
         # 字体大小复位到系统默认（spinbox 展示系统默认 pt，设置值存 0）。
         self.font_size_spin.setValue(_default_app_font_point or self.font().pointSize())
         # 光标样式复位到默认箭头。
@@ -10956,6 +11160,24 @@ class CrashReportDialog(QDialog):
         layout.addLayout(btn_row)
 
 
+class _MainThreadDialogBridge(QObject):
+    """把工作线程里的异常文本经信号（自动排队连接）送到主线程弹窗。"""
+    show_text = pyqtSignal(str)
+
+
+_DIALOG_BRIDGE: "_MainThreadDialogBridge | None" = None
+
+
+def _post_crash_dialog_to_main_thread(text: str) -> None:
+    bridge = _DIALOG_BRIDGE
+    if bridge is None:
+        return  # 日志已由 crash_log 钩子写好；没有桥就只记日志，绝不在工作线程碰 Qt 控件
+    try:
+        bridge.show_text.emit(text)
+    except Exception:
+        pass
+
+
 def _install_qt_exception_dialog() -> None:
     """Wrap sys.excepthook + threading.excepthook to show CrashReportDialog on unhandled exceptions.
 
@@ -10990,6 +11212,14 @@ def _install_qt_exception_dialog() -> None:
 
     sys.excepthook = _hook
 
+    global _DIALOG_BRIDGE
+    try:
+        if QApplication.instance() is not None and _DIALOG_BRIDGE is None:
+            _DIALOG_BRIDGE = _MainThreadDialogBridge()
+            _DIALOG_BRIDGE.show_text.connect(lambda t: CrashReportDialog(t).exec_())
+    except Exception:
+        _DIALOG_BRIDGE = None
+
     import threading
     _orig_th = getattr(threading, "excepthook", None)
     if _orig_th:
@@ -10997,12 +11227,17 @@ def _install_qt_exception_dialog() -> None:
             _orig_th(args)
             if args.exc_type is SystemExit:
                 return
-            text = "".join(_tb.format_exception(args.exc_type, args.exc_value, args.exc_tb))
-            try:
-                dlg = CrashReportDialog(text)
-                dlg.exec_()
-            except Exception:
-                pass
+            # 旧：args.exc_tb —— ExceptHookArgs 没有这个属性（是 exc_traceback），钩子自己再抛 AttributeError。
+            # 旧：直接在当前（工作）线程里 CrashReportDialog(text).exec_() —— Qt 控件只能在主线程创建，
+            #     工作线程里建对话框会原生崩溃 / 卡死。现：只把文本交给主线程显示。
+            text = "".join(_tb.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+            if threading.current_thread() is threading.main_thread():
+                try:
+                    CrashReportDialog(text).exec_()
+                except Exception:
+                    pass
+            else:
+                _post_crash_dialog_to_main_thread(text)
         threading.excepthook = _thread_hook
 
 

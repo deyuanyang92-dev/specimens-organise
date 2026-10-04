@@ -97,11 +97,18 @@ class ScopeFreshnessTests(unittest.TestCase):
         from specimen_app.image_search import clear_image_index, reconcile_image_index, scope_needs_reconcile
 
         clear_image_index()
+        # 2026-10-04：显式设定目录 mtime，不依赖"文件系统时钟一定落后 time.time()"——
+        # 虚拟机 / Windows CI 上两种时钟可差几 ms，旧写法偶发失败（刚建的目录 mtime > 扫描开始时刻）。
+        past = time.time() - 30
+        for d in (self.ws, self.photos):
+            os.utime(d, (past, past))
         self.assertTrue(scope_needs_reconcile(self.ws))  # 从未扫描
         reconcile_image_index(self.ws)
         self.assertFalse(scope_needs_reconcile(self.ws))  # 刚扫过，根目录没变
-        time.sleep(1.1)
-        (self.photos / "GDLZ-LZC-OWC002-1.tif").write_bytes(b"x")  # 根目录 mtime 变了
+        (self.photos / "GDLZ-LZC-OWC002-1.tif").write_bytes(b"x")
+        time.sleep(0.01)
+        now = time.time()  # 与扫描开始时刻同一时钟：必晚于上次扫描开始、早于下次扫描开始
+        os.utime(self.photos, (now, now))  # 根目录 mtime 变了（旧：sleep 1.1 s 再写文件）
         self.assertTrue(scope_needs_reconcile(self.ws))
         reconcile_image_index(self.ws)
         self.assertFalse(scope_needs_reconcile(self.ws))

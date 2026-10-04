@@ -80,7 +80,8 @@ class XlsxReadRetryTests(unittest.TestCase):
                 raise PermissionError(13, "Permission denied", str(self.path))
             return real_load(*a, **kw)
 
-        with mock.patch.object(table_backend, "_openpyxl", return_value=(None, flaky_load)), \
+        # 换掉缓存里的原始 load_workbook；_openpyxl() 会给它套上重试（覆盖模块内所有调用点）
+        with mock.patch.object(table_backend, "_OPENPYXL", (None, flaky_load)), \
                 mock.patch.object(table_backend.time, "sleep"):
             rows = xlsx_read_rows(self.path, _s, {})
         self.assertEqual(rows, [{"入库编号*": "YZZ000001", "种名": "A"}])

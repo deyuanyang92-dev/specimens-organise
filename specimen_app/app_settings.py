@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -120,6 +121,7 @@ class AppSettings:
     # plan v0.10.7 U2：pending update 启动提示走 banner 还是 modal 弹框
     # 默认 False = banner（非阻塞）。True = modal（老用户偏好）。
     pending_update_use_modal_prompt: bool = False
+    auto_update_default_on_applied: bool = True  # v0.10.42 一次性"默认开启检查更新"迁移已做（新安装无需迁移）
 
 
 def app_config_dir() -> Path:
@@ -137,10 +139,19 @@ def load_settings() -> AppSettings:
     path = settings_path()
     if not path.exists():
         return AppSettings()
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError):
+    # 旧：except (OSError, json.JSONDecodeError) —— 非 UTF-8 内容抛 UnicodeDecodeError 不在其中 → 每次启动都崩。
+    #     现：ValueError 一并接住（两者都是它的子类），且读坏时回退到上一份 .bak。
+    data = None
+    for candidate in (path, path.with_suffix(path.suffix + ".bak")):
+        try:
+            with candidate.open("r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                data = loaded
+                break
+        except (OSError, ValueError):
+            continue
+    if data is None:
         return AppSettings()
 
     def _bool(key, default=False):
@@ -215,7 +226,16 @@ def load_settings() -> AppSettings:
     auto_update_mode = str(data.get("auto_update_mode", ""))
     if auto_update_mode not in AUTO_UPDATE_MODE_OPTIONS:
         # 迁移:旧 check_updates_on_startup=True → notify;否则 off。
-        auto_update_mode = "notify" if check_updates_on_startup else "off"
+        # 旧：auto_update_mode = "notify" if check_updates_on_startup else "off"
+        #     —— 老用户几乎都没勾过旧复选框 → 实际是 off，从来看不到新版提示（2026-10-04 审计）。
+        auto_update_mode = "notify"
+    # v0.10.42 一次性：把"因旧迁移而处于 off"的用户切到 notify（用户要求默认开启启动检查）。
+    # 只做一次；之后用户在设置里手动关掉会被尊重。
+    auto_update_default_on_applied = _bool("auto_update_default_on_applied", False)
+    if not auto_update_default_on_applied:
+        if auto_update_mode == "off":
+            auto_update_mode = "notify"
+        auto_update_default_on_applied = True
     auto_update_interval_hours = data.get("auto_update_interval_hours", 24)
     if not isinstance(auto_update_interval_hours, int) or isinstance(auto_update_interval_hours, bool):
         auto_update_interval_hours = 24
@@ -289,6 +309,7 @@ def load_settings() -> AppSettings:
         last_voucher_filter_key=last_voucher_filter_key,
         last_photo_view_mode=last_photo_view_mode,
         pending_update_use_modal_prompt=pending_update_use_modal_prompt,
+        auto_update_default_on_applied=auto_update_default_on_applied,
     )
 
 
@@ -339,9 +360,24 @@ def save_settings(settings: AppSettings) -> None:
         "last_voucher_filter_key": settings.last_voucher_filter_key,
         "last_photo_view_mode": settings.last_photo_view_mode,
         "pending_update_use_modal_prompt": settings.pending_update_use_modal_prompt,
+        "auto_update_default_on_applied": settings.auto_update_default_on_applied,
     }
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    # 旧：with path.open("w") 直接覆盖 —— 写到一半断电 / 崩溃 → 文件截断 → 下次全部设置回默认。
+    # 现：先写临时文件再原子替换；替换前把上一份完好的留作 .bak，读坏时自动回退。
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        if path.exists():
+            try:
+                shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+            except OSError:
+                pass
+        tmp.replace(path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def remember_workspace(workspace: Path | str) -> None:

@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 # Maximum seconds the helper waits for the running PID to disappear before
@@ -114,7 +115,9 @@ def write_swap_script_windows(
     """Materialize the Windows ``swap.bat`` and return its path."""
     dest_dir = Path(dest_dir) if dest_dir else Path(tempfile.gettempdir())
     dest_dir.mkdir(parents=True, exist_ok=True)
-    path = dest_dir / f"specimen_swap_{time.time_ns()}_{os.getpid()}.bat"
+    # 旧：f"specimen_swap_{time.time_ns()}_{os.getpid()}.bat" —— Windows 时钟精度不足，同一进程连续两次
+    #     生成同名脚本、后者覆盖前者（2026-10-04 Windows CI 首次暴露）。现：加随机后缀。
+    path = dest_dir / f"specimen_swap_{time.time_ns()}_{os.getpid()}_{uuid.uuid4().hex[:8]}.bat"
     path.write_text(
         _WINDOWS_TEMPLATE.format(wait_seconds=wait_seconds),
         encoding="utf-8",
@@ -130,7 +133,9 @@ def write_swap_script_linux(
     """Materialize the Linux ``swap.sh`` and return its path. Sets +x."""
     dest_dir = Path(dest_dir) if dest_dir else Path(tempfile.gettempdir())
     dest_dir.mkdir(parents=True, exist_ok=True)
-    path = dest_dir / f"specimen_swap_{time.time_ns()}_{os.getpid()}.sh"
+    # 旧：f"specimen_swap_{time.time_ns()}_{os.getpid()}.sh" —— Windows 时钟精度不足，同一进程连续两次
+    #     生成同名脚本、后者覆盖前者（2026-10-04 Windows CI 首次暴露）。现：加随机后缀。
+    path = dest_dir / f"specimen_swap_{time.time_ns()}_{os.getpid()}_{uuid.uuid4().hex[:8]}.sh"
     path.write_text(
         _LINUX_TEMPLATE.format(wait_seconds=wait_seconds),
         encoding="utf-8",

@@ -81,8 +81,11 @@ class CoreTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
 
     def tearDown(self) -> None:
-        shutil.rmtree(self.tmp)
+        # 旧：直接 rmtree —— Windows 上用例里没关的 store（操作记录.sqlite）还开着 → WinError 32
+        from tests import close_all_open_stores
+        close_all_open_stores()
         clear_image_index()
+        shutil.rmtree(self.tmp)
 
     def _write_species_preset(self) -> Path:
         path = self.tmp / "species_preset.xlsx"

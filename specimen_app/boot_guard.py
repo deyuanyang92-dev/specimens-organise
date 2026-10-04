@@ -71,12 +71,21 @@ def show_fatal(message: str) -> None:
         except Exception:
             pass
     if sys.platform == "win32":
-        try:
-            import ctypes
+        _message_box(message)
 
-            ctypes.windll.user32.MessageBoxW(None, message, "标本入库管理 无法启动", 0x10)
-        except Exception:
-            pass
+
+def _message_box(message: str) -> None:
+    """Windows 系统错误框（不依赖 Qt）。单独成函数：测试里替换掉，否则 CI 上会弹框卡死。"""
+    # 无人值守环境（CI / 自动化测试的子进程）设 SPECIMEN_NO_SYSTEM_DIALOGS=1：只写日志不弹框，
+    # 否则没人点"确定"，进程永远不退出（2026-10-04 Windows CI 实况）。
+    if os.environ.get("SPECIMEN_NO_SYSTEM_DIALOGS"):
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(None, message, "标本入库管理 无法启动", 0x10)
+    except Exception:
+        pass
 
 
 def report_startup_failure(exc: BaseException) -> None:
