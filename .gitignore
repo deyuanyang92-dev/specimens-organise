@@ -54,3 +54,6 @@ chat内容.docx
 .Rhistory
 
 # Note: keep 字段模版/ as it contains templates
+
+# 测试用的日志样本要入库（triage_log 回归测试）
+!tests/fixtures/logs/*.log

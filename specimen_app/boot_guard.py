@@ -45,6 +45,15 @@ def enable_fault_log() -> Path | None:
         return None
 
 
+def _app_version() -> str:
+    # 启动失败可能就是 import 出错：只读 specimen_app/__init__ 的版本常量，失败返回 unknown
+    try:
+        from . import __version__
+        return __version__
+    except Exception:
+        return "unknown"
+
+
 def write_startup_failure(exc: BaseException) -> Path | None:
     """启动阶段未捕获异常 → startup_failure_<ts>.log。失败不抛。"""
     try:
@@ -53,6 +62,7 @@ def write_startup_failure(exc: BaseException) -> Path | None:
         path = d / f"startup_failure_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         path.write_text(
             f"Time: {datetime.now().isoformat(timespec='seconds')}\n"
+            f"Version:  v{_app_version()}\n"
             f"Executable: {sys.executable}\nFrozen: {bool(getattr(sys, 'frozen', False))}\n"
             f"Python: {sys.version}\nPlatform: {sys.platform}\n\n"
             + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),

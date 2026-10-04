@@ -42,6 +42,14 @@ def _default_sink(text: str) -> None:
         pass
 
 
+def _app_version() -> str:
+    try:
+        from . import __version__
+        return __version__
+    except Exception:
+        return "unknown"
+
+
 def format_main_thread_stack(main_thread_ident: int) -> str:
     frame = sys._current_frames().get(main_thread_ident)
     if frame is None:
@@ -117,6 +125,7 @@ class GuiStallWatchdog(QObject):
             text = (
                 f"========== GUI 线程停摆 {age:.1f}s（阈值 {self._threshold:.1f}s）==========\n"
                 f"context: gui_stall\n"
+                f"Version:  v{_app_version()}\n"  # 2026-10-04：排查时要能判断是不是旧版本留下的日志
                 f"time: {datetime.now().isoformat(timespec='seconds')}\n"
                 f"主线程此刻的调用栈（最后一行就是卡住的位置）：\n"
                 f"{format_main_thread_stack(self._main_ident)}"

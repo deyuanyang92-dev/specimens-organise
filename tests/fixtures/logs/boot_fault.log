@@ -1,0 +1,10 @@
+
+===== boot 2026-10-04T09:00:00 pid=4242 =====
+Windows fatal exception: access violation
+
+Thread 0x00001a2c (most recent call first):
+  File "C:\Program Files\标本入库管理\current\_internal\specimen_app\image_cache.py", line 120 in _decode
+  File "C:\Program Files\标本入库管理\current\_internal\specimen_app\ui.py", line 723 in run
+
+Current thread 0x00000f10 (most recent call first):
+  File "C:\Program Files\标本入库管理\current\_internal\specimen_app\ui.py", line 11200 in run_app

@@ -16,8 +16,12 @@ pip install -r requirements.txt
 python run_app.py
 python run_app.py --workspace "/path/to/workspace"
 
-# Run full test suite
-python -m unittest discover -s tests
+# Run full test suite (per-file isolated processes + 180 s per-test watchdog — what CI runs)
+python scripts/run_tests.py --isolate
+# 旧：python -m unittest discover -s tests（单进程；一个用例弹模态框 / 死锁会挂住整个运行）
+
+# Triage a user's error log (crash_/gui_stall_/boot_fault/startup_failure): version check + call chain
+python scripts/triage_log.py <log-file>
 
 # Run a single test
 python -m unittest tests.test_core.CoreTests.test_create_vouchers_increment
@@ -114,6 +118,17 @@ Templates live in `字段模版/`. External photos are archived (copied) into `�
 - `CURRENT_DATA_SCHEMA_VERSION` in `models.py` controls automated upgrades on workspace open: missing optional classification columns (`属名`, `目`, `纲`, `门`, `备注`) are appended to existing workbooks; hash-prefixed photo archives (`abcdef__original.jpg`) are migrated to clean names.
 - **Schema version rollback**: `_assert_supported_data_schema()` raises `ImportConflictError` (hard-blocking) when the workspace's recorded schema version exceeds what the running software supports. The error message (v0.5.0+) tells the user to use "工具 → 降低工作区兼容版本…" in a newer version first. That action calls `store.downgrade_schema_version("1.0.0")` which resets the flag without touching data — since the schema migrations (classification columns, photo rename) are backward-compatible, the old software can read the data fine after the flag is lowered.
 
+## Fixing bugs from error logs — never break another feature
+
+Follow `docs/fix-from-log.md` (skill: `.claude/skills/fix-from-log`). In short: triage with
+`scripts/triage_log.py` (an old-version log is probably already fixed — check before re-fixing) →
+failing test that reproduces the logged call chain → root-cause fix at the right layer, minimal diff →
+sweep the same pattern → never edit/delete existing tests to go green (a red old test means the change
+broke existing behaviour, unless the user explicitly asked for that change) → `run_tests.py --isolate`
+→ push a branch and wait for CI **Windows + Linux** green before merging. `.github/workflows/ci.yml`
+runs on every push and is a `needs:` gate of `release.yml`, so a tag whose tests fail never ships.
+Robustness mechanisms (retry on locked files, edit journal, daily backups, update flow): `docs/robustness.md`.
+
 ## Release & in-app update
 
 - `build_release.py` packages each build into: the full per-platform zip (`setup_v{version}_{plat}.zip`, kept for backward compat / fallback; old name had Chinese prefix which GitHub strips on upload), a small `app_v{version}_{plat}.zip` (app code), a content-hash-named `runtime_{plat}_{hash}.zip` (the `_internal/` runtime), each with a `{zip}.sha256`, plus `update_manifest_{plat}.json`. `partition_bundle()` defines the app/runtime split (app = root exe ∪ `_internal/specimen_app/**` ∪ `.update_meta.json`). Each built bundle also gets a `.update_meta.json` recording its `runtime_hash` + `app_files`.
@@ -122,6 +137,8 @@ Templates live in `字段模版/`. External photos are archived (copied) into `�
 
 ## Additional docs
 
+- `docs/fix-from-log.md` — log-driven fix procedure (no-regression rules)
+- `docs/robustness.md` — crash/data-loss defences, recovery steps, maintenance discipline
 - `docs/build-windows.md` — Windows build guide
 - `docs/build-linux.md` — Linux build guide
 - `docs/linux-user-guide.md` — Linux user guide
