@@ -76,7 +76,8 @@ class ThreadHookTests(unittest.TestCase):
         from PyQt5.QtWidgets import QApplication
         QApplication.instance() or QApplication(["t"])
         from specimen_app import ui
-        saved = (threading.excepthook,)
+        import sys as _sys
+        saved = (threading.excepthook, _sys.excepthook, ui._DIALOG_BRIDGE)
         try:
             ui._install_qt_exception_dialog()
             errors = []
@@ -89,7 +90,10 @@ class ThreadHookTests(unittest.TestCase):
             self.assertTrue(errors and "ZeroDivisionError" in errors[0])
             self.assertIs(orig, ui._post_crash_dialog_to_main_thread)
         finally:
+            # 全局钩子必须还原：否则后面的窗口用例一有异常就弹模态崩溃框 → 整个测试进程卡死
             threading.excepthook = saved[0]
+            _sys.excepthook = saved[1]
+            ui._DIALOG_BRIDGE = saved[2]
 
 
 class WindowStateRecoveryTests(unittest.TestCase):
