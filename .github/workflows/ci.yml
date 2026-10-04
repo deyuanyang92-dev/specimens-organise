@@ -39,4 +39,5 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run tests
-        run: python -m unittest discover -s tests
+        # 单用例看门狗：卡住超过 180 s 打印全部线程调用栈并失败（见 scripts/run_tests.py）
+        run: python -u scripts/run_tests.py --timeout 180

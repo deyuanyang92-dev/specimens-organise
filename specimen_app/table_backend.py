@@ -42,7 +42,7 @@ def _openpyxl():
     """
     global _OPENPYXL
     if _OPENPYXL is not None:
-        return _OPENPYXL
+        return _OPENPYXL[0], _lock_retrying(_OPENPYXL[1])
     numpy_module = sys.modules.get("numpy")
     blocked = "numpy" not in sys.modules
     if blocked:
@@ -55,7 +55,15 @@ def _openpyxl():
         elif numpy_module is not None:
             sys.modules["numpy"] = numpy_module
     _OPENPYXL = (Workbook, load_workbook)
-    return _OPENPYXL
+    # v0.10.42：本模块所有 load_workbook（读、headers、append 的 probe/load、stream_columns…）统一带占用重试，
+    #     不再逐个调用点补（v0.10.40 只补了 3 处，审计又找到 5 处漏网）。
+    return Workbook, _lock_retrying(load_workbook)
+
+
+def _lock_retrying(load_workbook: Callable[..., Any]) -> Callable[..., Any]:
+    def _load(*args: Any, **kwargs: Any) -> Any:
+        return retry_on_file_lock(lambda: load_workbook(*args, **kwargs))
+    return _load
 
 
 class TableBackend(Protocol):
@@ -92,9 +100,10 @@ class TableBackend(Protocol):
 _LOCK_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8)
 
 
-def retry_on_file_lock(fn: Callable[[], Any], delays: tuple[float, ...] = _LOCK_RETRY_DELAYS) -> Any:
+def retry_on_file_lock(fn: Callable[[], Any], delays: tuple[float, ...] | None = None) -> Any:
     """执行 fn；遇 PermissionError 按 delays 退避重试，耗尽后抛最后一次的 PermissionError。其他异常不重试。"""
-    for delay in delays:
+    # 调用时才读模块级 _LOCK_RETRY_DELAYS（测试里可整体调短，避免故意模拟占用的用例每次真等 1.5 s）
+    for delay in (_LOCK_RETRY_DELAYS if delays is None else delays):
         try:
             return fn()
         except PermissionError:
@@ -143,7 +152,7 @@ def xlsx_read_rows(path: Path | str, to_string: Callable[[object], str], column_
         return []
     _, load_workbook = _openpyxl()
     # 旧：wb = load_workbook(path, read_only=True, data_only=True)  —— 文件被短暂占用即抛 PermissionError
-    wb = retry_on_file_lock(lambda: load_workbook(path, read_only=True, data_only=True))
+    wb = load_workbook(path, read_only=True, data_only=True)  # _openpyxl() 返回的已带占用重试
     try:
         if sheet is not None:
             if sheet not in wb.sheetnames:
@@ -162,7 +171,7 @@ def xlsx_headers(path: Path | str, to_string: Callable[[object], str], sheet: st
         return []
     _, load_workbook = _openpyxl()
     # 旧：wb = load_workbook(path, read_only=True, data_only=True)  —— 文件被短暂占用即抛 PermissionError
-    wb = retry_on_file_lock(lambda: load_workbook(path, read_only=True, data_only=True))
+    wb = load_workbook(path, read_only=True, data_only=True)  # _openpyxl() 返回的已带占用重试
     try:
         if sheet is not None:
             if sheet not in wb.sheetnames:
@@ -265,7 +274,7 @@ class XlsxBackend:
                     results[idx] = []
                 continue
             # 旧：wb = load_workbook(path, read_only=True, data_only=True)
-            wb = retry_on_file_lock(lambda p=path: load_workbook(p, read_only=True, data_only=True))
+            wb = load_workbook(path, read_only=True, data_only=True)  # 已带占用重试
             try:
                 for idx in indices:
                     key, fallback = items[idx]

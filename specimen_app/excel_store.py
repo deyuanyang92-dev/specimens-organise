@@ -46,7 +46,13 @@ def _ensure_openpyxl() -> None:
         elif _numpy_module is not None:
             sys.modules["numpy"] = _numpy_module
     Workbook = _Wb
-    load_workbook = _lwb
+    # v0.10.42：本模块直接用 load_workbook 的地方也统一带文件占用重试
+    from .table_backend import retry_on_file_lock as _retry
+
+    def _lwb_retrying(*args, **kwargs):
+        return _retry(lambda: _lwb(*args, **kwargs))
+
+    load_workbook = _lwb_retrying
 
 from . import __version__
 from .action_log_db import ActionLogDatabase  # Tier B: SQLite 操作日志
