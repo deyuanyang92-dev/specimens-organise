@@ -71,12 +71,17 @@ def show_fatal(message: str) -> None:
         except Exception:
             pass
     if sys.platform == "win32":
-        try:
-            import ctypes
+        _message_box(message)
 
-            ctypes.windll.user32.MessageBoxW(None, message, "标本入库管理 无法启动", 0x10)
-        except Exception:
-            pass
+
+def _message_box(message: str) -> None:
+    """Windows 系统错误框（不依赖 Qt）。单独成函数：测试里替换掉，否则 CI 上会弹框卡死。"""
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(None, message, "标本入库管理 无法启动", 0x10)
+    except Exception:
+        pass
 
 
 def report_startup_failure(exc: BaseException) -> None:

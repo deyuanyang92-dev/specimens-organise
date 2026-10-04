@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 from datetime import date
 from pathlib import Path
@@ -24,6 +25,7 @@ from pathlib import Path
 from .models import DATA_VERSION_DIR
 
 DAILY_OPERATION_TYPE = "每日自动备份"
+_SAFE_KEY_RE = re.compile(r"[A-Za-z0-9-]{1,64}")
 DEFAULT_KEEP = 14
 _MANIFEST = "snapshot_manifest.json"
 _COMPLETE = ".snapshot.complete"
@@ -51,7 +53,9 @@ def _daily_snapshots(directory: Path) -> list[Path]:
 def workspace_backup_key(store) -> str:
     """本机备份子目录名：优先工作区 ID（换盘符 / 挪位置也不变），没有则用路径哈希。"""
     wid = str((getattr(store, "config", None) or {}).get("workspace_id", "")).strip()
-    if wid:
+    # 安全：workspace_id 来自工作区配置文件（可能是别人共享的工作区），只接受 UUID 样式，
+    # 否则 "..\.." 之类会让本机备份 / 清理落到 backups 目录之外（路径穿越）。
+    if _SAFE_KEY_RE.fullmatch(wid):
         return wid
     return hashlib.sha1(str(Path(store.root).resolve()).casefold().encode("utf-8")).hexdigest()[:16]
 

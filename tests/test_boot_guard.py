@@ -33,8 +33,11 @@ class BootGuardTests(unittest.TestCase):
 
     def test_show_fatal_survives_missing_stderr(self):
         # PyInstaller --windowed：sys.stderr 是 None，旧代码的 print 静默丢失
-        with patch.object(sys, "stderr", None):
+        # 2026-10-04：旧用例在 Windows 上真的弹出系统错误框 → CI 挂满 30 分钟。现替换掉弹框。
+        with patch.object(sys, "stderr", None), patch.object(boot_guard, "_message_box") as box:
             boot_guard.show_fatal("x")  # 不抛
+        if sys.platform == "win32":
+            box.assert_called_once()
 
     def test_app_dir_name_matches_settings(self):
         from specimen_app import app_settings

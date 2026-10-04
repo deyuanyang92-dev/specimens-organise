@@ -40,6 +40,13 @@ class DailyBackupTests(unittest.TestCase):
         manifest = json.loads((snap / SNAPSHOT_MANIFEST_FILENAME).read_text(encoding="utf-8"))
         self.assertEqual(manifest["operation_type"], daily_backup.DAILY_OPERATION_TYPE)
 
+    def test_malicious_workspace_id_cannot_escape_backup_dir(self):
+        self.store.config["workspace_id"] = "..\\..\\..\\Windows"
+        key = daily_backup.workspace_backup_key(self.store)
+        self.assertRegex(key, r"^[0-9a-f]{16}$")
+        self.store.config["workspace_id"] = "../../etc"
+        self.assertNotIn("..", daily_backup.workspace_backup_key(self.store))
+
     def test_second_run_same_day_is_noop(self):
         daily_backup.run_daily_backup(self.store, self.local, today=date(2026, 10, 4))
         self.assertIsNone(daily_backup.run_daily_backup(self.store, self.local, today=date(2026, 10, 4)))
