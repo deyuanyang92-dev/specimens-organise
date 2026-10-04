@@ -959,7 +959,8 @@ class CoreTests(unittest.TestCase):
             settings = load_settings()
             self.assertTrue(settings.show_grid_filenames)
             self.assertEqual(settings.photo_filename_fill_shortcut, DEFAULT_PHOTO_FILENAME_FILL_SHORTCUT)
-            self.assertEqual(settings.photo_management_mode, "copy_with_absolute")
+            # 旧：assertEqual(..., "copy_with_absolute")。v0.10.45 用户明确要求关联照片默认不复制 → 默认改为 absolute_only
+            self.assertEqual(settings.photo_management_mode, "absolute_only")
             # 旧 settings.json 缺该键时，沿用上条信息默认开启
             self.assertTrue(settings.carry_over_specimen_fields)
             # 旧 settings.json 缺该键时，入库汇总可见列为空（运行时回退到默认列集）
@@ -969,7 +970,8 @@ class CoreTests(unittest.TestCase):
 
             settings.show_grid_filenames = False
             settings.photo_filename_fill_shortcut = "Ctrl+Shift+F"
-            settings.photo_management_mode = "absolute_only"
+            # 旧：设为 "absolute_only"——现在它等于默认值，读回相等证明不了已保存；改设非默认值
+            settings.photo_management_mode = "copy_with_absolute"
             settings.photo_library_path = str(self.tmp / "library")
             settings.carry_over_specimen_fields = False
             settings.summary_visible_columns = ["入库编号*", "管内编号*", "照片数"]
@@ -978,7 +980,7 @@ class CoreTests(unittest.TestCase):
             reloaded = load_settings()
             self.assertFalse(reloaded.show_grid_filenames)
             self.assertEqual(reloaded.photo_filename_fill_shortcut, "Ctrl+Shift+F")
-            self.assertEqual(reloaded.photo_management_mode, "absolute_only")
+            self.assertEqual(reloaded.photo_management_mode, "copy_with_absolute")
             self.assertEqual(reloaded.photo_library_path, str(self.tmp / "library"))
             self.assertFalse(reloaded.carry_over_specimen_fields)
             self.assertEqual(reloaded.summary_visible_columns, ["入库编号*", "管内编号*", "照片数"])
