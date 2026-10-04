@@ -234,3 +234,63 @@ def list_recent_crash_logs(limit: int = 5, context: str | None = None) -> list[P
         return paths[:limit]
     except OSError:
         return []
+
+
+# ---------------------------------------------------------------------------
+# v0.10.41：会话记录 —— 「上次未正常退出」只报上一次运行期间写的日志
+# ---------------------------------------------------------------------------
+# 旧：启动提示 = list_recent_crash_logs(limit=1, context="main_thread")，取"最新一份"，不管它是哪次运行写的。
+#     升级 / 安装器关程序不走 closeEvent → 没有 clean 标记 → 把几天前、旧版本的日志当成"刚刚崩溃"弹出来
+#     （2026-10-04 用户升级到 v0.10.40 后看到 10-03 的 v0.10.37 日志，以为又闪退了）。
+_SESSION_FILE = "last_session.json"
+
+
+def begin_session(version: str) -> dict | None:
+    """启动时调用：返回上一次运行的 {started_at, version}（没有记录返回 None），并写入本次的。"""
+    import json
+    import time
+
+    cfg = _config_dir()
+    if cfg is None:
+        return None
+    path = cfg / _SESSION_FILE
+    previous: dict | None = None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("started_at"), (int, float)):
+            previous = {"started_at": float(data["started_at"]), "version": str(data.get("version", ""))}
+    except (OSError, ValueError):
+        previous = None
+    try:
+        cfg.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{_pid()}.tmp")
+        tmp.write_text(json.dumps({"started_at": time.time(), "version": version}), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
+    return previous
+
+
+def describe_unclean_exit(previous: dict | None, current_version: str) -> tuple[str, list[Path]]:
+    """上次没走正常关闭时，判断该给用户看什么。
+
+    返回 (kind, logs)：
+      - ("crash", [log])  上一次运行期间写过主线程崩溃日志 → 给用户看这份
+      - ("killed", [])    同版本、无新日志 → 任务管理器结束 / 断电 / 系统重启
+      - ("none", [])      版本变了（升级 / 重装时被安装器关掉）或无会话记录 → 不提示，避免误报
+    """
+    if previous is None:
+        return "none", []
+    started_at = float(previous.get("started_at", 0.0))
+    logs = []
+    for log in list_recent_crash_logs(limit=5, context="main_thread"):
+        try:
+            if log.stat().st_mtime >= started_at:
+                logs.append(log)
+        except OSError:
+            continue
+    if logs:
+        return "crash", logs[:1]
+    if previous.get("version") != current_version:
+        return "none", []
+    return "killed", []

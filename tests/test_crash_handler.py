@@ -158,3 +158,56 @@ class CrashLogTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StaleCrashHintTests(unittest.TestCase):
+    """v0.10.41：「上次未正常退出」只报上一次运行期间写的崩溃日志。
+
+    现场（2026-10-04）：用户升级到 v0.10.40 后启动，又弹出 2026-10-03 那份 v0.10.37 的旧日志——
+    升级 / 安装器关程序不走 closeEvent → 没有 clean 标记 → 启动提示取"最新一份"日志，不管它是哪次运行写的。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self._patcher = mock.patch.object(crash_log, "_config_dir", return_value=self.tmp)
+        self._patcher.start()
+
+    def tearDown(self) -> None:
+        self._patcher.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _log(self, name: str, mtime: float) -> Path:
+        p = self.tmp / name
+        p.write_text("Context:  main_thread\nboom", encoding="utf-8")
+        os.utime(p, (mtime, mtime))
+        return p
+
+    def test_old_log_from_earlier_session_is_not_reported(self) -> None:
+        self._log("crash_old.log", 1000.0)
+        prev = {"started_at": 2000.0, "version": "0.10.40"}
+        kind, logs = crash_log.describe_unclean_exit(prev, "0.10.40")
+        self.assertEqual(logs, [])
+        self.assertEqual(kind, "killed")  # 没日志 + 同版本 → 被结束 / 断电
+
+    def test_log_written_during_previous_session_is_reported(self) -> None:
+        self._log("crash_old.log", 1000.0)
+        new = self._log("crash_new.log", 2500.0)
+        kind, logs = crash_log.describe_unclean_exit({"started_at": 2000.0, "version": "0.10.40"}, "0.10.40")
+        self.assertEqual((kind, logs), ("crash", [new]))
+
+    def test_after_upgrade_without_new_log_is_silent(self) -> None:
+        self._log("crash_old.log", 1000.0)
+        kind, _ = crash_log.describe_unclean_exit({"started_at": 2000.0, "version": "0.10.37"}, "0.10.41")
+        self.assertEqual(kind, "none")
+
+    def test_unknown_previous_session_is_silent(self) -> None:
+        # 第一次跑带会话记录的版本（从旧版升级上来）：无法判断旧日志属于哪次运行 → 不打扰
+        self._log("crash_old.log", 1000.0)
+        kind, _ = crash_log.describe_unclean_exit(None, "0.10.41")
+        self.assertEqual(kind, "none")
+
+    def test_begin_session_returns_previous_and_records_current(self) -> None:
+        self.assertIsNone(crash_log.begin_session("0.10.41"))
+        prev = crash_log.begin_session("0.10.41")
+        self.assertEqual(prev["version"], "0.10.41")
+        self.assertIsInstance(prev["started_at"], float)

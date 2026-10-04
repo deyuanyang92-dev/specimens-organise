@@ -7970,6 +7970,9 @@ class SpecimenWindow(QMainWindow):
 
         clear_pending()
         # Quit the current process so the swap script can take over.
+        # 旧：QApplication.instance().quit() —— 不走 closeEvent：待保存字段不落盘、不写 clean 标记，
+        #     下次启动误报"上次未正常退出"。现：先 close() 走完整关闭流程，再 quit。
+        self.close()
         QApplication.instance().quit()
 
     def _check_post_update_sentinel_on_startup(self) -> None:
@@ -11018,6 +11021,10 @@ def run_app(workspace_root: Path | str | None) -> None:
     install_excepthook()
     _install_qt_exception_dialog()
     _last_exit_was_clean = mark_app_started()
+    # v0.10.41：记录本次会话，拿到上次会话（开始时间 + 版本），用来判断旧崩溃日志是不是上次写的。
+    from .crash_log import begin_session, describe_unclean_exit
+    from . import __version__ as _cur_version
+    _previous_session = begin_session(_cur_version)
 
     if workspace_root is None:
         workspace_root = default_workspace()
@@ -11151,7 +11158,11 @@ def run_app(workspace_root: Path | str | None) -> None:
     if not _last_exit_was_clean:
         def _show_crash_hint() -> None:
             # 后台 WoRMS/测试线程日志不代表主窗口崩溃，不能冒充上次应用异常退出。
-            recent = list_recent_crash_logs(limit=1, context="main_thread")
+            # 旧：recent = list_recent_crash_logs(limit=1, context="main_thread")
+            #     —— 取"最新一份"，升级后会把几天前旧版本的日志当成刚崩溃弹出来。
+            kind, recent = describe_unclean_exit(_previous_session, _cur_version)
+            if kind == "none":
+                return  # 升级 / 重装时被安装器关掉，或首次带会话记录启动：不是崩溃，不打扰
             if recent:
                 try:
                     log_text = recent[0].read_text(encoding="utf-8", errors="replace")
