@@ -366,6 +366,10 @@ def build_release(version: str, project_root: Path, icon_path: Path | None = Non
         str(spec_path),
         "--hidden-import",
         "tifffile",
+        # v0.10.46 单实例守卫用 QLocalServer/QLocalSocket。single_instance 是函数内
+        # 延迟 import 的，显式声明免得 PyInstaller 分析漏掉 → 打包版退化成可重复启动。
+        "--hidden-import",
+        "PyQt5.QtNetwork",
     ]
     if icon_file and icon_file.exists():
         command.extend(["--icon", str(icon_file)])

@@ -93,7 +93,9 @@ def main() -> None:
         # 旧文案提到"在弹出的对话框中选择"——那是窗口构建前的裸 QFileDialog。
         # 现改为：先打开主窗口，再在窗口内提示选择/新建工作区。
         print("未找到上次使用的工作区，程序将打开主窗口并提示选择或新建工作区。", file=sys.stderr)
-    run_app(workspace)
+    # v0.10.46：双击图标（无参数）启动时做单实例限制，避免重复打开抢同一工作区；
+    # 显式 --workspace 是"再开一个工作区"的明确意图，不限制。
+    run_app(workspace, enforce_single_instance=args.workspace is None)
 
 
 if __name__ == "__main__":
