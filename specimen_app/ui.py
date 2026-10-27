@@ -11656,6 +11656,11 @@ def run_app(workspace_root: Path | str | None, enforce_single_instance: bool = T
         from .splash import SplashScreen
         splash = SplashScreen()
         splash.show()
+        # v0.10.46：splash 是置顶 + 禁交互的，一旦启动途中弹出模态对话框（典型是
+        # 「工作区被占用」），它会把对话框盖住 —— 用户看不见也点不到，进程就停在
+        # 嵌套事件循环里，桌面上留一个关不掉的 "打开工作区… 25%"（boot_fault.log
+        # 的 pid=10732 挂了 15 小时）。装上保险：见模态窗口或启动超时就让开。
+        splash.enable_auto_hide(app)
         app.processEvents()  # 让 splash 实际出现在屏幕上
         splash.show_stage("初始化…", 5)
     except Exception:

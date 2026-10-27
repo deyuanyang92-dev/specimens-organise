@@ -511,7 +511,12 @@ def build_release(version: str, project_root: Path, icon_path: Path | None = Non
     (release_dir / "build_info.json").write_text(json.dumps(build_info, ensure_ascii=False, indent=2), encoding="utf-8")
 
     notes = release_dir / "release_notes.md"
-    if not notes.exists():
+    # 优先用本版手写的发布说明。旧逻辑只有一段写死的模板，内容停留在 0.2.x
+    # （"跨平台支持""路径遍历修复"），每个新版本都照抄一遍，对用户是误导。
+    curated = project_root / "docs" / "release-notes" / f"v{version}.md"
+    if curated.is_file():
+        notes.write_text(curated.read_text(encoding="utf-8"), encoding="utf-8")
+    elif not notes.exists():
         notes.write_text(
             f"# {APP_NAME} v{version}\n\n"
             "## 安全修复\n\n"
