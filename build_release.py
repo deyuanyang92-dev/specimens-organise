@@ -174,10 +174,16 @@ def _find_inno_setup_compiler() -> Path | None:
         found = shutil.which(name)
         if found:
             candidates.append(Path(found))
-    for base_env in ("ProgramFiles(x86)", "ProgramFiles"):
+    # LOCALAPPDATA：winget（`winget install JRSoftware.InnoSetup`）默认装到用户目录，
+    # 不进 Program Files 也不进 PATH。漏掉它的后果是静默退化成"只出 zip 不出安装器"。
+    # CI 用 choco，装在 Program Files，由下面两项覆盖。
+    for base_env in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"):
         base = os.environ.get(base_env)
-        if base:
-            candidates.append(Path(base) / "Inno Setup 6" / "ISCC.exe")
+        if not base:
+            continue
+        candidates.append(Path(base) / "Inno Setup 6" / "ISCC.exe")
+        if base_env == "LOCALAPPDATA":
+            candidates.append(Path(base) / "Programs" / "Inno Setup 6" / "ISCC.exe")
     for candidate in candidates:
         try:
             if candidate.is_file():
