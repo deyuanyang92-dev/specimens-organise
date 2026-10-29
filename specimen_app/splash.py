@@ -24,9 +24,9 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PyQt5.QtCore import Qt, QRect
+from PyQt5.QtCore import Qt, QEvent, QObject, QRect, QTimer
 from PyQt5.QtGui import QColor, QFont, QPainter, QPixmap
-from PyQt5.QtWidgets import QSplashScreen, QApplication
+from PyQt5.QtWidgets import QSplashScreen, QApplication, QWidget
 
 from . import __version__
 
@@ -39,6 +39,70 @@ _TEXT_COLOR = QColor("#222")
 _MUTED_COLOR = QColor("#888")
 _PROGRESS_BG = QColor("#e8eef7")
 _PROGRESS_FG = QColor("#1a5faa")
+
+# 启动最多允许 splash 占屏多久。超过就让开 —— 宁可让用户看见一个半成品窗口，
+# 也好过一个置顶、禁交互、关不掉的方块糊在桌面上。
+_DEFAULT_AUTO_HIDE_MS = 15_000
+
+
+class _SplashAutoHide(QObject):
+    """让 splash 在"挡路"的时候自己退场。
+
+    v0.10.46 修复。现象：桌面上一个 "打开工作区… 25%" 的窗口挂了 15 小时关不掉
+    （boot_fault.log 的 pid=10732）。成因：
+      1. 两个进程同时启动抢工作区锁，后一个弹出模态的「工作区被占用」对话框；
+      2. splash 带 Qt.WindowStaysOnTopHint 且 setEnabled(False)，在 Windows 上
+         盖住了那个对话框；
+      3. 主线程停在 mb.exec_() 的嵌套事件循环里等用户点按钮 —— 用户既看不见也
+         点不到。事件循环还在跑，所以 GUI 卡死探针一条日志都没留下。
+
+    两道保险：
+      * 任何模态窗口出现 → 立刻隐藏 splash，把屏幕让给对话框；
+      * 启动超过 timeout_ms 仍未结束 → 隐藏 splash（纯 Python 阻塞时定时器不会
+        触发，这一道只覆盖事件循环还在跑的情形，和上面那条互补）。
+    """
+
+    def __init__(self, splash: "SplashScreen", app: QApplication, timeout_ms: int) -> None:
+        super().__init__(splash)
+        self._splash = splash
+        self._app = app
+        self._pending = False
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._release)
+        if timeout_ms > 0:
+            self._timer.start(int(timeout_ms))
+        app.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt 命名)
+        if self._pending or self._app is None:
+            return False
+        if event is not None and event.type() == QEvent.Show:
+            if isinstance(obj, QWidget) and obj is not self._splash and obj.isModal():
+                self._pending = True
+                # 必须延后一轮，不能在这里同步 hide() + removeEventFilter()：
+                # 此刻 Qt 正在派发这个 Show 事件、正在遍历过滤器链，在 Windows 平台
+                # 插件上同步动窗口会直接 access violation（实测退出码 0xC0000005，
+                # 本机 Windows 全量测试跑出来的，Linux/offscreen 上看不到）。
+                QTimer.singleShot(0, self._release)
+        return False  # 只观察，不吞事件
+
+    def _release(self) -> None:
+        try:
+            self._splash.hide()
+        except RuntimeError:
+            pass  # splash 的 C++ 对象已销毁
+        self.detach()
+
+    def detach(self) -> None:
+        """撤掉过滤器和定时器。重复调用安全。"""
+        self._timer.stop()
+        if self._app is not None:
+            try:
+                self._app.removeEventFilter(self)
+            except RuntimeError:
+                pass
+            self._app = None
 
 
 class SplashScreen(QSplashScreen):
@@ -53,10 +117,32 @@ class SplashScreen(QSplashScreen):
         super().__init__(parent, pix, Qt.WindowStaysOnTopHint)
         self._stage_text = "正在启动…"
         self._percent = 0
+        self._auto_hide: Optional[_SplashAutoHide] = None
         # QSplashScreen 自带 showMessage,但我们要画自定义进度条 -> 用 drawContents 重绘
         self.setEnabled(False)  # splash 期间禁交互避免误点
 
     # ---- API ----
+    def enable_auto_hide(self, app: QApplication, timeout_ms: int = _DEFAULT_AUTO_HIDE_MS) -> None:
+        """装上"别挡路"保险：模态对话框出现或启动超时就隐藏自己。
+
+        见 _SplashAutoHide 的说明。重复调用会替换掉上一个。
+        """
+        self.disable_auto_hide()
+        try:
+            self._auto_hide = _SplashAutoHide(self, app, timeout_ms)
+        except Exception:
+            self._auto_hide = None  # 保险本身失败不能影响启动
+
+    def disable_auto_hide(self) -> None:
+        if self._auto_hide is not None:
+            self._auto_hide.detach()
+            self._auto_hide = None
+
+    def finish(self, window) -> None:  # noqa: D102 (覆写 QSplashScreen.finish)
+        # 启动已结束，撤掉保险，别让事件过滤器留在 QApplication 上。
+        self.disable_auto_hide()
+        super().finish(window)
+
     def show_stage(self, text: str, percent: int) -> None:
         """更新当前阶段文字 + 进度百分比;调用后立刻 repaint + processEvents 让其可见。"""
         self._stage_text = str(text or "")

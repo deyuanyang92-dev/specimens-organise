@@ -83,11 +83,18 @@ class _PersonItemDelegate(QStyledItemDelegate):
         return QSize(option.rect.width(), self.ROW_HEIGHT)
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
-        member: Optional[TeamMember] = index.data(Qt.UserRole)
-        if member is None:
-            # 占位项 (如 "+ 新增人员…" / "未设置")
+        data = index.data(Qt.UserRole)
+        # v0.10.46 崩溃修复（crash_20261021_165731.log）：
+        #   AttributeError: 'str' object has no attribute 'pinned'
+        # "＋ 管理人员…" 这一项的 UserRole 存的是字符串哨兵 SPECIAL_MANAGE，不是
+        # None，旧的 `if member is None` 挡不住它，下面 member.pinned 直接抛。
+        # 异常发生在 Qt 的 paint 回调里 —— 没有调用栈能接，直接走崩溃钩子退出。
+        # 现在按类型判断：只有真的 TeamMember 才走自绘。
+        if not isinstance(data, TeamMember):
+            # 占位项 / 特殊项 ("＋ 管理人员…" / "未设置")
             super().paint(painter, option, index)
             return
+        member: TeamMember = data
         painter.save()
         try:
             painter.setRenderHint(QPainter.Antialiasing)

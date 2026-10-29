@@ -215,6 +215,59 @@ def grid_shape(count: int) -> tuple[int, int]:
     return 4, 2
 
 
+# 宫格单元里照片之外必然占掉的像素（2px 边框 ×2 + 3px 内边距 ×2，再留点余量）。
+_GRID_SPACING = 6
+_GRID_CELL_CHROME_W = 12
+_GRID_CELL_CHROME_H = 12
+
+
+def best_grid_shape(
+    count: int,
+    viewport_w: int,
+    viewport_h: int,
+    photo_aspect: float = 4 / 3,
+    spacing: int = 6,
+) -> tuple[int, int]:
+    """为 count 张照片挑一个让画面最大的 (列, 行)。
+
+    v0.10.46。旧的 grid_shape() 只看照片张数，不看可用区域的长宽比，也不看照片
+    本身的长宽比 —— 8 张横构图照片固定排成 4 列 2 行，每格又窄又高，照片等比缩放
+    后上下各留一大片空白（用户反馈"图片展示有很多空白"的主因）。
+
+    这里穷举所有 cols × rows >= count 的排法，算每张照片等比塞进单元格后的实际
+    显示面积，取最大的那个。同样 8 张图、1290×1020 的区域、4:3 的照片：
+    4×2 每张约 322×242，3×3 每张约 430×322 —— 面积大 77%，空白相应减少。
+
+    photo_aspect = 宽/高；越接近真实照片比例，空白越少。调用方用已加载缩略图的
+    实测值滚动更新它。
+    """
+    count = max(1, int(count))
+    if viewport_w <= 0 or viewport_h <= 0:
+        return grid_shape(count)
+    if photo_aspect <= 0:
+        photo_aspect = 4 / 3
+
+    best: tuple[float, int, int] | None = None
+    for cols in range(1, count + 1):
+        rows = -(-count // cols)  # ceil
+        if (cols - 1) * rows >= count:
+            continue  # 这么多列用不满，等价于更少的列
+        cell_w = (viewport_w - spacing * (cols - 1)) / cols - _GRID_CELL_CHROME_W
+        cell_h = (viewport_h - spacing * (rows - 1)) / rows - _GRID_CELL_CHROME_H
+        if cell_w <= 1 or cell_h <= 1:
+            continue
+        shown_w = min(cell_w, cell_h * photo_aspect)   # 等比塞进去之后的实际显示尺寸
+        shown_h = shown_w / photo_aspect
+        # 空槽惩罚：9 格放 8 张只浪费 1 格可以接受，但面积相当时优先排满
+        empty_penalty = max(0.1, 1.0 - 0.04 * (cols * rows - count))
+        score = shown_w * shown_h * empty_penalty
+        if best is None or score > best[0]:
+            best = (score, cols, rows)
+    if best is None:
+        return grid_shape(count)
+    return best[1], best[2]
+
+
 def _join_display(*parts: str) -> str:
     return "  ".join(part for part in parts if part)
 
@@ -322,17 +375,38 @@ def _shorten(value: str, max_length: int) -> str:
     return value[: max(1, max_length - 1)] + "…"
 
 
-def pil_to_qpixmap(pil_image: Image.Image) -> QPixmap:
+def pil_to_qimage(pil_image: Image.Image) -> QImage:
+    """PIL.Image → QImage（深拷贝，线程安全，可跨线程用信号传递）。
+
+    v0.10.46 崩溃修复。旧实现 ``QImage(data, w, h, fmt)`` 漏传 bytesPerLine：
+    Qt 文档明确要求"每条扫描线必须 32 位对齐"，而 PIL ``tobytes("raw","RGB")``
+    的行宽是 ``w*3`` 且无填充。只要 ``w*3 % 4 != 0``（即宽度不是 4 的倍数），
+    Qt 就按 4 字节对齐的行宽去读，越过缓冲区末尾 →
+    ``Windows fatal exception: access violation``（见 boot_fault.log 中 9 次崩溃，
+    栈顶全是 pil_to_qpixmap）。显式传 bytesPerLine 即按真实行宽读取。
+
+    ``.copy()`` 不可省：构造出的 QImage 只引用 Python bytes 缓冲区，不持有它。
+    """
     if pil_image.mode == "RGBA":
         data = pil_image.tobytes("raw", "RGBA")
         fmt = QImage.Format_RGBA8888
+        bytes_per_line = pil_image.width * 4
     else:
         if pil_image.mode != "RGB":
             pil_image = pil_image.convert("RGB")
         data = pil_image.tobytes("raw", "RGB")
         fmt = QImage.Format_RGB888
-    qimg = QImage(data, pil_image.width, pil_image.height, fmt).copy()
-    return QPixmap.fromImage(qimg)
+        bytes_per_line = pil_image.width * 3
+    return QImage(data, pil_image.width, pil_image.height, bytes_per_line, fmt).copy()
+
+
+def pil_to_qpixmap(pil_image: Image.Image) -> QPixmap:
+    """PIL.Image → QPixmap。**只能在 GUI 线程调用**。
+
+    QPixmap 由平台绘图后端支撑，Qt 规定只能在 GUI 线程创建和使用。
+    后台线程请用 pil_to_qimage()，把 QImage 传回主线程再转 QPixmap。
+    """
+    return QPixmap.fromImage(pil_to_qimage(pil_image))
 
 
 # 管理密码：原本硬编码 "123" 散落在删除入库编号流程（_context_delete_voucher /
@@ -664,7 +738,9 @@ class _ThumbnailRequest:
 
 
 class ThumbnailWorker(QThread):
-    result_ready = pyqtSignal(int, object, object)  # token, QPixmap|None, Exception|None
+    # v0.10.46：改发 QImage（不是 QPixmap）。QPixmap 只能在 GUI 线程创建，
+    # 在解码线程里造它是 Qt 层未定义行为，Windows 上直接 access violation。
+    result_ready = pyqtSignal(int, object, object)  # token, QImage|None, Exception|None
 
     def __init__(self, cache: ThumbnailCache, parent=None, max_workers: int | None = None):
         super().__init__(parent)
@@ -735,8 +811,9 @@ class ThumbnailWorker(QThread):
     def _process(self, req: _ThumbnailRequest) -> None:
         try:
             pil_img = self.cache.thumbnail(req.path, req.size)
-            qpixmap = pil_to_qpixmap(pil_img)
-            self.result_ready.emit(req.token, qpixmap, None)
+            # 这里是 ThreadPoolExecutor 的工作线程：只做 QImage，不碰 QPixmap。
+            qimage = pil_to_qimage(pil_img)
+            self.result_ready.emit(req.token, qimage, None)
         except Exception as exc:
             self.result_ready.emit(req.token, None, exc)
 
@@ -1313,6 +1390,9 @@ class SpecimenWindow(QMainWindow):
         self._is_closing = False
         self._photo_load_token = 0
         self._grid_load_token = 0
+        # v0.10.46：当前这批照片的长宽比（宽/高）滚动估计，驱动宫格排法。
+        # 初值 4:3；每张缩略图加载完成后按实测值做指数平滑，很快收敛到真实构图。
+        self._grid_photo_aspect = 4 / 3
         self._import_job_active = False
         self._grid_mode_before_expand = ""
         self._photo_page_size = 200
@@ -2036,7 +2116,10 @@ class SpecimenWindow(QMainWindow):
 
         self.grid_frame = QFrame()
         self.grid_layout = QGridLayout(self.grid_frame)
-        self.grid_layout.setSpacing(10)
+        # v0.10.46：间距 10 → 6、外边距 9（Qt 默认）→ 2。8 宫格下光这一项就把
+        # 可用给照片的宽度多还回约 40px。
+        self.grid_layout.setSpacing(_GRID_SPACING)
+        self.grid_layout.setContentsMargins(2, 2, 2, 2)
         self.grid_frame.setAcceptDrops(True)
         # 规范化软件设计 2026-05 P1 审查修复:
         # 旧:`grid_frame.dragEnterEvent = lambda e: ...` — Qt C++ 事件 dispatch 不走 Python
@@ -5648,7 +5731,19 @@ class SpecimenWindow(QMainWindow):
         self._show_skipped_photos(skipped)
         return added
 
-    def add_photo_paths_async(self, paths: list[str], ask_for_outside: bool = True) -> None:
+    def add_photo_paths_async(
+        self,
+        paths: list[str],
+        ask_for_outside: bool = True,
+        confirm_batch: bool = True,
+        on_done: "Callable[[int, str], None] | None" = None,
+    ) -> None:
+        """后台关联照片。
+
+        v0.10.46 新增 ``confirm_batch`` / ``on_done``，让「检索图片」对话框也能走
+        这条后台路径 —— 它原先调同步的 ``add_photo_paths``，整本 Excel 在 GUI 线程
+        重写，实测主线程停摆 2 秒以上（gui_stall 日志里 872 次停摆有 678 次是它）。
+        """
         if self._import_job_active:
             QMessageBox.information(self, "照片导入中", "当前已有照片导入任务正在执行。")
             return
@@ -5666,7 +5761,7 @@ class SpecimenWindow(QMainWindow):
         if not self._confirm_archive_name_conflicts(photo_paths):
             return
         # Show batch confirmation for 3+ photos
-        if len(photo_paths) >= 3:
+        if confirm_batch and len(photo_paths) >= 3:
             dlg = PhotoBatchDialog(voucher, photo_paths, self)
             if dlg.exec_() != QDialog.Accepted or not dlg.confirmed:
                 return
@@ -5703,14 +5798,25 @@ class SpecimenWindow(QMainWindow):
 
         self._import_thread = ImportThread(self.store, voucher, photo_paths, allow_outside, mode, library_path)
         self._import_thread.finished.connect(
-            lambda rows, err: self._on_import_done(voucher, rows, err, skipped)
+            lambda rows, err: self._on_import_done(voucher, rows, err, skipped, on_done)
         )
         self._import_thread.start()
 
-    def _on_import_done(self, voucher: str, rows: list, err: str, skipped: list[str]) -> None:
+    def _on_import_done(
+        self,
+        voucher: str,
+        rows: list,
+        err: str,
+        skipped: list[str],
+        on_done: "Callable[[int, str], None] | None" = None,
+    ) -> None:
         self._import_job_active = False
         if err:
             self.statusBar().showMessage("照片关联失败")
+            if on_done is not None:
+                # 发起方（如检索对话框）自己报错，避免两个弹窗叠在一起
+                on_done(0, err)
+                return
             QMessageBox.critical(self, "照片关联失败", err)
             return
         if self.current_voucher == voucher:
@@ -5722,6 +5828,8 @@ class SpecimenWindow(QMainWindow):
         self.patch_voucher_row(voucher, "updated")
         self._show_skipped_photos(skipped)
         self.statusBar().showMessage(f"已关联 {len(rows)} 张照片")
+        if on_done is not None:
+            on_done(len(rows), "")
 
     def _append_added_photos_to_image_index(self, rows: list[dict[str, Any]]) -> None:
         paths: list[Path] = []
@@ -6300,7 +6408,9 @@ class SpecimenWindow(QMainWindow):
         self._thumb_worker.enqueue(path, size, token)
         self._loading = False
 
-    def _on_thumbnail_ready(self, token: int, qpixmap: QPixmap | None, exc: Exception | None) -> None:
+    def _on_thumbnail_ready(self, token: int, qimage: QImage | None, exc: Exception | None) -> None:
+        # v0.10.46：worker 回传 QImage，在这里（GUI 线程）才转 QPixmap。
+        qpixmap = QPixmap.fromImage(qimage) if qimage is not None else None
         # Check if this is a single-photo load
         if token == self._photo_load_token and not self._is_grid_mode():
             self._finish_single_photo_load(token, qpixmap, exc)
@@ -6344,16 +6454,30 @@ class SpecimenWindow(QMainWindow):
         # 计算当前页的照片索引范围
         page_start = (self.current_photo_index // count) * count
         page_indices = list(range(page_start, min(page_start + count, len(self.current_photos))))
-        # 原代码：grid_shape(count) 始终基于按钮数量，1张照片也按3×2显示 → 变形
-        # 改为基于实际照片数自适应：1→1×1, 2→2×1, 3-4→2×2, 5-6→3×2, 7-8→4×2
-        cols, rows = grid_shape(len(page_indices))
-
         # 重新渲染宫格时，多选状态重置为当前张（翻页/切 voucher/切宫格数后无残留）。
         self._grid_selected_indices = {self.current_photo_index}
 
+        # 必须先切到宫格视图、再量尺寸：Qt 不给隐藏控件做布局，grid_frame 还 hide()
+        # 着的时候 size() 返回的是 640×480 的默认值，据此算出的缩略图永远是最小档。
         self.photo_view.hide()
         self._placeholder_label.hide()
         self.grid_frame.show()
+        self.grid_frame.updateGeometry()
+        if self.grid_frame.layout() is not None:
+            self.grid_frame.layout().activate()
+
+        # 原代码：grid_shape(count) 始终基于按钮数量，1张照片也按3×2显示 → 变形
+        # 后来：基于实际照片数自适应，但形状仍写死，不看可用区域和照片比例。
+        # v0.10.46：best_grid_shape 把可用区域长宽比 + 照片长宽比一起算进去，
+        #           选让照片显示面积最大的排法 —— 这是"大量空白"的主要来源。
+        vw, vh = self._grid_viewport_size()
+        cols, rows = best_grid_shape(
+            len(page_indices), vw, vh, self._grid_photo_aspect, _GRID_SPACING
+        )
+        # 按单元格的真实像素尺寸请求缩略图。旧代码固定 (320, 240)：单元格普遍有
+        # 400-600px 宽，320px 的图被放大显示 → 糊（用户反馈"显示不够清楚"）。
+        thumb_size = self._grid_thumb_size(vw, vh, cols, rows)
+        self._grid_layout_signature = (cols, rows, thumb_size)
 
         for slot, photo_index in enumerate(page_indices):
             r = slot // cols
@@ -6372,8 +6496,8 @@ class SpecimenWindow(QMainWindow):
             label.set_filename(filename)
             if path.exists():
                 self._grid_requests[token * 100 + slot] = slot
-                # 缩略图尺寸与网格单元格匹配，使用固定的预览尺寸
-                self._thumb_worker.enqueue(path, (320, 240), token * 100 + slot)
+                # 缩略图尺寸跟随单元格实际大小（含 HiDPI 缩放），不再写死 320×240
+                self._thumb_worker.enqueue(path, thumb_size, token * 100 + slot)
             else:
                 label.set_error("照片不存在")
             self.grid_layout.addWidget(label, r, c)
@@ -6382,6 +6506,110 @@ class SpecimenWindow(QMainWindow):
         page_text = f"{page_start + 1}-{page_indices[-1] + 1} / {len(self.current_photos)}" if page_indices else f"0 / {len(self.current_photos)}"
         self.photo_counter.setText(f"{page_text} · {self._view_mode}")
         self._zoom_label.setText("")
+
+    def resizeEvent(self, event) -> None:
+        """v0.10.46：改窗口大小后按新尺寸重排宫格 + 重新取清晰度匹配的缩略图。
+
+        防抖 250ms —— 拖动窗口边框会连发几十个 resize，每个都重排会把解码线程打爆。
+        """
+        super().resizeEvent(event)
+        if not self._is_grid_mode():
+            return
+        timer = getattr(self, "_grid_resize_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._on_grid_resize_settled)
+            self._grid_resize_timer = timer
+        timer.start(250)
+
+    def _on_grid_resize_settled(self) -> None:
+        if not (self._is_grid_mode() and self.current_photos):
+            return
+        # 尺寸变化没改变排法也没改变清晰度档位 → 不必重排重解码
+        count = self._grid_count()
+        page_start = (self.current_photo_index // count) * count
+        shown = min(count, len(self.current_photos) - page_start)
+        vw, vh = self._grid_viewport_size()
+        cols, rows = best_grid_shape(shown, vw, vh, self._grid_photo_aspect, _GRID_SPACING)
+        signature = (cols, rows, self._grid_thumb_size(vw, vh, cols, rows))
+        if signature == getattr(self, "_grid_layout_signature", None):
+            return
+        self._grid_layout_signature = signature
+        # 重排不该丢掉用户的多选
+        selected = set(self._grid_selected_indices)
+        self._render_grid()
+        if selected:
+            self._grid_selected_indices = selected
+            for cell in self._grid_labels:
+                cell.set_selected(cell.photo_index in selected)
+
+    def _grid_viewport_size(self) -> tuple[int, int]:
+        """宫格可用区域的像素尺寸。
+
+        先问 _photo_stack_container：grid_frame 在 _render_grid 测量时通常还处于
+        hide() 状态，Qt 不会给隐藏控件做布局，它的 size() 会一直停在 640×480 的
+        默认值 —— 据此算出来的缩略图尺寸永远是最小档，照片依旧是糊的。容器一直
+        可见且参与布局，尺寸才是真的。
+        """
+        candidates = [getattr(self, "_photo_stack_container", None)]
+        if self.grid_frame.isVisible():
+            candidates.insert(0, self.grid_frame)
+        candidates.append(self)
+        for widget in candidates:
+            if widget is None:
+                continue
+            size = widget.size()
+            if size.width() > 50 and size.height() > 50:
+                return size.width(), size.height()
+        return 0, 0
+
+    def _grid_thumb_size(self, vw: int, vh: int, cols: int, rows: int) -> tuple[int, int]:
+        """单元格对应的缩略图解码尺寸。
+
+        按单元格实际像素 × 设备像素比来要图，HiDPI 屏上才不糊。尺寸量化到 128px
+        的台阶：ThumbnailCache 以尺寸为缓存键，连续变化会让缓存命中率归零，每次
+        改窗口大小都要重新解码大图。
+        """
+        if vw <= 0 or vh <= 0:
+            return (640, 480)
+        cell_w = (vw - _GRID_SPACING * (cols - 1)) / max(1, cols) - _GRID_CELL_CHROME_W
+        cell_h = (vh - _GRID_SPACING * (rows - 1)) / max(1, rows) - _GRID_CELL_CHROME_H
+        try:
+            dpr = float(self.devicePixelRatioF())
+        except Exception:
+            dpr = 1.0
+        dpr = min(max(dpr, 1.0), 2.0)  # 超高 dpr 不值得为此解码超大图
+
+        # 低内存档位已有 preview_max_size 上限（800×600），宫格沿用它，
+        # 否则 8 格 × 2048px 大图同时解码会把 4GB 机器拖垮。
+        cap_w, cap_h = 2048, 2048
+        try:
+            from .env_detect import memory_profile_params
+            limit = memory_profile_params(load_settings().memory_profile).get("preview_max_size")
+            if limit:
+                cap_w, cap_h = int(limit[0]), int(limit[1])
+        except Exception:
+            pass
+
+        def _quantize(v: float, cap: int) -> int:
+            step = 128
+            return int(max(320, min(cap, -(-int(v * dpr) // step) * step)))
+
+        return (_quantize(cell_w, cap_w), _quantize(cell_h, cap_h))
+
+    def _note_grid_photo_aspect(self, width: int, height: int) -> None:
+        """用刚加载好的缩略图实测比例，平滑更新 _grid_photo_aspect。
+
+        下一次渲染宫格（翻页 / 切标本 / 改宫格数 / 改窗口大小）就用上新比例。
+        不在当前这帧重排，避免照片刚出现就跳位置。
+        """
+        if width <= 0 or height <= 0:
+            return
+        aspect = width / height
+        if not (0.05 < aspect < 20):
+            return
+        self._grid_photo_aspect = self._grid_photo_aspect * 0.6 + aspect * 0.4
 
     def _clear_grid(self) -> None:
         self._grid_requests.clear()
@@ -6399,6 +6627,7 @@ class SpecimenWindow(QMainWindow):
         if exc or qpixmap is None:
             label.set_error("无法预览")
             return
+        self._note_grid_photo_aspect(qpixmap.width(), qpixmap.height())
         label.set_pixmap(qpixmap)
 
     def _on_grid_cell_clicked(self, photo_index: int) -> None:
@@ -8613,6 +8842,16 @@ class ImageSearchDialog(QDialog):
             return f"关联到 {voucher}"
         return "未选入库编号 — 不可关联"
 
+    def _set_link_buttons_enabled(self, enabled: bool) -> None:
+        """后台关联进行中时禁用「关联」按钮，避免重复提交同一批照片。"""
+        for button_attr_name in (
+            "_link_selected_images_button_top",
+            "_link_selected_images_button_bottom",
+        ):
+            button = getattr(self, button_attr_name, None)
+            if button is not None:
+                button.setEnabled(enabled)
+
     def _refresh_link_controls_enabled_state(self) -> None:
         """plan V1：同步顶部 + 底部「关联」按钮的文案 + enabled 状态。
 
@@ -9057,9 +9296,13 @@ class ImageSearchDialog(QDialog):
 
         return card
 
-    def _on_thumbnail_ready(self, token: int, qpixmap: QPixmap | None, exc: Exception | None) -> None:
+    def _on_thumbnail_ready(self, token: int, qimage: QImage | None, exc: Exception | None) -> None:
         label = getattr(self, "_card_labels", {}).get(token)
-        if not label or not qpixmap:
+        if not label or qimage is None:
+            return
+        # v0.10.46：worker 回传 QImage，在这里（GUI 线程）才转 QPixmap。
+        qpixmap = QPixmap.fromImage(qimage)
+        if qpixmap.isNull():
             return
         scaled = qpixmap.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         label.setPixmap(scaled)
@@ -9165,15 +9408,28 @@ class ImageSearchDialog(QDialog):
         if not paths:
             QMessageBox.information(self, "无需添加", "选中的图片已经关联到当前入库编号。")
             return
-        # plan V2: 捕获跨 voucher 关联导致的 ValueError，明确告知用户而不是 crash
-        try:
-            added = self.app.add_photo_paths(paths, ask_for_outside=False)
-        except ValueError as exc:
-            QMessageBox.warning(self, "关联失败", str(exc))
+        # v0.10.46：改走后台。旧代码调同步的 add_photo_paths，openpyxl 在 GUI 线程
+        # 整本重写 Excel，几十张照片时主线程停摆数秒 —— 用户看到的"卡顿"就是这里
+        # （gui_stall 日志：872 次停摆里 678 次栈顶是 add_selected → add_photo_paths）。
+        self.status_label.setText(f"正在关联 {len(paths)} 张照片到 {current_voucher}…")
+        self._set_link_buttons_enabled(False)
+        self.app.add_photo_paths_async(
+            paths,
+            ask_for_outside=False,
+            confirm_batch=False,  # 保持旧行为：检索对话框里不再弹一次批量确认
+            on_done=lambda added, err: self._on_photos_linked(current_voucher, added, err),
+        )
+
+    def _on_photos_linked(self, voucher: str, added: int, err: str) -> None:
+        """后台关联结束后的收尾（主线程，由 add_photo_paths_async 回调）。"""
+        self._refresh_link_controls_enabled_state()  # 按 current_voucher 还原 enabled
+        if err:
+            self.status_label.setText("关联失败")
+            QMessageBox.warning(self, "关联失败", err)
             return
         # 旧：状态消息仅 "已添加 {added} 张图片。"，未含目标 voucher，UX 不清晰
         # 新：双通道（dialog status_label + 主窗口 statusBar）显式带 voucher
-        success_message = f"已成功关联 {added} 张照片到入库编号 {current_voucher}。"
+        success_message = f"已成功关联 {added} 张照片到入库编号 {voucher}。"
         self.status_label.setText(success_message)
         try:
             self.app.statusBar().showMessage(success_message, 5000)
@@ -9183,8 +9439,6 @@ class ImageSearchDialog(QDialog):
         self.last_selected_index = None
         self._start_context_refresh()
         self.refresh_results()
-        # 关联完成后刷新按钮态（voucher 大概率没变，但保险刷新）
-        self._refresh_link_controls_enabled_state()
 
     def _navigate_to_voucher(self, link: str) -> None:
         """Navigate the main window to the given voucher, keeping this dialog open."""
@@ -11093,6 +11347,10 @@ class _AdminBatchEditDialog(QDialog):
 # Entry point
 # ---------------------------------------------------------------------------
 
+class _SkipSingleInstance(Exception):
+    """内部哨兵：命令行显式给了 --workspace，本次跳过单实例守卫。"""
+
+
 class WindowManager:
     def __init__(self, app: QApplication):
         self.app = app
@@ -11129,6 +11387,20 @@ class WindowManager:
         key = key.resolve()
         if self._windows.get(key) is window:
             self._windows.pop(key, None)
+
+    def newest_window(self) -> "SpecimenWindow | None":
+        """v0.10.46：返回一个仍存活的可见窗口，供单实例守卫拉到前台。
+
+        优先已绑定工作区的主窗口；没有就退回只读副本。
+        """
+        for bucket in (list(self._windows.values()), list(self._ro_windows)):
+            for w in reversed(bucket):
+                try:
+                    if w is not None and not w.isHidden():
+                        return w
+                except RuntimeError:
+                    continue  # 底层 C++ 对象已销毁
+        return None
 
     def register_dialog_stopper(self, dialog: object, stop_handler) -> None:
         """C1: 让对话框（如 DbManagerDialog）注册一个"停止后台 worker"回调。
@@ -11305,7 +11577,7 @@ def _install_qt_exception_dialog() -> None:
         threading.excepthook = _thread_hook
 
 
-def run_app(workspace_root: Path | str | None) -> None:
+def run_app(workspace_root: Path | str | None, enforce_single_instance: bool = True) -> None:
     # 规范化软件设计 2026-05 启动卡死优化:
     # 1. QApplication 先创建,Splash 立刻可见 (无视觉反馈是"卡死"误判主因)
     # 2. 各启动阶段 splash.show_stage(text, percent) 给用户进度
@@ -11340,6 +11612,28 @@ def run_app(workspace_root: Path | str | None) -> None:
         except Exception:
             pass
     app = QApplication.instance() or QApplication(sys.argv)
+    # ---- v0.10.46 单实例守卫：必须在任何重活之前 ----
+    # 旧行为：启动慢 → 用户以为没点到再点一次 → 两个进程抢同一个工作区锁，
+    #         后起的那个卡在重试上，splash 进度条一直转（boot_fault.log 有实例：
+    #         22:09:31 pid=10732 与 22:09:32 pid=6844）。
+    # 现行为：后起的进程把已有窗口拉到前台，然后立刻退出。
+    _instance_guard = None
+    try:
+        if not enforce_single_instance:
+            raise _SkipSingleInstance
+        from .single_instance import acquire as _acquire_instance
+
+        _instance_guard = _acquire_instance()
+        if _instance_guard is None:
+            print("[startup] 程序已在运行，已将已有窗口拉到前台；本次启动退出。", file=sys.stderr)
+            return
+        app.aboutToQuit.connect(_instance_guard.release)
+    except _SkipSingleInstance:
+        # 命令行显式指定了 --workspace：这是"再开一个工作区"的明确意图，放行。
+        print("[startup] 已指定 --workspace，本次不做单实例限制。", file=sys.stderr)
+    except Exception as _si_exc:  # noqa: BLE001
+        # 单实例只是体验优化，出问题不能挡住启动
+        print(f"[startup] 单实例守卫未启用：{_si_exc}", file=sys.stderr)
     # 2026-10-02 GUI 卡死探针：主线程停摆 >2 s 就把调用栈写进崩溃日志目录（gui_stall_*.log），下次再卡能直接定位
     try:
         from .ui_watchdog import GuiStallWatchdog
@@ -11362,6 +11656,11 @@ def run_app(workspace_root: Path | str | None) -> None:
         from .splash import SplashScreen
         splash = SplashScreen()
         splash.show()
+        # v0.10.46：splash 是置顶 + 禁交互的，一旦启动途中弹出模态对话框（典型是
+        # 「工作区被占用」），它会把对话框盖住 —— 用户看不见也点不到，进程就停在
+        # 嵌套事件循环里，桌面上留一个关不掉的 "打开工作区… 25%"（boot_fault.log
+        # 的 pid=10732 挂了 15 小时）。装上保险：见模态窗口或启动超时就让开。
+        splash.enable_auto_hide(app)
         app.processEvents()  # 让 splash 实际出现在屏幕上
         splash.show_stage("初始化…", 5)
     except Exception:
@@ -11423,6 +11722,24 @@ def run_app(workspace_root: Path | str | None) -> None:
         splash.show_stage("准备就绪", 100)
         app.processEvents()
         splash.finish(window)  # 主窗口可见后关闭 splash
+    # v0.10.46：用户再次双击图标时，把已有窗口拉到前台（而不是开第二个进程）。
+    if _instance_guard is not None:
+        def _activate_existing_window() -> None:
+            target = window
+            try:
+                if manager is not None:
+                    newest = manager.newest_window()
+                    if newest is not None:
+                        target = newest
+            except Exception:
+                pass
+            if target.isMinimized():
+                target.showNormal()
+            else:
+                target.show()
+            target.raise_()
+            target.activateWindow()
+        _instance_guard.activate_requested.connect(_activate_existing_window)
     # WoRMS bootstrap 延后 3s 后台触发 (规范化软件设计 2026-05 启动卡死优化):
     # 旧:run_app() 末尾同步 ensure_bootstrap_cache 解压 sqlite.gz,加 0.5-1s 黑屏。
     # 现:延后到 app.exec_() 后 3s,首启不阻塞启动。若用户在 3s 内就开 WoRMS 菜单,

@@ -1052,6 +1052,7 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(is_unsafe_workspace_root(workspace))
 
     def test_desktop_is_rejected_as_workspace_root(self) -> None:
+        from specimen_app import workspace as workspace_module
         from specimen_app.workspace import default_workspace, is_unsafe_workspace_root
 
         desktop = self.tmp / "Desktop"
@@ -1070,7 +1071,22 @@ class CoreTests(unittest.TestCase):
                 last_workspace=str(desktop),
                 recent_workspaces=[str(desktop), str(normal)],
             )
-            with patch("specimen_app.workspace.load_settings", return_value=fake_settings):
+            # default_workspace() 还会把 CWD 和「可执行文件所在目录的上两级」当候选。
+            # 开发机上这两者往往就是仓库根目录，而仓库根目录常常本身就是一个真实
+            # 工作区（本项目作者的 H:\标本整理 就是），于是它会先于 normal 被选中，
+            # 用例在那种机器上必然失败 —— 跟被测逻辑无关。
+            # 这里把"是不是工作区"限定在本用例的临时目录内，用例对机器布局免疫。
+            real_has_data = workspace_module.has_workspace_data
+
+            def only_inside_tmp(path):
+                try:
+                    Path(path).resolve().relative_to(self.tmp.resolve())
+                except ValueError:
+                    return False
+                return real_has_data(path)
+
+            with patch("specimen_app.workspace.load_settings", return_value=fake_settings), \
+                 patch("specimen_app.workspace.has_workspace_data", side_effect=only_inside_tmp):
                 self.assertEqual(default_workspace(), normal.resolve())
 
     def test_image_decode_respects_pixel_cap(self) -> None:

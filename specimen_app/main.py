@@ -45,7 +45,19 @@ def _run_smoke() -> int:
 
         app = QApplication.instance() or QApplication(["smoke"])
         app.processEvents()
-        print(f"[smoke] ok v{__version__}")
+
+        # v0.10.46：单实例守卫是 run_app() 里的函数内延迟 import，且依赖 PyQt5.QtNetwork
+        # （QLocalServer/QLocalSocket）。这两样任何一个没被打进包，用户看到的就是
+        # "重复启动限制失效"——而普通 import 自检发现不了。这里真跑一遍。
+        from .single_instance import acquire as _acquire
+
+        guard = _acquire("specimen-organise-smoke")
+        if guard is None:
+            print("[smoke] FAILED: 单实例守卫拿不到锁（smoke 环境不应有其他实例）",
+                  file=sys.stderr)
+            return 4
+        guard.release()
+        print(f"[smoke] ok v{__version__} (single-instance + QtNetwork ok)")
         return 0
     except Exception as exc:  # noqa: BLE001
         from .boot_guard import write_startup_failure
@@ -93,7 +105,9 @@ def main() -> None:
         # 旧文案提到"在弹出的对话框中选择"——那是窗口构建前的裸 QFileDialog。
         # 现改为：先打开主窗口，再在窗口内提示选择/新建工作区。
         print("未找到上次使用的工作区，程序将打开主窗口并提示选择或新建工作区。", file=sys.stderr)
-    run_app(workspace)
+    # v0.10.46：双击图标（无参数）启动时做单实例限制，避免重复打开抢同一工作区；
+    # 显式 --workspace 是"再开一个工作区"的明确意图，不限制。
+    run_app(workspace, enforce_single_instance=args.workspace is None)
 
 
 if __name__ == "__main__":

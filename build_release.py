@@ -174,10 +174,16 @@ def _find_inno_setup_compiler() -> Path | None:
         found = shutil.which(name)
         if found:
             candidates.append(Path(found))
-    for base_env in ("ProgramFiles(x86)", "ProgramFiles"):
+    # LOCALAPPDATA：winget（`winget install JRSoftware.InnoSetup`）默认装到用户目录，
+    # 不进 Program Files 也不进 PATH。漏掉它的后果是静默退化成"只出 zip 不出安装器"。
+    # CI 用 choco，装在 Program Files，由下面两项覆盖。
+    for base_env in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"):
         base = os.environ.get(base_env)
-        if base:
-            candidates.append(Path(base) / "Inno Setup 6" / "ISCC.exe")
+        if not base:
+            continue
+        candidates.append(Path(base) / "Inno Setup 6" / "ISCC.exe")
+        if base_env == "LOCALAPPDATA":
+            candidates.append(Path(base) / "Programs" / "Inno Setup 6" / "ISCC.exe")
     for candidate in candidates:
         try:
             if candidate.is_file():
@@ -366,6 +372,10 @@ def build_release(version: str, project_root: Path, icon_path: Path | None = Non
         str(spec_path),
         "--hidden-import",
         "tifffile",
+        # v0.10.46 单实例守卫用 QLocalServer/QLocalSocket。single_instance 是函数内
+        # 延迟 import 的，显式声明免得 PyInstaller 分析漏掉 → 打包版退化成可重复启动。
+        "--hidden-import",
+        "PyQt5.QtNetwork",
     ]
     if icon_file and icon_file.exists():
         command.extend(["--icon", str(icon_file)])
@@ -507,7 +517,12 @@ def build_release(version: str, project_root: Path, icon_path: Path | None = Non
     (release_dir / "build_info.json").write_text(json.dumps(build_info, ensure_ascii=False, indent=2), encoding="utf-8")
 
     notes = release_dir / "release_notes.md"
-    if not notes.exists():
+    # 优先用本版手写的发布说明。旧逻辑只有一段写死的模板，内容停留在 0.2.x
+    # （"跨平台支持""路径遍历修复"），每个新版本都照抄一遍，对用户是误导。
+    curated = project_root / "docs" / "release-notes" / f"v{version}.md"
+    if curated.is_file():
+        notes.write_text(curated.read_text(encoding="utf-8"), encoding="utf-8")
+    elif not notes.exists():
         notes.write_text(
             f"# {APP_NAME} v{version}\n\n"
             "## 安全修复\n\n"

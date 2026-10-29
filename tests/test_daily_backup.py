@@ -48,8 +48,28 @@ class DailyBackupTests(unittest.TestCase):
         self.assertNotIn("..", daily_backup.workspace_backup_key(self.store))
 
     def test_second_run_same_day_is_noop(self):
-        daily_backup.run_daily_backup(self.store, self.local, today=date(2026, 10, 4))
-        self.assertIsNone(daily_backup.run_daily_backup(self.store, self.local, today=date(2026, 10, 4)))
+        # 不能注入假日期：快照目录名来自 ExcelStore.create_data_snapshot 里的
+        # datetime.now()（excel_store.py `version_id = datetime.now()...`），而
+        # has_daily_backup_for() 按传入的 today 去匹配目录名前缀。两个时钟一旦不同，
+        # 第二次必然判定"今天还没备过"。生产路径里 today 就是真实日期，所以这里也用
+        # 真实日期 —— 用例本来要验证的"同一天只备一次"才真的被覆盖到。
+        # 注入日期的那条分支由 test_has_daily_backup_for_matches_by_date 单独覆盖。
+        today = date.today()
+        self.assertIsNotNone(daily_backup.run_daily_backup(self.store, self.local, today=today))
+        self.assertIsNone(daily_backup.run_daily_backup(self.store, self.local, today=today))
+
+    def test_has_daily_backup_for_matches_by_date(self):
+        """纯函数：按日期前缀匹配快照目录，不碰时钟。"""
+        versions = self._versions_dir()
+        versions.mkdir(parents=True, exist_ok=True)
+        self.assertFalse(daily_backup.has_daily_backup_for(versions, date(2026, 10, 4)))
+
+        snap = self.store.create_data_snapshot(daily_backup.DAILY_OPERATION_TYPE, "x")
+        made_on = date(*(int(x) for x in (snap.name[1:5], snap.name[5:7], snap.name[7:9])))
+        self.assertTrue(daily_backup.has_daily_backup_for(versions, made_on))
+        self.assertFalse(
+            daily_backup.has_daily_backup_for(versions, made_on.replace(year=made_on.year - 1))
+        )
 
     def test_prune_keeps_only_recent_daily_and_never_touches_other_snapshots(self):
         manual = self.store.create_data_snapshot("手动快照", "用户自己做的")
